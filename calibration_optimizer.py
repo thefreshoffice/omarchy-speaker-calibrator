@@ -1,0 +1,746 @@
+#!/usr/bin/python3
+"""Adaptive, subtractive-first parametric EQ for speaker calibration."""
+
+from __future__ import annotations
+
+import math
+
+try:
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+    from scipy.optimize import minimize
+except ImportError as error:  # pragma: no cover
+    raise SystemExit(
+        f"Optimizer import failed: {error}. The panel expects Arch's "
+        "python-numpy and python-scipy packages."
+    ) from error
+
+
+DIAGNOSTIC_CENTERS = np.asarray(
+    [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
+     2500.0, 4000.0, 6300.0, 10000.0]
+)
+CUT_LIMIT_DB = -6.0
+INTERNAL_CUT_ANCHORS_HZ = np.asarray(
+    [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
+     2500.0, 4000.0, 6300.0, 10000.0]
+)
+INTERNAL_CUT_LIMITS_DB = np.asarray(
+    [-3.0, -4.0, -5.0, -6.0, -6.0, -6.0, -6.0, -6.0, -5.0, -3.5]
+)
+
+
+def _log_interpolate(frequencies: np.ndarray, anchors_hz, anchors_db) -> np.ndarray:
+    return np.interp(
+        np.log(frequencies), np.log(np.asarray(anchors_hz, dtype=float)),
+        np.asarray(anchors_db, dtype=float),
+    )
+
+
+def pleasant_in_room_target(frequencies: np.ndarray, voicing: str) -> np.ndarray:
+    """Return the broad in-room loudspeaker target relative to the midband."""
+    frequencies = np.asarray(frequencies, dtype=float)
+    target = np.zeros_like(frequencies)
+    low = frequencies < 250.0
+    high = frequencies > 2000.0
+    target[low] = np.minimum(3.5, 2.0 * np.log2(250.0 / frequencies[low]))
+    target[high] = np.maximum(-4.5, -1.5 * np.log2(frequencies[high] / 2000.0))
+    if voicing == "warm":
+        target += _log_interpolate(
+            frequencies,
+            [80, 400, 800, 1600, 3150, 6300, 10000, 16000],
+            [0.0, 0.0, -0.25, -0.7, -1.2, -1.35, -1.1, -0.7],
+        )
+    return target
+
+
+def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
+    order = np.argsort(values)
+    ordered_values = values[order]
+    ordered_weights = weights[order]
+    cumulative = np.cumsum(ordered_weights)
+    if cumulative[-1] <= 0:
+        return float(np.median(values))
+    location = quantile * cumulative[-1]
+    return float(ordered_values[min(np.searchsorted(cumulative, location), values.size - 1)])
+
+
+def _peaking_response_db(
+    frequencies: np.ndarray, center: float, q: float, gain_db: float, rate: int
+) -> np.ndarray:
+    """Exact RBJ peaking-biquad magnitude response."""
+    amplitude = 10.0 ** (gain_db / 40.0)
+    omega0 = 2.0 * math.pi * center / rate
+    alpha = math.sin(omega0) / (2.0 * q)
+    cos0 = math.cos(omega0)
+    b0 = 1.0 + alpha * amplitude
+    b1 = -2.0 * cos0
+    b2 = 1.0 - alpha * amplitude
+    a0 = 1.0 + alpha / amplitude
+    a1 = -2.0 * cos0
+    a2 = 1.0 - alpha / amplitude
+    omega = 2.0 * math.pi * frequencies / rate
+    z1 = np.exp(-1j * omega)
+    z2 = z1 * z1
+    numerator = b0 + b1 * z1 + b2 * z2
+    denominator = a0 + a1 * z1 + a2 * z2
+    return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
+
+
+def _highpass_response_db(
+    frequencies: np.ndarray, cutoff: float, q: float, rate: int
+) -> np.ndarray:
+    """Exact RBJ high-pass magnitude response."""
+    omega0 = 2.0 * math.pi * cutoff / rate
+    alpha = math.sin(omega0) / (2.0 * q)
+    cos0 = math.cos(omega0)
+    b0 = (1.0 + cos0) / 2.0
+    b1 = -(1.0 + cos0)
+    b2 = b0
+    a0 = 1.0 + alpha
+    a1 = -2.0 * cos0
+    a2 = 1.0 - alpha
+    omega = 2.0 * math.pi * frequencies / rate
+    z1 = np.exp(-1j * omega)
+    z2 = z1 * z1
+    numerator = b0 + b1 * z1 + b2 * z2
+    denominator = a0 + a1 * z1 + a2 * z2
+    return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
+
+
+def filter_response_db(
+    frequencies: np.ndarray,
+    gains_db: np.ndarray,
+    rate: int = 48_000,
+    *,
+    centers_hz: np.ndarray | list[float] | None = None,
+    q_values: np.ndarray | list[float] | None = None,
+) -> np.ndarray:
+    """Return the summed response of any number of parametric filters."""
+    frequencies = np.asarray(frequencies, dtype=float)
+    gains = np.asarray(gains_db, dtype=float)
+    centers = np.asarray(centers_hz if centers_hz is not None else [], dtype=float)
+    q_array = np.asarray(q_values if q_values is not None else [], dtype=float)
+    if not (centers.size == q_array.size == gains.size):
+        raise ValueError("Parametric filter frequency, Q, and gain arrays must match.")
+    response = np.zeros_like(frequencies)
+    for center, q, gain in zip(centers, q_array, gains):
+        response += _peaking_response_db(frequencies, center, q, float(gain), rate)
+    return response
+
+
+def _measurement_confidence(measurement: dict) -> tuple[np.ndarray, np.ndarray]:
+    frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
+    channels = measurement.get("channels", [])
+    uncertainty_curves = [
+        np.asarray(channel.get("uncertainty_db", np.zeros(frequencies.size)), dtype=float)
+        for channel in channels
+    ]
+    uncertainty = (
+        np.max(np.vstack(uncertainty_curves), axis=0)
+        if uncertainty_curves else np.full(frequencies.size, 3.0)
+    )
+    confidence = 1.0 / (1.0 + (uncertainty / 1.25) ** 2)
+    if len(channels) >= 2:
+        left = np.asarray(channels[0]["response_db"], dtype=float)
+        right = np.asarray(channels[1]["response_db"], dtype=float)
+        band = (frequencies >= 250.0) & (frequencies <= 2000.0)
+        mismatch = (left - np.median(left[band])) - (right - np.median(right[band]))
+        confidence *= 1.0 / (1.0 + (np.abs(mismatch) / 4.0) ** 2)
+    return np.clip(confidence, 0.05, 1.0), uncertainty
+
+
+def _safe_boost_floor(
+    frequencies: np.ndarray, measured: np.ndarray, confidence: np.ndarray
+) -> float:
+    mid = (frequencies >= 300.0) & (frequencies <= 1600.0)
+    mid_reference = float(np.percentile(measured[mid], 65))
+    candidates = np.where(
+        (frequencies >= 140.0) & (frequencies <= 1000.0)
+        & (measured >= mid_reference - 10.0) & (confidence >= 0.55)
+    )[0]
+    return float(max(160.0, frequencies[candidates[0]])) if candidates.size else 1000.0
+
+
+def _cut_limit_at(center: float, internal_mic: bool) -> float:
+    if not internal_mic:
+        return CUT_LIMIT_DB
+    return float(np.interp(
+        math.log(center), np.log(INTERNAL_CUT_ANCHORS_HZ), INTERNAL_CUT_LIMITS_DB
+    ))
+
+
+def _boost_decision(
+    center: float,
+    frequencies: np.ndarray,
+    desired: np.ndarray,
+    confidence: np.ndarray,
+    safe_boost_floor: float,
+) -> dict:
+    local = np.abs(np.log2(frequencies / center)) <= 0.42
+    if not np.any(local):
+        local_confidence = 0.0
+        broad_deficit = 0.0
+        deficit_fraction = 0.0
+    else:
+        local_confidence = float(np.average(confidence[local]))
+        broad_deficit = float(np.average(desired[local], weights=confidence[local]))
+        deficit_fraction = float(np.mean(desired[local] >= 1.0))
+    permitted = (
+        center >= safe_boost_floor and center <= 8000.0
+        and local_confidence >= 0.72 and broad_deficit >= 1.50
+        and deficit_fraction >= 0.60
+    )
+    return {
+        "center_hz": round(float(center), 1),
+        "permitted": bool(permitted),
+        "broad_deficit_db": round(broad_deficit, 3),
+        "confidence": round(local_confidence, 3),
+        "deficit_fraction": round(deficit_fraction, 3),
+    }
+
+
+def _smooth_and_level_align(
+    curve: np.ndarray, reference: np.ndarray, frequencies: np.ndarray
+) -> np.ndarray:
+    smoothed = gaussian_filter1d(np.asarray(curve, dtype=float), sigma=4.0, mode="nearest")
+    band = (frequencies >= 250.0) & (frequencies <= 2000.0)
+    smoothed += float(np.median(reference[band] - smoothed[band]))
+    return smoothed
+
+
+def _validation_data(
+    measurement: dict, measured_smooth: np.ndarray, frequencies: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], dict]:
+    """Build a training curve and a genuinely held-out repeat when available."""
+    repeat_groups: dict[int, list[np.ndarray]] = {}
+    for item in measurement.get("validation_curves", []):
+        curve = np.asarray(item.get("response_db", []), dtype=float)
+        if curve.size != frequencies.size:
+            continue
+        repeat = int(item.get("repeat", 0))
+        repeat_groups.setdefault(repeat, []).append(
+            _smooth_and_level_align(curve, measured_smooth, frequencies)
+        )
+    grouped = [
+        np.median(np.vstack(repeat_groups[key]), axis=0)
+        for key in sorted(repeat_groups)
+        if repeat_groups[key]
+    ]
+    group_names = [str(key) for key in sorted(repeat_groups) if repeat_groups[key]]
+    if len(grouped) >= 2:
+        training = np.median(np.vstack(grouped[:-1]), axis=0)
+        holdout = grouped[-1]
+        return training, holdout, grouped, {
+            "mode": "repeat-holdout",
+            "groups": len(grouped),
+            "training_repeats": group_names[:-1],
+            "held_out_repeats": group_names[-1:],
+            "curves": sum(len(items) for items in repeat_groups.values()),
+        }
+
+    channel_folds = []
+    channel_names = []
+    for channel in measurement.get("channels", []):
+        curve = np.asarray(channel.get("response_db", []), dtype=float)
+        if curve.size == frequencies.size:
+            channel_folds.append(
+                _smooth_and_level_align(curve, measured_smooth, frequencies)
+            )
+            channel_names.append(str(channel.get("output_channel", len(channel_names))))
+    if len(channel_folds) >= 2:
+        return channel_folds[0], channel_folds[1], channel_folds, {
+            "mode": "channel-holdout",
+            "groups": len(channel_folds),
+            "training_channels": channel_names[:1],
+            "held_out_channels": channel_names[1:2],
+            "curves": len(channel_folds),
+        }
+    return measured_smooth, measured_smooth, [measured_smooth], {
+        "mode": "aggregate-only",
+        "groups": 1,
+        "curves": 1,
+    }
+
+
+def _weighted_rmse(
+    curve: np.ndarray,
+    correction: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    valid: np.ndarray,
+) -> float:
+    residual = curve[valid] + correction[valid] - target[valid]
+    return math.sqrt(float(np.average(residual * residual, weights=weights[valid])))
+
+
+def _candidate_indices(score: np.ndarray, valid: np.ndarray, limit: int) -> list[int]:
+    indices = np.where(valid)[0]
+    peaks = []
+    for position, index in enumerate(indices):
+        left = score[indices[position - 1]] if position > 0 else -math.inf
+        right = score[indices[position + 1]] if position + 1 < indices.size else -math.inf
+        if score[index] >= left and score[index] >= right:
+            peaks.append(index)
+    return sorted(peaks, key=lambda index: float(score[index]), reverse=True)[:limit]
+
+
+def _estimate_q(
+    need: np.ndarray, peak_index: int, frequencies: np.ndarray, q_bounds: tuple[float, float]
+) -> float:
+    peak = float(need[peak_index])
+    threshold = max(0.25, peak * 0.5)
+    left = peak_index
+    right = peak_index
+    while left > 0 and need[left - 1] >= threshold:
+        left -= 1
+    while right + 1 < need.size and need[right + 1] >= threshold:
+        right += 1
+    bandwidth_octaves = max(0.28, math.log2(frequencies[right] / frequencies[left]))
+    ratio = 2.0 ** bandwidth_octaves
+    q = math.sqrt(ratio) / max(ratio - 1.0, 1e-6)
+    return float(np.clip(q, q_bounds[0], q_bounds[1]))
+
+
+def _filter_correction(
+    frequencies: np.ndarray, filters: list[dict], parameters: np.ndarray, rate: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not filters:
+        empty = np.asarray([], dtype=float)
+        return np.zeros_like(frequencies), empty, empty, empty
+    shaped = np.asarray(parameters, dtype=float).reshape((-1, 3))
+    centers = np.exp(shaped[:, 0])
+    q_values = np.exp(shaped[:, 1])
+    gains = shaped[:, 2]
+    response = filter_response_db(
+        frequencies, gains, rate, centers_hz=centers, q_values=q_values
+    )
+    return response, centers, q_values, gains
+
+
+def _parameter_bounds(filters: list[dict]) -> list[tuple[float, float]]:
+    bounds = []
+    for item in filters:
+        bounds.extend((
+            (math.log(item["frequency_bounds"][0]), math.log(item["frequency_bounds"][1])),
+            (math.log(item["q_bounds"][0]), math.log(item["q_bounds"][1])),
+            item["gain_bounds"],
+        ))
+    return bounds
+
+
+def _initial_parameters(filters: list[dict]) -> np.ndarray:
+    values = []
+    for item in filters:
+        values.extend((math.log(item["center_hz"]), math.log(item["q"]), item["gain_db"]))
+    return np.asarray(values, dtype=float)
+
+
+def _fit_filters(
+    frequencies: np.ndarray,
+    training: np.ndarray,
+    target: np.ndarray,
+    weights: np.ndarray,
+    valid: np.ndarray,
+    safety_highpass: np.ndarray,
+    filters: list[dict],
+    rate: int,
+    initial: np.ndarray | None = None,
+) -> tuple[np.ndarray, object, float]:
+    if not filters:
+        return np.asarray([], dtype=float), None, _weighted_rmse(
+            training, safety_highpass, target, weights, valid
+        )
+
+    def objective(parameters):
+        peq, centers, q_values, gains = _filter_correction(
+            frequencies, filters, parameters, rate
+        )
+        correction = safety_highpass + peq
+        residual = training[valid] + correction[valid] - target[valid]
+        data_cost = float(np.average(residual * residual, weights=weights[valid]))
+        cuts = np.minimum(gains, 0.0)
+        boosts = np.maximum(gains, 0.0)
+        complexity = 0.006 * float(np.sum(cuts * cuts))
+        boost_cost = 0.080 * float(np.sum(boosts * boosts))
+        count_cost = 0.035 * len(filters)
+        narrow_thresholds = np.asarray([
+            item["narrow_q_threshold"] for item in filters
+        ])
+        narrow = np.maximum(q_values - narrow_thresholds, 0.0)
+        narrow_cost = 0.025 * float(np.sum(narrow * narrow * np.abs(gains)))
+        response_peak = max(0.0, float(np.max(correction)))
+        headroom_cost = 0.35 * response_peak * response_peak
+        overlap_cost = 0.0
+        for left in range(centers.size):
+            for right in range(left + 1, centers.size):
+                distance = abs(math.log2(centers[left] / centers[right]))
+                overlap_cost += 0.02 * max(0.0, 0.28 - distance) ** 2
+        return (
+            data_cost + complexity + boost_cost + count_cost
+            + narrow_cost + headroom_cost + overlap_cost
+        )
+
+    start = _initial_parameters(filters) if initial is None else np.asarray(initial, dtype=float)
+    result = minimize(
+        objective,
+        start,
+        method="L-BFGS-B",
+        bounds=_parameter_bounds(filters),
+        options={"maxiter": 350, "ftol": 1e-10, "gtol": 1e-6},
+    )
+    peq, _, _, _ = _filter_correction(frequencies, filters, result.x, rate)
+    rmse = _weighted_rmse(training, safety_highpass + peq, target, weights, valid)
+    return np.asarray(result.x, dtype=float), result, rmse
+
+
+def _new_filter(
+    kind: str,
+    index: int,
+    residual: np.ndarray,
+    frequencies: np.ndarray,
+    q_bounds: tuple[float, float],
+    frequency_range: tuple[float, float],
+    internal_mic: bool,
+    maximum_boost: float,
+) -> dict:
+    center = float(frequencies[index])
+    need = np.maximum(residual, 0.0) if kind == "cut" else np.maximum(-residual, 0.0)
+    q = _estimate_q(need, index, frequencies, q_bounds)
+    low_frequency = max(frequency_range[0], center / (2.0 ** 0.48))
+    high_frequency = min(frequency_range[1], center * (2.0 ** 0.48))
+    if kind == "cut":
+        samples = np.geomspace(low_frequency, high_frequency, 9)
+        # The least-negative limit anywhere in the search window is used so a
+        # moving filter can never cross into a less-trusted band at -6 dB.
+        lower_gain = max(_cut_limit_at(float(value), internal_mic) for value in samples)
+        gain = -min(abs(lower_gain), max(0.35, float(residual[index]) * 0.72))
+        gain_bounds = (lower_gain, 0.0)
+    else:
+        gain = min(maximum_boost, max(0.25, float(-residual[index]) * 0.55))
+        gain_bounds = (0.0, maximum_boost)
+    return {
+        "kind": kind,
+        "center_hz": center,
+        "q": q,
+        "gain_db": float(gain),
+        "frequency_bounds": (low_frequency, high_frequency),
+        "q_bounds": q_bounds,
+        "gain_bounds": gain_bounds,
+        "narrow_q_threshold": 1.4 if internal_mic else 2.25,
+    }
+
+
+def optimize_peq(measurement: dict, voicing: str, *, internal_mic: bool) -> dict:
+    frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
+    measured = np.asarray(measurement["level_dbfs"], dtype=float)
+    measured_smooth = gaussian_filter1d(measured, sigma=4.0, mode="nearest")
+    confidence, uncertainty = _measurement_confidence(measurement)
+    training, holdout, validation_groups, validation_info = _validation_data(
+        measurement, measured_smooth, frequencies
+    )
+
+    calibrated_external = bool(
+        not internal_mic and measurement.get("microphone_calibration")
+    )
+    if internal_mic:
+        maximum_boost = 1.5
+        maximum_filters = 6
+        q_bounds = (0.5, 2.0)
+        frequency_range = (160.0, 10_000.0)
+    elif calibrated_external:
+        maximum_boost = 3.0
+        maximum_filters = 10
+        q_bounds = (0.4, 4.0)
+        frequency_range = (100.0, 14_000.0)
+    else:
+        maximum_boost = 2.0
+        maximum_filters = 8
+        q_bounds = (0.45, 3.0)
+        frequency_range = (140.0, 12_000.0)
+
+    base_target = pleasant_in_room_target(frequencies, "neutral")
+    selected_target = pleasant_in_room_target(frequencies, voicing)
+    valid = (
+        (frequencies >= frequency_range[0])
+        & (frequencies <= frequency_range[1])
+    )
+    # Alignment remains intentionally low: cuts are the normal solution.  The
+    # held-out repeat is not used to choose this offset or filter count.
+    offset = _weighted_quantile(
+        training[valid] - selected_target[valid], confidence[valid], 0.22
+    )
+    aligned_target = selected_target + offset
+    safety_highpass = 2.0 * _highpass_response_db(
+        frequencies, 55.0, 0.707, measurement["rate_hz"]
+    )
+    desired = np.clip(aligned_target - training - safety_highpass, -8.0, 4.0)
+    safe_boost_floor = _safe_boost_floor(frequencies, training, confidence)
+
+    weights = confidence.copy()
+    weights[~valid] *= 0.1
+    weights /= max(float(np.mean(weights[valid])), 1e-9)
+    boost_decisions = [
+        _boost_decision(
+            float(center), frequencies, desired, confidence, safe_boost_floor
+        )
+        for center in DIAGNOSTIC_CENTERS
+    ]
+
+    filters: list[dict] = []
+    parameters = np.asarray([], dtype=float)
+    optimizer_results = []
+    selection_trace = []
+    current_peq = np.zeros_like(frequencies)
+    current_train_rmse = _weighted_rmse(
+        training, safety_highpass, aligned_target, weights, valid
+    )
+    current_holdout_rmse = _weighted_rmse(
+        holdout, safety_highpass, aligned_target, weights, valid
+    )
+    current_group_rmse = [
+        _weighted_rmse(group, safety_highpass, aligned_target, weights, valid)
+        for group in validation_groups
+    ]
+    real_holdout = validation_info["mode"] != "aggregate-only"
+    # A built-in microphone needs a larger win before another filter is worth
+    # trusting.  Calibrated external measurements may justify finer changes.
+    if not real_holdout:
+        minimum_improvement = 0.12
+    elif internal_mic:
+        minimum_improvement = 0.10
+    elif calibrated_external:
+        minimum_improvement = 0.04
+    else:
+        minimum_improvement = 0.06
+
+    for _ in range(maximum_filters):
+        residual = training + safety_highpass + current_peq - aligned_target
+        cut_score = gaussian_filter1d(
+            np.maximum(residual, 0.0) * confidence, sigma=2.0, mode="nearest"
+        )
+        boost_score = gaussian_filter1d(
+            np.maximum(-residual, 0.0) * confidence, sigma=2.0, mode="nearest"
+        )
+        candidate_specs = []
+        for index in _candidate_indices(cut_score, valid, 7):
+            if cut_score[index] < 0.30:
+                continue
+            center = float(frequencies[index])
+            if any(abs(math.log2(center / item["center_hz"])) < 0.22 for item in filters):
+                continue
+            candidate_specs.append(_new_filter(
+                "cut", index, residual, frequencies, q_bounds,
+                frequency_range, internal_mic, maximum_boost,
+            ))
+        for index in _candidate_indices(boost_score, valid, 4):
+            center = float(frequencies[index])
+            decision = _boost_decision(
+                center, frequencies, desired, confidence, safe_boost_floor
+            )
+            if not decision["permitted"]:
+                continue
+            if any(abs(math.log2(center / item["center_hz"])) < 0.30 for item in filters):
+                continue
+            candidate_specs.append(_new_filter(
+                "boost", index, residual, frequencies, q_bounds,
+                frequency_range, internal_mic, maximum_boost,
+            ))
+
+        best = None
+        for candidate in candidate_specs:
+            trial_filters = filters + [candidate]
+            trial_initial = np.concatenate((
+                parameters,
+                _initial_parameters([candidate]),
+            ))
+            trial_parameters, result, train_rmse = _fit_filters(
+                frequencies, training, aligned_target, weights, valid,
+                safety_highpass, trial_filters, measurement["rate_hz"], trial_initial,
+            )
+            trial_peq, _, _, trial_gains = _filter_correction(
+                frequencies, trial_filters, trial_parameters, measurement["rate_hz"]
+            )
+            if abs(float(trial_gains[-1])) < 0.12:
+                continue
+            correction = safety_highpass + trial_peq
+            holdout_rmse = _weighted_rmse(
+                holdout, correction, aligned_target, weights, valid
+            )
+            group_rmse = [
+                _weighted_rmse(group, correction, aligned_target, weights, valid)
+                for group in validation_groups
+            ]
+            train_improvement = current_train_rmse - train_rmse
+            holdout_improvement = current_holdout_rmse - holdout_rmse
+            worst_change = max(group_rmse) - max(current_group_rmse)
+            accepted = (
+                train_improvement >= minimum_improvement
+                and holdout_improvement >= minimum_improvement
+                and worst_change <= 0.06
+            )
+            if not accepted:
+                continue
+            score = holdout_improvement + 0.35 * train_improvement - max(0.0, worst_change)
+            if best is None or score > best["score"]:
+                best = {
+                    "score": score,
+                    "candidate": candidate,
+                    "filters": trial_filters,
+                    "parameters": trial_parameters,
+                    "result": result,
+                    "peq": trial_peq,
+                    "train_rmse": train_rmse,
+                    "holdout_rmse": holdout_rmse,
+                    "group_rmse": group_rmse,
+                    "train_improvement": train_improvement,
+                    "holdout_improvement": holdout_improvement,
+                }
+        if best is None:
+            break
+        filters = best["filters"]
+        parameters = best["parameters"]
+        current_peq = best["peq"]
+        current_train_rmse = best["train_rmse"]
+        current_holdout_rmse = best["holdout_rmse"]
+        current_group_rmse = best["group_rmse"]
+        optimizer_results.append(best["result"])
+        _, centers_now, q_now, gains_now = _filter_correction(
+            frequencies, filters, parameters, measurement["rate_hz"]
+        )
+        selection_trace.append({
+            "filter": len(filters),
+            "kind": best["candidate"]["kind"],
+            "frequency_hz": round(float(centers_now[-1]), 1),
+            "q": round(float(q_now[-1]), 3),
+            "gain_db": round(float(gains_now[-1]), 2),
+            "training_improvement_db": round(best["train_improvement"], 3),
+            "held_out_improvement_db": round(best["holdout_improvement"], 3),
+        })
+
+    # Filter count has now been selected without the held-out repeat. Refit the
+    # accepted structure to the robust all-capture aggregate, but keep the
+    # training fit if the refit degrades held-out behavior materially.
+    if filters:
+        final_parameters, final_result, _ = _fit_filters(
+            frequencies, measured_smooth, aligned_target, weights, valid,
+            safety_highpass, filters, measurement["rate_hz"], parameters,
+        )
+        final_peq, _, _, _ = _filter_correction(
+            frequencies, filters, final_parameters, measurement["rate_hz"]
+        )
+        final_holdout = _weighted_rmse(
+            holdout, safety_highpass + final_peq, aligned_target, weights, valid
+        )
+        final_group_rmse = [
+            _weighted_rmse(
+                group, safety_highpass + final_peq, aligned_target, weights, valid
+            )
+            for group in validation_groups
+        ]
+        if (
+            final_holdout <= current_holdout_rmse + 0.05
+            and max(final_group_rmse) <= max(current_group_rmse) + 0.08
+        ):
+            parameters = final_parameters
+            current_peq = final_peq
+            current_holdout_rmse = final_holdout
+            current_group_rmse = final_group_rmse
+            optimizer_results.append(final_result)
+
+    _, centers, q_values, gains = _filter_correction(
+        frequencies, filters, parameters, measurement["rate_hz"]
+    )
+    if gains.size:
+        keep = np.abs(gains) >= 0.08
+        centers = centers[keep]
+        q_values = q_values[keep]
+        gains = gains[keep]
+        order = np.argsort(centers)
+        centers, q_values, gains = centers[order], q_values[order], gains[order]
+    correction = safety_highpass + filter_response_db(
+        frequencies,
+        gains,
+        measurement["rate_hz"],
+        centers_hz=centers,
+        q_values=q_values,
+    )
+    predicted = measured_smooth + correction
+    positive_peak = max(0.0, float(np.max(correction)))
+    headroom_db = max(1.0, math.ceil((positive_peak + 1.0) * 100.0) / 100.0)
+    before_rmse = _weighted_rmse(
+        measured_smooth, np.zeros_like(frequencies), aligned_target, weights, valid
+    )
+    after_rmse = _weighted_rmse(
+        measured_smooth, correction, aligned_target, weights, valid
+    )
+    cv_before = _weighted_rmse(
+        holdout, safety_highpass, aligned_target, weights, valid
+    )
+    cv_after = _weighted_rmse(
+        holdout, correction, aligned_target, weights, valid
+    )
+    cut_limits = [_cut_limit_at(float(center), internal_mic) for center in centers]
+    filters_payload = [
+        {
+            "type": "peaking",
+            "frequency_hz": round(float(center), 1),
+            "q": round(float(q), 3),
+            "gain_db": round(float(gain), 2),
+        }
+        for center, q, gain in zip(centers, q_values, gains)
+    ]
+
+    return {
+        "algorithm": "adaptive-cross-validated-peq-v2",
+        "filter_strategy": "adaptive frequency, bandwidth, gain, and count",
+        "filter_count": len(filters_payload),
+        "maximum_filter_count": maximum_filters,
+        "filters": filters_payload,
+        # Parallel arrays remain for PipeWire and older panel compatibility.
+        "centers_hz": [item["frequency_hz"] for item in filters_payload],
+        "q": [item["q"] for item in filters_payload],
+        "gains_db": [item["gain_db"] for item in filters_payload],
+        "q_bounds": list(q_bounds),
+        "cut_limit_db": CUT_LIMIT_DB,
+        "cut_limits_db": np.round(cut_limits, 2).tolist(),
+        "maximum_allowed_boost_db": maximum_boost,
+        "actual_maximum_boost_db": round(
+            max(0.0, float(np.max(gains))) if gains.size else 0.0, 2
+        ),
+        "safe_boost_floor_hz": round(safe_boost_floor, 1),
+        "boost_decisions": boost_decisions,
+        "headroom_db": headroom_db,
+        "input_gain_linear": round(10.0 ** (-headroom_db / 20.0), 6),
+        "weighted_rmse_before_db": round(before_rmse, 3),
+        "weighted_rmse_after_db": round(after_rmse, 3),
+        "cross_validation": {
+            **validation_info,
+            "rmse_before_db": round(cv_before, 3),
+            "rmse_after_db": round(cv_after, 3),
+            "minimum_filter_improvement_db": minimum_improvement,
+            "selection_trace": selection_trace,
+        },
+        "target": {
+            "name": "Pleasant in-room loudspeaker target",
+            "basis": "gentle bass rise, flat midband, gradual treble decline",
+            "voicing": voicing,
+            "relative_db": np.round(base_target, 3).tolist(),
+            "selected_relative_db": np.round(selected_target, 3).tolist(),
+            "aligned_db": np.round(aligned_target, 3).tolist(),
+            "offset_db": round(offset, 3),
+        },
+        "measured_smoothed_db": np.round(measured_smooth, 3).tolist(),
+        "predicted_response_db": np.round(predicted, 3).tolist(),
+        "correction_response_db": np.round(correction, 3).tolist(),
+        "confidence": np.round(confidence, 3).tolist(),
+        "uncertainty_db": np.round(uncertainty, 3).tolist(),
+        "objective": round(after_rmse * after_rmse, 6),
+        "optimizer_success": all(
+            result is None or bool(result.success) for result in optimizer_results
+        ),
+        "optimizer_message": (
+            str(optimizer_results[-1].message)
+            if optimizer_results else "No filter passed held-out validation."
+        ),
+    }

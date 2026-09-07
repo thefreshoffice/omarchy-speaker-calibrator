@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.wav
+*.json.tmp
+.DS_Store

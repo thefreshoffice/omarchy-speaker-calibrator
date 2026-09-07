@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "local.speaker-calibrator",
+  "name": "Speaker Calibrator",
+  "version": "0.6.0",
+  "author": "Slimbook user and Codex",
+  "license": "MIT",
+  "description": "Measure with one or many microphones and generate adaptive, repeat-validated, protected parametric speaker tuning.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Speaker Calibrator",
+    "description": "Open the native panel to measure, review, install, and bypass speaker calibration.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
