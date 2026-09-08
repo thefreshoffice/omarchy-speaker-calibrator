@@ -27,6 +27,13 @@ Panel {
   property string loudnessMode: "protected"
   property bool advanced: false
   property bool _optionsAdopted: false
+  // Selected device rows; -1 until the device list arrives.
+  property int sinkIndex: -1
+  property int micIndex: -1
+  readonly property string internalMicHint:
+    "Built-in microphones sit right next to the speakers. They hear the speaker itself very well but not what reaches you, so the calibration stays deliberately cautious with them. Still a big improvement."
+  readonly property string externalMicHint:
+    "A measurement microphone placed where you listen captures what actually reaches you, desk and all, so the correction can be finer and go further. This makes a big difference."
 
   function open() { root.controller.show(); service.refresh() }
   function close() { root.controller.hide() }
@@ -41,7 +48,7 @@ Panel {
 
   // ---- devices -------------------------------------------------------------
   function channelOptions() {
-    var mic = service.microphones[micBox.currentIndex]
+    var mic = service.microphones[root.micIndex]
     var count = mic ? Math.max(1, Number(mic.channels || 1)) : 1
     var result = []
     if (mic && mic.internal === true && count > 1) {
@@ -54,26 +61,30 @@ Panel {
     return result
   }
   function selectedChannelValue() {
-    var mic = service.microphones[micBox.currentIndex]
+    var mic = service.microphones[root.micIndex]
     var count = mic ? Math.max(1, Number(mic.channels || 1)) : 1
     if (mic && mic.internal === true && count > 1)
       return channelBox.currentIndex === 0 ? "all" : channelBox.currentIndex - 1
     return channelBox.currentIndex
   }
   function multiMicAvailable() {
-    var mic = service.microphones[micBox.currentIndex]
+    var mic = service.microphones[root.micIndex]
     return !!(mic && mic.internal === true && Number(mic.channels || 1) > 1)
   }
   function selectedMicIsInternal() {
-    var mic = service.microphones[micBox.currentIndex]
+    var mic = service.microphones[root.micIndex]
     return mic ? mic.internal === true : true
   }
   // Zero-knowledge default: the laptop's own speakers and microphones.
   function selectInternalDevices() {
+    var sink = -1
     for (var sinkIndex = 0; sinkIndex < service.sinks.length; sinkIndex++)
-      if (service.sinks[sinkIndex].internal === true) { sinkBox.currentIndex = sinkIndex; break }
+      if (service.sinks[sinkIndex].internal === true) { sink = sinkIndex; break }
+    root.sinkIndex = sink >= 0 ? sink : (service.sinks.length > 0 ? 0 : -1)
+    var mic = -1
     for (var micIndex = 0; micIndex < service.microphones.length; micIndex++)
-      if (service.microphones[micIndex].internal === true) { micBox.currentIndex = micIndex; break }
+      if (service.microphones[micIndex].internal === true) { mic = micIndex; break }
+    root.micIndex = mic >= 0 ? mic : (service.microphones.length > 0 ? 0 : -1)
   }
 
   // ---- options -------------------------------------------------------------
@@ -555,29 +566,94 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          GridLayout {
+          Column {
             width: parent.width
-            columns: 2
-            columnSpacing: Style.space(10)
-            rowSpacing: Style.space(8)
+            spacing: Style.space(6)
 
-            Text { text: "SPEAKERS"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
-            QQC.ComboBox {
-              id: sinkBox
-              Layout.fillWidth: true
-              model: service.sinks.map(function(item) { return item.description })
-              enabled: !service.busy && model.length > 0
+            PanelSectionHeader { text: "SPEAKERS"; foreground: root.foreground; fontFamily: root.fontFamily }
+            Repeater {
+              model: service.sinks
+              Button {
+                width: parent.width
+                leftAlign: true
+                bordered: true
+                selected: index === root.sinkIndex
+                iconText: "󰓃"
+                text: modelData.description + (modelData.internal ? "  ·  built-in" : "  ·  external")
+                tooltipText: modelData.internal
+                  ? "The laptop's own speakers."
+                  : "An external output; the sweeps play through it and the correction is installed in front of it."
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: root.sinkIndex = index
+              }
+            }
+            Text {
+              visible: service.sinks.length === 0
+              width: parent.width
+              text: "No speakers found. Middle-click the bar icon to refresh."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader { text: "MICROPHONE"; foreground: root.foreground; fontFamily: root.fontFamily }
+            Repeater {
+              model: service.microphones
+              Button {
+                width: parent.width
+                leftAlign: true
+                bordered: true
+                selected: index === root.micIndex
+                iconText: "󰍬"
+                text: modelData.description
+                  + (modelData.internal
+                      ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
+                      : "  ·  external")
+                tooltipText: modelData.internal ? root.internalMicHint : root.externalMicHint
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+              }
+            }
+            Text {
+              visible: service.microphones.length === 0
+              width: parent.width
+              text: "No microphone found. Plug one in or middle-click the bar icon to refresh."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
-            Text { text: "MICROPHONE"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
-            QQC.ComboBox {
-              id: micBox
-              Layout.fillWidth: true
-              model: service.microphones.map(function(item) {
-                return (item.internal ? "Built-in — " : "External — ") + item.description
-              })
-              enabled: !service.busy && model.length > 0
-              onCurrentIndexChanged: channelBox.currentIndex = 0
+            RowLayout {
+              width: parent.width
+              spacing: Style.space(8)
+              PanelActionButton {
+                id: micInfo
+                Layout.alignment: Qt.AlignTop
+                iconText: "󰋽"
+                tooltipText: root.selectedMicIsInternal() ? root.internalMicHint : root.externalMicHint
+                foreground: root.dim
+                fontFamily: root.fontFamily
+              }
+              Text {
+                Layout.fillWidth: true
+                Layout.alignment: Qt.AlignVCenter
+                text: "The built-in microphones already give a big improvement. An external measurement microphone placed where you sit makes a big difference."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
             }
           }
 
@@ -590,10 +666,10 @@ Panel {
             bordered: true
             selected: true
             focusable: true
-            enabled: !service.busy && sinkBox.currentIndex >= 0 && micBox.currentIndex >= 0
+            enabled: !service.busy && root.sinkIndex >= 0 && root.micIndex >= 0
             onClicked: {
-              var sink = service.sinks[sinkBox.currentIndex]
-              var mic = service.microphones[micBox.currentIndex]
+              var sink = service.sinks[root.sinkIndex]
+              var mic = service.microphones[root.micIndex]
               service.measure(sink.name, mic.name, root.selectedChannelValue(), root.options(), true)
             }
           }
