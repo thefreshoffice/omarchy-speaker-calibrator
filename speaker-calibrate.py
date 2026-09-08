@@ -54,6 +54,11 @@ FRAGMENT = CONFIG / "pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf"
 UNIT = CONFIG / "systemd/user/omarchy-speaker-tuning.service"
 PROFILE = DATA / "active-profile.json"
 PROPOSAL = DATA / "proposed-profile.json"
+# The profile that the last install replaced, kept so the two can be swapped
+# in and out for a level-honest listening comparison.
+PREVIOUS_GRAPH = DATA / "previous-tuning.conf"
+PREVIOUS_PROFILE = DATA / "previous-profile.json"
+COMPARE_STATE = DATA / "compare-state.json"
 SERVICE = "omarchy-speaker-tuning.service"
 VIRTUAL_SINK = "omarchy_speaker_tuning"
 
@@ -86,6 +91,14 @@ RestartSec=2
 [Install]
 WantedBy=graphical-session.target
 """
+
+
+def plugin_version():
+    try:
+        manifest = json.loads((Path(__file__).resolve().parent / "manifest.json").read_text())
+        return str(manifest.get("version", "unknown"))
+    except (OSError, ValueError):
+        return "unknown"
 
 
 def run(args, *, check=True, capture=False):
@@ -229,17 +242,54 @@ def move_apps(target):
             run(["pactl", "move-sink-input", str(stream["index"]), target], check=False)
 
 
-def install_profile(profile, graph):
-    if not Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl").exists():
-        raise SystemExit("Missing lsp-plugins-lv2. Install it with: omarchy pkg add lsp-plugins-lv2")
-    for path in (HOST, FRAGMENT, UNIT):
-        backup(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-    HOST.write_text(HOST_TEXT)
-    FRAGMENT.write_text(graph)
-    UNIT.write_text(UNIT_TEXT)
-    DATA.mkdir(parents=True, exist_ok=True)
-    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+def swap_files(first, second):
+    """Exchange the contents of two files."""
+    first_text = first.read_text()
+    second_text = second.read_text()
+    first.write_text(second_text)
+    second.write_text(first_text)
+
+
+def compare_state():
+    try:
+        state = json.loads(COMPARE_STATE.read_text())
+    except (OSError, ValueError):
+        state = {}
+    if state.get("active") not in ("current", "previous"):
+        state["active"] = "current"
+    return state
+
+
+def profile_summary(path):
+    """A short label for a saved profile, or None when there is none."""
+    try:
+        profile = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    fit = profile.get("fit") or {}
+    created = str(profile.get("created_at", ""))[:16].replace("T", " ")
+    return {
+        "created_at": profile.get("created_at"),
+        "label": f"{created} · {fit.get('filter_count', 0)} filters · "
+                 f"{'flat' if profile.get('voicing') == 'neutral' else 'warm'}",
+        "plugin_version": profile.get("plugin_version"),
+    }
+
+
+def keep_previous_profile():
+    """Set the installed profile aside so the next one can be compared with it."""
+    if not (FRAGMENT.exists() and PROFILE.exists()):
+        return
+    if compare_state()["active"] == "previous":
+        # The previous graph is currently installed; put the current one back
+        # first so "previous" always means the profile being replaced now.
+        swap_files(FRAGMENT, PREVIOUS_GRAPH)
+    shutil.copy2(FRAGMENT, PREVIOUS_GRAPH)
+    shutil.copy2(PROFILE, PREVIOUS_PROFILE)
+    COMPARE_STATE.write_text(json.dumps({"active": "current"}) + "\n")
+
+
+def restart_tuning():
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", SERVICE])
     run(["systemctl", "--user", "restart", SERVICE])
@@ -249,6 +299,43 @@ def install_profile(profile, graph):
             return
         time.sleep(0.25)
     raise SystemExit("The tuning sink did not appear; inspect the user service status.")
+
+
+def install_profile(profile, graph):
+    if not Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl").exists():
+        raise SystemExit("Missing lsp-plugins-lv2. Install it with: omarchy pkg add lsp-plugins-lv2")
+    DATA.mkdir(parents=True, exist_ok=True)
+    keep_previous_profile()
+    for path in (HOST, FRAGMENT, UNIT):
+        backup(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    HOST.write_text(HOST_TEXT)
+    FRAGMENT.write_text(graph)
+    UNIT.write_text(UNIT_TEXT)
+    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+    restart_tuning()
+
+
+def compare_payload():
+    state = compare_state()
+    return {
+        "available": PREVIOUS_GRAPH.exists() and FRAGMENT.exists(),
+        "active": state["active"],
+        "current": profile_summary(PROFILE),
+        "previous": profile_summary(PREVIOUS_PROFILE),
+    }
+
+
+def compare_toggle():
+    """Swap the installed graph with the previous one and restart the tuning."""
+    if not (PREVIOUS_GRAPH.exists() and FRAGMENT.exists()):
+        raise SystemExit("No previous profile to compare with; install a second profile first.")
+    state = compare_state()
+    swap_files(FRAGMENT, PREVIOUS_GRAPH)
+    state["active"] = "previous" if state["active"] == "current" else "current"
+    COMPARE_STATE.write_text(json.dumps(state) + "\n")
+    restart_tuning()
+    return compare_payload()
 
 
 def analyze_recording(
@@ -427,6 +514,7 @@ def profile_from_measurement(sink, mic, channel, voicing, measurement):
         )
     profile = {
         "schema_version": 5,
+        "plugin_version": plugin_version(),
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "speaker": {"name": sink["name"], "description": label(sink)},
         "microphone": {
@@ -542,7 +630,8 @@ def status_payload():
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
     return {"service": active or "inactive", "defaultSink": default or "unknown",
             "profile": profile, "proposal": proposal,
-            "enabled": active == "active" and default == VIRTUAL_SINK}
+            "enabled": active == "active" and default == VIRTUAL_SINK,
+            "compare": compare_payload()}
 
 
 def choose_mic():
@@ -638,6 +727,12 @@ def status():
     payload = status_payload()
     profile = payload["profile"]
     print(f"Service: {payload['service']}\nDefault output: {payload['defaultSink']}")
+    compare = payload["compare"]
+    if compare["available"]:
+        playing = compare[compare["active"]]
+        print(f"Playing: {compare['active']} profile"
+              + (f" ({playing['label']})" if playing else "")
+              + " · run 'compare-toggle' to hear the other one")
     if profile:
         print(f"Speaker: {profile['speaker']['description']}\nMicrophone: {profile['microphone']['description']}")
         gains = profile.get("fit", {}).get("gains_db") if profile.get("fit") else None
@@ -659,7 +754,8 @@ def disable():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
-    for name in ("wizard", "status", "status-json", "devices-json", "install-proposal", "disable"):
+    for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
+                 "disable", "compare-toggle"):
         sub.add_parser(name)
     calibrate = sub.add_parser("calibrate-json")
     calibrate.add_argument("--sink", required=True)
@@ -684,6 +780,8 @@ def main():
         print(json.dumps(reanalyze_saved_capture(args.voicing, args.channel)))
     elif command == "install-proposal":
         print(json.dumps(install_proposal()))
+    elif command == "compare-toggle":
+        print(json.dumps(compare_toggle()))
     else:
         {"wizard": wizard, "status": status, "disable": disable}[command]()
 

@@ -105,6 +105,11 @@ long-lived Omarchy shell process.
   selected. Individual channels remain available for troubleshooting.
 - Measure first, review the proposed filters and graph, then explicitly install
   the profile.
+- After a second install, **Hear the previous profile** swaps the profile that
+  was replaced back in, and pressing it again returns to the current one, so two
+  measurements or two plugin versions can be compared by ear on the same music.
+  The command-line equivalent is `compare-toggle`; `status` says which one is
+  playing.
 
 The wizard asks you to select a physical speaker sink, microphone, microphone
 channel, and flat or warm voicing. For an external microphone, an optional

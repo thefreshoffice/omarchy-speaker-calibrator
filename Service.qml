@@ -21,7 +21,7 @@ Item {
     error = ""
     message = operation === "measure"
       ? "Checking the level, then playing six left/right sweeps — about 30 seconds…"
-      : "Working…"
+      : operation === "compare" ? "Switching profiles…" : "Working…"
     _stdout = ""
     _stderr = ""
     // Keep mise/user-site packages from shadowing Arch's matched NumPy/SciPy
@@ -42,6 +42,7 @@ Item {
   }
   function install() { start("install", ["install-proposal"]) }
   function disable() { start("disable", ["disable"]) }
+  function compare() { start("compare", ["compare-toggle"]) }
 
   Process {
     id: process
@@ -85,8 +86,16 @@ Item {
           else
             root.message = "Measurement rejected — follow the retry guidance below"
         } else if (root.phase === "install") {
-          root.status = { service: "active", enabled: true, profile: JSON.parse(raw) }
+          root.status = { service: "active", enabled: true, profile: JSON.parse(raw),
+                          compare: root.status.compare }
           root.message = "Profile installed and enabled"
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "compare") {
+          var compare = JSON.parse(raw)
+          var playing = compare[compare.active]
+          root.status = Object.assign({}, root.status, { compare: compare })
+          root.message = "Now playing the " + compare.active + " profile"
+            + (playing && playing.label ? " · " + playing.label : "")
         } else if (root.phase === "disable") {
           root.status = { service: "inactive", enabled: false, profile: root.status.profile }
           root.message = "Calibration disabled"

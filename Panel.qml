@@ -161,7 +161,10 @@ Panel {
             width: parent.width
             title: "Speaker Calibrator"
             meta: service.busy ? service.message
-              : (service.status.enabled ? "Protected profile active" : "Ready to measure")
+              : (service.status.enabled
+                  ? (service.status.compare && service.status.compare.active === "previous"
+                      ? "Previous profile playing for comparison" : "Protected profile active")
+                  : "Ready to measure")
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -608,6 +611,19 @@ Panel {
                 && service.proposal.quality.accepted === true
               onClicked: service.install()
             }
+          }
+
+          Button {
+            visible: service.status.enabled && service.status.compare !== undefined
+              && service.status.compare.available === true
+            width: parent.width
+            text: service.busy && service.phase === "compare" ? "Switching…"
+              : (service.status.compare && service.status.compare.active === "previous"
+                  ? "Switch back to the current profile" : "Hear the previous profile")
+            iconText: "󰓦"
+            bordered: true
+            enabled: !service.busy
+            onClicked: service.compare()
           }
 
           Button {

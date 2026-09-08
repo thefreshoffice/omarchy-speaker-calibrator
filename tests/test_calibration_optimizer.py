@@ -3,6 +3,7 @@
 import sys
 import unittest
 import importlib.util
+import tempfile
 import json
 from pathlib import Path
 
@@ -217,6 +218,32 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertEqual(result["filter_count"], 1)
         self.assertGreater(result["q"][0], 2.0)
         self.assertLessEqual(result["q"][0], 4.0)
+
+
+class CompareToggleTests(unittest.TestCase):
+    def test_swap_files_exchanges_contents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first = Path(folder) / "a.conf"
+            second = Path(folder) / "b.conf"
+            first.write_text("current graph")
+            second.write_text("previous graph")
+            speaker_calibrate.swap_files(first, second)
+            self.assertEqual(first.read_text(), "previous graph")
+            self.assertEqual(second.read_text(), "current graph")
+
+    def test_profile_summary_labels_a_saved_profile(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "profile.json"
+            path.write_text(json.dumps({
+                "created_at": "2026-09-08T20:00:00+00:00",
+                "voicing": "neutral",
+                "fit": {"filter_count": 4},
+                "plugin_version": "0.8.0",
+            }))
+            summary = speaker_calibrate.profile_summary(path)
+            self.assertEqual(summary["label"], "2026-09-08 20:00 · 4 filters · flat")
+            self.assertEqual(summary["plugin_version"], "0.8.0")
+            self.assertIsNone(speaker_calibrate.profile_summary(Path(folder) / "missing.json"))
 
 
 if __name__ == "__main__":
