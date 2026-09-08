@@ -20,14 +20,28 @@ DIAGNOSTIC_CENTERS = np.asarray(
     [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
      2500.0, 4000.0, 6300.0, 10000.0]
 )
-CUT_LIMIT_DB = -6.0
+# Depth limits apply to the whole correction at a frequency, not to each
+# filter.  Stacked shallow filters used to add up to the same depth anyway;
+# one deep filter does the same job with less interaction between sections,
+# so a single section may go as deep as the total limit allows.
+CUT_LIMIT_DB = -15.0
+PER_FILTER_CUT_LIMIT_DB = CUT_LIMIT_DB
 INTERNAL_CUT_ANCHORS_HZ = np.asarray(
     [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
      2500.0, 4000.0, 6300.0, 10000.0]
 )
+# A built-in microphone's own response is unknown at the band edges, so the
+# whole correction stays shallower there.
 INTERNAL_CUT_LIMITS_DB = np.asarray(
-    [-3.0, -4.0, -5.0, -6.0, -6.0, -6.0, -6.0, -6.0, -5.0, -3.5]
+    [-6.0, -8.0, -10.0, -13.0, -15.0, -15.0, -15.0, -15.0, -13.0, -8.0]
 )
+# Shelves handle a residual that stays high all the way to a band edge, so a
+# tilt costs one section instead of several overlapping peaking filters.
+# They are cut-only: a shelf boost would extend below the knee or above the
+# measured band, exactly where boosting is forbidden.
+SHELF_Q_BOUNDS = (0.5, 1.0)
+LOW_SHELF_CORNERS_HZ = (200.0, 300.0, 450.0)
+HIGH_SHELF_CORNERS_HZ = (2500.0, 4000.0, 6300.0)
 
 
 def _log_interpolate(frequencies: np.ndarray, anchors_hz, anchors_db) -> np.ndarray:
@@ -172,6 +186,39 @@ def _lowshelf_response_db(
     return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
 
 
+def _highshelf_response_db(
+    frequencies: np.ndarray, corner: float, q: float, gain_db: float, rate: int
+) -> np.ndarray:
+    """Exact RBJ high-shelf magnitude response."""
+    amplitude = 10.0 ** (gain_db / 40.0)
+    omega0 = 2.0 * math.pi * corner / rate
+    alpha = math.sin(omega0) / (2.0 * q)
+    cos0 = math.cos(omega0)
+    root_term = 2.0 * math.sqrt(amplitude) * alpha
+    b0 = amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cos0 + root_term)
+    b1 = -2.0 * amplitude * ((amplitude - 1.0) + (amplitude + 1.0) * cos0)
+    b2 = amplitude * ((amplitude + 1.0) + (amplitude - 1.0) * cos0 - root_term)
+    a0 = (amplitude + 1.0) - (amplitude - 1.0) * cos0 + root_term
+    a1 = 2.0 * ((amplitude - 1.0) - (amplitude + 1.0) * cos0)
+    a2 = (amplitude + 1.0) - (amplitude - 1.0) * cos0 - root_term
+    omega = 2.0 * math.pi * frequencies / rate
+    z1 = np.exp(-1j * omega)
+    z2 = z1 * z1
+    numerator = b0 + b1 * z1 + b2 * z2
+    denominator = a0 + a1 * z1 + a2 * z2
+    return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
+
+
+def _section_response_db(
+    frequencies: np.ndarray, shape: str, center: float, q: float, gain_db: float, rate: int
+) -> np.ndarray:
+    if shape == "lowshelf":
+        return _lowshelf_response_db(frequencies, center, q, gain_db, rate)
+    if shape == "highshelf":
+        return _highshelf_response_db(frequencies, center, q, gain_db, rate)
+    return _peaking_response_db(frequencies, center, q, gain_db, rate)
+
+
 def bass_shelf(knee_hz: float, bass: str) -> dict | None:
     """The full-bass shelf for this measurement, or None for normal bass."""
     if bass != "full":
@@ -208,17 +255,21 @@ def filter_response_db(
     *,
     centers_hz: np.ndarray | list[float] | None = None,
     q_values: np.ndarray | list[float] | None = None,
+    shapes: list[str] | None = None,
 ) -> np.ndarray:
-    """Return the summed response of any number of parametric filters."""
+    """Return the summed response of any number of parametric sections."""
     frequencies = np.asarray(frequencies, dtype=float)
     gains = np.asarray(gains_db, dtype=float)
     centers = np.asarray(centers_hz if centers_hz is not None else [], dtype=float)
     q_array = np.asarray(q_values if q_values is not None else [], dtype=float)
     if not (centers.size == q_array.size == gains.size):
         raise ValueError("Parametric filter frequency, Q, and gain arrays must match.")
+    shape_list = list(shapes) if shapes is not None else ["peaking"] * gains.size
+    if len(shape_list) != gains.size:
+        raise ValueError("Filter shapes must match the number of filters.")
     response = np.zeros_like(frequencies)
-    for center, q, gain in zip(centers, q_array, gains):
-        response += _peaking_response_db(frequencies, center, q, float(gain), rate)
+    for center, q, gain, shape in zip(centers, q_array, gains, shape_list):
+        response += _section_response_db(frequencies, shape, center, q, float(gain), rate)
     return response
 
 
@@ -256,11 +307,31 @@ def _safe_boost_floor(
 
 
 def _cut_limit_at(center: float, internal_mic: bool) -> float:
+    """Deepest the whole correction may go at this frequency."""
     if not internal_mic:
         return CUT_LIMIT_DB
     return float(np.interp(
         math.log(center), np.log(INTERNAL_CUT_ANCHORS_HZ), INTERNAL_CUT_LIMITS_DB
     ))
+
+
+def _total_cut_limit(frequencies: np.ndarray, internal_mic: bool) -> np.ndarray:
+    if not internal_mic:
+        return np.full(frequencies.size, CUT_LIMIT_DB)
+    return np.interp(
+        np.log(frequencies), np.log(INTERNAL_CUT_ANCHORS_HZ), INTERNAL_CUT_LIMITS_DB
+    )
+
+
+def _filter_cut_limit_at(center: float, internal_mic: bool) -> float:
+    """Deepest one section may go: the per-filter limit, or the total where tighter."""
+    return max(PER_FILTER_CUT_LIMIT_DB, _cut_limit_at(center, internal_mic))
+
+
+def _window_cut_limit(low_hz: float, high_hz: float, internal_mic: bool) -> float:
+    """The least-negative single-filter limit anywhere a section can reach."""
+    samples = np.geomspace(max(low_hz, 1.0), max(high_hz, low_hz, 1.0), 9)
+    return max(_filter_cut_limit_at(float(value), internal_mic) for value in samples)
 
 
 def _boost_decision(
@@ -406,7 +477,8 @@ def _filter_correction(
     q_values = np.exp(shaped[:, 1])
     gains = shaped[:, 2]
     response = filter_response_db(
-        frequencies, gains, rate, centers_hz=centers, q_values=q_values
+        frequencies, gains, rate, centers_hz=centers, q_values=q_values,
+        shapes=[item.get("shape", "peaking") for item in filters],
     )
     return response, centers, q_values, gains
 
@@ -439,6 +511,7 @@ def _fit_filters(
     filters: list[dict],
     rate: int,
     initial: np.ndarray | None = None,
+    total_limit: np.ndarray | None = None,
 ) -> tuple[np.ndarray, object, float]:
     if not filters:
         return np.asarray([], dtype=float), None, _weighted_rmse(
@@ -452,9 +525,17 @@ def _fit_filters(
         correction = safety_highpass + peq
         residual = training[valid] + correction[valid] - target[valid]
         data_cost = float(np.average(residual * residual, weights=weights[valid]))
+        # The depth limit applies to the sum of all sections, so overlapping
+        # cuts cannot add up past what one filter is allowed to do.
+        depth_cost = 0.0
+        if total_limit is not None:
+            below = np.minimum(peq[valid] - total_limit[valid], 0.0)
+            depth_cost = 1.5 * float(np.sum(below * below))
         cuts = np.minimum(gains, 0.0)
         boosts = np.maximum(gains, 0.0)
-        complexity = 0.006 * float(np.sum(cuts * cuts))
+        # Linear in depth on purpose: a quadratic penalty made two shallow
+        # sections cheaper than one deep one and rewarded stacking.
+        complexity = 0.03 * float(np.sum(np.abs(cuts)))
         boost_cost = 0.080 * float(np.sum(boosts * boosts))
         count_cost = 0.035 * len(filters)
         narrow_thresholds = np.asarray([
@@ -471,7 +552,7 @@ def _fit_filters(
                 overlap_cost += 0.02 * max(0.0, 0.28 - distance) ** 2
         return (
             data_cost + complexity + boost_cost + count_cost
-            + narrow_cost + headroom_cost + overlap_cost
+            + narrow_cost + headroom_cost + overlap_cost + depth_cost
         )
 
     start = _initial_parameters(filters) if initial is None else np.asarray(initial, dtype=float)
@@ -503,10 +584,9 @@ def _new_filter(
     low_frequency = max(frequency_range[0], center / (2.0 ** 0.48))
     high_frequency = min(frequency_range[1], center * (2.0 ** 0.48))
     if kind == "cut":
-        samples = np.geomspace(low_frequency, high_frequency, 9)
         # The least-negative limit anywhere in the search window is used so a
-        # moving filter can never cross into a less-trusted band at -6 dB.
-        lower_gain = max(_cut_limit_at(float(value), internal_mic) for value in samples)
+        # moving filter can never cross into a less-trusted band at full depth.
+        lower_gain = _window_cut_limit(low_frequency, high_frequency, internal_mic)
         gain = -min(abs(lower_gain), max(0.35, float(residual[index]) * 0.72))
         gain_bounds = (lower_gain, 0.0)
     else:
@@ -514,6 +594,7 @@ def _new_filter(
         gain_bounds = (0.0, maximum_boost)
     return {
         "kind": kind,
+        "shape": "peaking",
         "center_hz": center,
         "q": q,
         "gain_db": float(gain),
@@ -522,6 +603,58 @@ def _new_filter(
         "gain_bounds": gain_bounds,
         "narrow_q_threshold": 1.4 if internal_mic else 2.25,
     }
+
+
+def _shelf_candidates(
+    residual: np.ndarray,
+    frequencies: np.ndarray,
+    confidence: np.ndarray,
+    valid: np.ndarray,
+    internal_mic: bool,
+    existing: list[dict],
+) -> list[dict]:
+    """Cut-only shelf proposals where the residual stays high toward an edge."""
+    candidates: list[dict] = []
+    present = {item.get("shape") for item in existing}
+    valid_frequencies = frequencies[valid]
+    if valid_frequencies.size < 8:
+        return candidates
+    low_edge, high_edge = float(valid_frequencies[0]), float(valid_frequencies[-1])
+    for shape, corners in (
+        ("lowshelf", LOW_SHELF_CORNERS_HZ), ("highshelf", HIGH_SHELF_CORNERS_HZ)
+    ):
+        if shape in present:
+            continue
+        for corner in corners:
+            if shape == "lowshelf":
+                if corner <= low_edge * 1.4:
+                    continue
+                region = valid & (frequencies <= corner)
+                reach = (low_edge, min(high_edge, corner * 1.5))
+            else:
+                if corner >= high_edge / 1.4:
+                    continue
+                region = valid & (frequencies >= corner)
+                reach = (max(low_edge, corner / 1.5), high_edge)
+            if np.count_nonzero(region) < 6 or float(np.sum(confidence[region])) <= 1e-9:
+                continue
+            excess = float(np.average(residual[region], weights=confidence[region]))
+            fraction = float(np.mean(residual[region] >= 0.5))
+            if excess < 0.8 or fraction < 0.6:
+                continue
+            limit = _window_cut_limit(reach[0], reach[1], internal_mic)
+            candidates.append({
+                "kind": "cut",
+                "shape": shape,
+                "center_hz": float(corner),
+                "q": 0.707,
+                "gain_db": -min(abs(limit), max(0.5, excess * 0.75)),
+                "frequency_bounds": (max(low_edge, corner / 1.5), min(high_edge, corner * 1.5)),
+                "q_bounds": SHELF_Q_BOUNDS,
+                "gain_bounds": (limit, 0.0),
+                "narrow_q_threshold": 1.4 if internal_mic else 2.25,
+            })
+    return candidates
 
 
 def optimize_peq(
@@ -574,7 +707,8 @@ def optimize_peq(
     safety_highpass = 2.0 * _highpass_response_db(
         frequencies, 55.0, 0.707, measurement["rate_hz"]
     )
-    desired = np.clip(aligned_target - training - safety_highpass, -8.0, 4.0)
+    total_cut_limit = _total_cut_limit(frequencies, internal_mic)
+    desired = np.clip(aligned_target - training - safety_highpass, -16.0, 4.0)
     safe_boost_floor = _safe_boost_floor(frequencies, training, confidence)
 
     weights = confidence.copy()
@@ -623,11 +757,16 @@ def optimize_peq(
             np.maximum(-residual, 0.0) * confidence, sigma=2.0, mode="nearest"
         )
         candidate_specs = []
+        # Compare against where the sections ended up after fitting, not where
+        # they were proposed, so a second cut cannot land on top of the first.
+        _, existing_centers, _, _ = _filter_correction(
+            frequencies, filters, parameters, measurement["rate_hz"]
+        )
         for index in _candidate_indices(cut_score, valid, 7):
             if cut_score[index] < 0.30:
                 continue
             center = float(frequencies[index])
-            if any(abs(math.log2(center / item["center_hz"])) < 0.22 for item in filters):
+            if any(abs(math.log2(center / float(existing))) < 0.22 for existing in existing_centers):
                 continue
             candidate_specs.append(_new_filter(
                 "cut", index, residual, frequencies, q_bounds,
@@ -640,12 +779,15 @@ def optimize_peq(
             )
             if not decision["permitted"]:
                 continue
-            if any(abs(math.log2(center / item["center_hz"])) < 0.30 for item in filters):
+            if any(abs(math.log2(center / float(existing))) < 0.30 for existing in existing_centers):
                 continue
             candidate_specs.append(_new_filter(
                 "boost", index, residual, frequencies, q_bounds,
                 frequency_range, internal_mic, maximum_boost,
             ))
+        candidate_specs.extend(_shelf_candidates(
+            residual, frequencies, confidence, valid, internal_mic, filters
+        ))
 
         best = None
         for candidate in candidate_specs:
@@ -657,6 +799,7 @@ def optimize_peq(
             trial_parameters, result, train_rmse = _fit_filters(
                 frequencies, training, aligned_target, weights, valid,
                 safety_highpass, trial_filters, measurement["rate_hz"], trial_initial,
+                total_limit=total_cut_limit,
             )
             trial_peq, _, _, trial_gains = _filter_correction(
                 frequencies, trial_filters, trial_parameters, measurement["rate_hz"]
@@ -711,6 +854,7 @@ def optimize_peq(
         selection_trace.append({
             "filter": len(filters),
             "kind": best["candidate"]["kind"],
+            "shape": best["candidate"]["shape"],
             "frequency_hz": round(float(centers_now[-1]), 1),
             "q": round(float(q_now[-1]), 3),
             "gain_db": round(float(gains_now[-1]), 2),
@@ -725,6 +869,7 @@ def optimize_peq(
         final_parameters, final_result, _ = _fit_filters(
             frequencies, measured_smooth, aligned_target, weights, valid,
             safety_highpass, filters, measurement["rate_hz"], parameters,
+            total_limit=total_cut_limit,
         )
         final_peq, _, _, _ = _filter_correction(
             frequencies, filters, final_parameters, measurement["rate_hz"]
@@ -751,20 +896,25 @@ def optimize_peq(
     _, centers, q_values, gains = _filter_correction(
         frequencies, filters, parameters, measurement["rate_hz"]
     )
+    shapes = np.asarray([item["shape"] for item in filters], dtype=object)
     if gains.size:
         keep = np.abs(gains) >= 0.08
-        centers = centers[keep]
-        q_values = q_values[keep]
-        gains = gains[keep]
+        centers, q_values, gains, shapes = (
+            centers[keep], q_values[keep], gains[keep], shapes[keep]
+        )
         order = np.argsort(centers)
-        centers, q_values, gains = centers[order], q_values[order], gains[order]
-    correction = safety_highpass + filter_response_db(
+        centers, q_values, gains, shapes = (
+            centers[order], q_values[order], gains[order], shapes[order]
+        )
+    peq_response = filter_response_db(
         frequencies,
         gains,
         measurement["rate_hz"],
         centers_hz=centers,
         q_values=q_values,
+        shapes=list(shapes),
     )
+    correction = safety_highpass + peq_response
     shelf = bass_shelf(safe_boost_floor, bass)
     if shelf is not None:
         correction = correction + _lowshelf_response_db(
@@ -795,15 +945,15 @@ def optimize_peq(
     cv_after = _weighted_rmse(
         holdout, correction, aligned_target, weights, valid
     )
-    cut_limits = [_cut_limit_at(float(center), internal_mic) for center in centers]
+    cut_limits = [_filter_cut_limit_at(float(center), internal_mic) for center in centers]
     filters_payload = [
         {
-            "type": "peaking",
+            "type": str(shape),
             "frequency_hz": round(float(center), 1),
             "q": round(float(q), 3),
             "gain_db": round(float(gain), 2),
         }
-        for center, q, gain in zip(centers, q_values, gains)
+        for center, q, gain, shape in zip(centers, q_values, gains, shapes)
     ]
 
     return {
@@ -812,13 +962,19 @@ def optimize_peq(
         "filter_count": len(filters_payload),
         "maximum_filter_count": maximum_filters,
         "filters": filters_payload,
-        # Parallel arrays remain for PipeWire and older panel compatibility.
+        "shelves": [item for item in filters_payload if item["type"] != "peaking"],
+        # Parallel arrays remain for the panel and older profiles; the graph
+        # routes each section by its type when the "filters" list is present.
         "centers_hz": [item["frequency_hz"] for item in filters_payload],
         "q": [item["q"] for item in filters_payload],
         "gains_db": [item["gain_db"] for item in filters_payload],
+        "types": [item["type"] for item in filters_payload],
         "q_bounds": list(q_bounds),
         "cut_limit_db": CUT_LIMIT_DB,
+        "per_filter_cut_limit_db": PER_FILTER_CUT_LIMIT_DB,
         "cut_limits_db": np.round(cut_limits, 2).tolist(),
+        "total_cut_limit_db": np.round(total_cut_limit, 2).tolist(),
+        "deepest_correction_db": round(float(np.min(peq_response)) if peq_response.size else 0.0, 2),
         "maximum_allowed_boost_db": maximum_boost,
         "actual_maximum_boost_db": round(
             max(0.0, float(np.max(gains))) if gains.size else 0.0, 2
@@ -827,7 +983,7 @@ def optimize_peq(
         "boost_decisions": boost_decisions,
         "headroom_db": headroom_db,
         "bass_mode": bass,
-        "low_shelf": shelf,
+        "bass_shelf": shelf,
         "loudness_mode": loudness,
         "loudness_loss_db": round(loudness_loss_db, 2),
         "makeup_db": makeup_db,

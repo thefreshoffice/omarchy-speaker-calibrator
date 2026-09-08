@@ -61,11 +61,17 @@ measurement microphones retain the stricter stable-gain requirement.
 Phase 2 uses a fully adaptive parametric EQ against a smooth, pleasant in-room
 loudspeaker target: a gentle bass rise, flat midband, and gradual treble decline.
 It chooses the number of filters and optimizes every filter's frequency, gain, and
-Q (width). Built-in microphones are limited to six broad filters with Q 0.5–2.0;
+Q (width). Built-in microphones are limited to six sections with Q 0.5–2.0;
 an uncalibrated external microphone may use eight, and a calibrated external
 microphone may use ten with narrower Q up to 4.0. These are upper bounds, not
 targets: a broad problem that needs one filter gets one filter rather than a
-dense fixed bank.
+dense fixed bank. A residual that stays high all the way to the bass or treble
+end of the band is offered a cut-only low or high shelf, so a tilt costs one
+section instead of several overlapping peaking filters. Depth is limited on
+the whole correction rather than per filter: one section may cut up to 12 dB
+and the sum of all sections never goes below -15 dB at any frequency, with
+tighter limits toward the band edges for built-in microphones, so stacked
+shallow cuts can no longer add up past what one deep cut is allowed to do.
 
 Filter selection is cross-validated. The optimizer fits using earlier accepted
 repeat groups and adds a candidate only when a separate held-out repeat also
@@ -152,8 +158,10 @@ response before and after correction.
 
 Both choices can be changed after a measurement: **Refit saved measurement**
 re-runs the analysis and the fit on the recorded sweeps without playing
-anything, and installing the result switches live, so the variants can be
-compared by ear against the previous profile.
+anything. A refit is only a proposal; nothing changes in the sound until
+**Install and play** is pressed. Installing switches live, and the compare
+button then names the other stored profile it would switch to, so the
+variants can be compared by ear.
 
 The built-in microphone is useful for a rough first profile. A measurement mic
 placed on-axis at normal listening distance is recommended for final tuning.
@@ -178,11 +186,14 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 
 ## Safety model
 
-- Each parametric cut is clamped to -6 dB; boosts require the confidence and
+- One section may cut at most 12 dB, and the whole correction is held to
+  -15 dB at any frequency inside the fit; boosts require the confidence and
   held-out-repeat gates above.
-- With an uncalibrated built-in microphone, bass and extreme-treble cuts use
-  tighter frequency-dependent limits; the full -6 dB range remains available in
+- With an uncalibrated built-in microphone the total depth is limited by
+  frequency, from -6 dB at 160 Hz and -8 dB at 10 kHz to the full -15 dB in
   the more reliable midrange.
+- Shelves are cut-only; the only shelf boost is the full-bass option, which
+  is paid for by input trim.
 - Positive correction is matched by automatic input trim plus 1 dB margin.
 - Loudness make-up is limited to 6 dB and only ever pays back loudness that
   the cuts removed; the limiter ceiling stays at -1 dBFS. Because the input

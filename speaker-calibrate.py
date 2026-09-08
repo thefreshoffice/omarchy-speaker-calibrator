@@ -170,49 +170,80 @@ DEFAULT_HIGHPASS_HZ = 55.0
 SECTION_LABELS = {
     "hp": "bq_highpass",
     "ls": "bq_lowshelf",
+    "bs": "bq_lowshelf",
     "p": "bq_peaking",
     "hs": "bq_highshelf",
 }
 
 
 def graph_sections():
-    """Section names per channel, in signal order."""
-    return ["hp1", "hp2", "ls"] + [f"p{slot}" for slot in range(1, PEAKING_SLOTS + 1)] + ["hs"]
+    """Section names per channel, in signal order.
+
+    ``ls`` and ``hs`` are the optimizer's shelves; ``bs`` is the full-bass
+    option's shelf, kept separate so both can be present at once.
+    """
+    return (
+        ["hp1", "hp2", "ls", "bs"]
+        + [f"p{slot}" for slot in range(1, PEAKING_SLOTS + 1)]
+        + ["hs"]
+    )
+
+
+def fit_sections(fit_payload):
+    """(peaking list, low shelf, high shelf, bass shelf) from a fit payload."""
+    filters = fit_payload.get("filters")
+    if filters is None:
+        peaking = list(zip(
+            fit_payload.get("centers_hz", []),
+            fit_payload.get("q", []),
+            fit_payload.get("gains_db", []),
+        ))
+        low_shelf = high_shelf = None
+    else:
+        peaking = [
+            (item["frequency_hz"], item["q"], item["gain_db"])
+            for item in filters if item.get("type", "peaking") == "peaking"
+        ]
+        low_shelf = next((item for item in filters if item.get("type") == "lowshelf"), None)
+        high_shelf = next((item for item in filters if item.get("type") == "highshelf"), None)
+    # Profiles from 0.10.0 stored the full-bass shelf as "low_shelf".
+    bass = fit_payload.get("bass_shelf")
+    if bass is None and low_shelf is None:
+        bass = fit_payload.get("low_shelf")
+    return peaking, low_shelf, high_shelf, bass
+
+
+def _shelf_controls(controls, name, shelf, default_hz):
+    shelf = shelf or {}
+    controls[f"{name}:Freq"] = float(shelf.get("frequency_hz", default_hz))
+    controls[f"{name}:Q"] = float(shelf.get("q", 0.707))
+    controls[f"{name}:Gain"] = float(shelf.get("gain_db", 0.0))
 
 
 def graph_controls(fit_payload):
     """Every control of the fixed-shape graph, for both channels, in order."""
-    centers = list(fit_payload.get("centers_hz", []))
-    q_values = list(fit_payload.get("q", []))
-    gains = list(fit_payload.get("gains_db", []))
-    if not (len(centers) == len(q_values) == len(gains)):
-        raise ValueError("Parametric filter frequency, Q, and gain lists must match.")
-    if len(centers) > PEAKING_SLOTS:
+    peaking, low_shelf, high_shelf, bass = fit_sections(fit_payload)
+    if len(peaking) > PEAKING_SLOTS:
         raise ValueError(
-            f"The graph has {PEAKING_SLOTS} parametric slots; this fit needs {len(centers)}."
+            f"The graph has {PEAKING_SLOTS} parametric slots; this fit needs {len(peaking)}."
         )
     highpass = float(fit_payload.get("highpass_hz", DEFAULT_HIGHPASS_HZ))
-    low_shelf = fit_payload.get("low_shelf") or {}
-    high_shelf = fit_payload.get("high_shelf") or {}
     controls = {}
     for side in ("l", "r"):
         for index in (1, 2):
             controls[f"hp{index}_{side}:Freq"] = highpass
             controls[f"hp{index}_{side}:Q"] = 0.707
-        controls[f"ls_{side}:Freq"] = float(low_shelf.get("frequency_hz", 100.0))
-        controls[f"ls_{side}:Q"] = float(low_shelf.get("q", 0.707))
-        controls[f"ls_{side}:Gain"] = float(low_shelf.get("gain_db", 0.0))
+        _shelf_controls(controls, f"ls_{side}", low_shelf, 100.0)
+        _shelf_controls(controls, f"bs_{side}", bass, 100.0)
         for slot in range(1, PEAKING_SLOTS + 1):
-            if slot <= len(centers):
-                frequency, q, gain = centers[slot - 1], q_values[slot - 1], gains[slot - 1]
+            if slot <= len(peaking):
+                frequency, q, gain = peaking[slot - 1]
             else:
                 frequency, q, gain = 1000.0, 1.0, 0.0
             controls[f"p{slot}_{side}:Freq"] = float(frequency)
             controls[f"p{slot}_{side}:Q"] = float(q)
             controls[f"p{slot}_{side}:Gain"] = float(gain)
-        controls[f"hs_{side}:Freq"] = float(high_shelf.get("frequency_hz", 8000.0))
-        controls[f"hs_{side}:Q"] = float(high_shelf.get("q", 0.707))
-        controls[f"hs_{side}:Gain"] = float(high_shelf.get("gain_db", 0.0))
+        _shelf_controls(controls, f"hs_{side}", high_shelf, 8000.0)
     controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
     return controls
 
@@ -676,7 +707,8 @@ def profile_from_measurement(
         "bass": bass,
         "safety": {
             "eq_max_db": fit_payload["maximum_allowed_boost_db"] if fit_payload else 0,
-            "eq_min_db": -6,
+            "eq_min_db": fit_payload["cut_limit_db"] if fit_payload else 0,
+            "per_filter_min_db": fit_payload["per_filter_cut_limit_db"] if fit_payload else 0,
             "highpass_hz": 55,
             "limiter_ceiling_dbfs": -1,
             "input_trim_db": -fit_payload["headroom_db"] if fit_payload else -1,
@@ -880,12 +912,11 @@ def wizard():
     fit_payload = profile["fit"]
     gains = fit_payload["gains_db"]
     print("\nProposed protected filters:")
-    for center, q, gain in zip(
-        fit_payload["centers_hz"], fit_payload["q"], gains
-    ):
-        print(f"  {center:7.1f} Hz  Q {q:4.2f}  {gain:5.2f} dB")
-    if fit_payload.get("low_shelf"):
-        shelf = fit_payload["low_shelf"]
+    for item in fit_payload["filters"]:
+        print(f"  {item['type']:9s} {item['frequency_hz']:7.1f} Hz  Q {item['q']:4.2f}  "
+              f"{item['gain_db']:6.2f} dB")
+    if fit_payload.get("bass_shelf"):
+        shelf = fit_payload["bass_shelf"]
         print(f"  Bass shelf: {shelf['gain_db']:+.1f} dB below {shelf['frequency_hz']:.0f} Hz")
     print(f"  Input headroom: {fit_payload['headroom_db']:.2f} dB")
     print(f"  Loudness lost to cuts: {fit_payload['loudness_loss_db']:.1f} dB; "

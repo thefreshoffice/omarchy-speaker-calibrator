@@ -82,8 +82,8 @@ class CalibrationOptimizerTests(unittest.TestCase):
         full = optimize_peq(
             self.measurement(response), "neutral", internal_mic=True, bass="full"
         )
-        self.assertIsNone(normal["low_shelf"])
-        shelf = full["low_shelf"]
+        self.assertIsNone(normal["bass_shelf"])
+        shelf = full["bass_shelf"]
         self.assertEqual(shelf["gain_db"], 3.0)
         self.assertGreaterEqual(shelf["frequency_hz"], 150.0)
         self.assertLessEqual(shelf["frequency_hz"], 600.0)
@@ -96,6 +96,69 @@ class CalibrationOptimizerTests(unittest.TestCase):
         # The shelf is a positive correction, so headroom and input trim pay for it.
         self.assertGreaterEqual(full["headroom_db"], normal["headroom_db"] + 2.0)
         self.assertLess(full["input_gain_linear"], normal["input_gain_linear"])
+
+    def test_rising_treble_is_handled_by_a_high_shelf(self):
+        response = np.full(self.frequencies.size, -30.0)
+        high = self.frequencies > 2000.0
+        response[high] += 6.0 * np.log2(self.frequencies[high] / 2000.0)
+        result = optimize_peq(self.measurement(response), "neutral", internal_mic=False)
+        shelves = [item for item in result["filters"] if item["type"] == "highshelf"]
+        self.assertEqual(len(shelves), 1, result["filters"])
+        self.assertLess(shelves[0]["gain_db"], -2.0)
+        self.assertLessEqual(result["filter_count"], 3)
+        at = lambda hz: float(np.interp(
+            np.log(hz), np.log(self.frequencies), result["correction_response_db"]
+        ))
+        self.assertLess(at(12_000), -4.0)
+        self.assertGreater(at(1000), -1.5)
+
+    def test_deep_hump_uses_one_deep_cut_within_the_total_limit(self):
+        response = np.full(self.frequencies.size, -30.0)
+        response += 14.0 * np.exp(-0.5 * (np.log2(self.frequencies / 1000.0) / 0.45) ** 2)
+        result = optimize_peq(self.measurement(response), "neutral", internal_mic=True)
+        deepest = min(result["gains_db"])
+        self.assertLess(deepest, -6.5)
+        self.assertGreaterEqual(deepest, -12.0)
+        self.assertLessEqual(result["filter_count"], 4, result["filters"])
+        # Sections may share a hump, but they must not pile onto one frequency.
+        cuts = [item["frequency_hz"] for item in result["filters"]
+                if item["type"] == "peaking" and item["gain_db"] < -1.0]
+        spacing = [abs(np.log2(a / b)) for i, a in enumerate(cuts) for b in cuts[i + 1:]]
+        if spacing:
+            self.assertGreaterEqual(min(spacing), 0.25, result["filters"])
+        limit = np.asarray(result["total_cut_limit_db"])
+        correction = np.asarray(result["correction_response_db"])
+        self.assertGreaterEqual(float(np.min(correction - limit)), -0.5)
+        self.assertLess(result["weighted_rmse_after_db"], result["weighted_rmse_before_db"] / 2.0)
+
+    def test_graph_routes_shelves_and_the_bass_shelf_to_their_slots(self):
+        fit = {
+            "filters": [
+                {"type": "lowshelf", "frequency_hz": 300, "q": 0.7, "gain_db": -3.0},
+                {"type": "peaking", "frequency_hz": 1000, "q": 1.0, "gain_db": -2.5},
+                {"type": "highshelf", "frequency_hz": 4000, "q": 0.8, "gain_db": -4.0},
+            ],
+            "bass_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
+            "input_gain_linear": 0.5,
+        }
+        controls = speaker_calibrate.graph_controls(fit)
+        self.assertEqual(controls["ls_l:Freq"], 300.0)
+        self.assertEqual(controls["ls_r:Gain"], -3.0)
+        self.assertEqual(controls["bs_l:Freq"], 500.0)
+        self.assertEqual(controls["bs_r:Gain"], 3.0)
+        self.assertEqual(controls["p1_l:Freq"], 1000.0)
+        self.assertEqual(controls["p2_l:Gain"], 0.0)
+        self.assertEqual(controls["hs_l:Freq"], 4000.0)
+        self.assertEqual(controls["hs_r:Gain"], -4.0)
+        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit)
+        self.assertIn('name = bs_l label = bq_lowshelf control = { "Freq" = 500 "Q" = 0.707 "Gain" = 3 }', graph)
+        # A 0.10.0 profile stored the bass shelf as low_shelf.
+        legacy = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.5],
+                  "low_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
+                  "input_gain_linear": 0.5}
+        legacy_controls = speaker_calibrate.graph_controls(legacy)
+        self.assertEqual(legacy_controls["bs_l:Gain"], 3.0)
+        self.assertEqual(legacy_controls["ls_l:Gain"], 0.0)
 
     def test_loudness_modes_pay_back_a_capped_share_of_the_loss(self):
         self.assertEqual(loudness_makeup_db(4.0, "protected"), 0.0)
@@ -217,7 +280,8 @@ class CalibrationOptimizerTests(unittest.TestCase):
         }
         controls = speaker_calibrate.graph_controls(fit)
         slots = speaker_calibrate.PEAKING_SLOTS
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 * slots + 3) + 1)
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3) + 1)
+        self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["p1_l:Freq"], 1000.0)
         self.assertEqual(controls["p2_r:Gain"], 0.75)
         self.assertEqual(controls["p3_l:Gain"], 0.0)

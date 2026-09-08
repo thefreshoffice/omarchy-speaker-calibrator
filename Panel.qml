@@ -60,14 +60,15 @@ Panel {
   }
   function gainsText() {
     if (!service.proposal || !service.proposal.fit) return ""
-    var centers = service.proposal.fit.centers_hz || []
-    var qValues = service.proposal.fit.q || []
-    var gains = service.proposal.fit.gains_db || []
+    var fit = service.proposal.fit
+    var filters = fit.filters || []
     var rows = []
-    for (var index = 0; index < Math.min(centers.length, gains.length, qValues.length); index++) {
-      var gain = Number(gains[index])
-      rows.push(Number(centers[index]).toFixed(1) + " Hz   ·   Q "
-        + Number(qValues[index]).toFixed(2) + "   ·   "
+    var labels = { peaking: "", lowshelf: "low shelf ", highshelf: "high shelf " }
+    for (var index = 0; index < filters.length; index++) {
+      var item = filters[index]
+      var gain = Number(item.gain_db)
+      rows.push((labels[item.type] || "") + Number(item.frequency_hz).toFixed(1) + " Hz   ·   Q "
+        + Number(item.q).toFixed(2) + "   ·   "
         + (gain > 0 ? "+" : "") + gain.toFixed(2) + " dB")
     }
     return rows.join("   ·   ")
@@ -100,9 +101,12 @@ Panel {
       + " → " + Number(validation.rmse_after_db || 0).toFixed(2) + " dB"
       + "   ·   max boost " + Number(fit.actual_maximum_boost_db || 0).toFixed(2) + " dB"
       + "   ·   protected headroom " + Number(fit.headroom_db || 1).toFixed(2) + " dB"
-      + (fit.low_shelf
-          ? "   ·   bass shelf +" + Number(fit.low_shelf.gain_db).toFixed(1) + " dB below "
-            + Number(fit.low_shelf.frequency_hz).toFixed(0) + " Hz"
+      + (fit.deepest_correction_db !== undefined
+          ? "   ·   deepest cut " + Number(fit.deepest_correction_db).toFixed(1) + " dB"
+          : "")
+      + (fit.bass_shelf
+          ? "   ·   bass shelf +" + Number(fit.bass_shelf.gain_db).toFixed(1) + " dB below "
+            + Number(fit.bass_shelf.frequency_hz).toFixed(0) + " Hz"
           : "")
       + (fit.loudness_loss_db !== undefined
           ? "   ·   loudness lost to cuts " + Number(fit.loudness_loss_db).toFixed(1) + " dB"
@@ -187,8 +191,7 @@ Panel {
             title: "Speaker Calibrator"
             meta: service.busy ? service.message
               : (service.status.enabled
-                  ? (service.status.compare && service.status.compare.active === "previous"
-                      ? "Previous profile playing for comparison" : "Protected profile active")
+                  ? "Playing: " + (service.playingLabel() || "calibrated profile")
                   : "Ready to measure")
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -362,7 +365,10 @@ Panel {
 
             PanelSectionHeader {
               text: service.proposal && service.proposal.quality
-                ? "MEASUREMENT QUALITY — " + String(service.proposal.quality.verdict).toUpperCase()
+                ? "PROPOSAL: " + service.optionsLabel(service.proposal).toUpperCase()
+                  + (service.status.profile && service.status.profile.created_at === service.proposal.created_at
+                      ? " — INSTALLED" : " — NOT INSTALLED YET")
+                  + " · QUALITY " + String(service.proposal.quality.verdict).toUpperCase()
                 : "MEASUREMENT QUALITY"
               foreground: service.proposal && service.proposal.quality
                 && !service.proposal.quality.accepted
@@ -649,9 +655,9 @@ Panel {
               text: {
                 var fit = service.proposal && service.proposal.fit
                 var maximum = fit ? Number(fit.maximum_allowed_boost_db || 0).toFixed(1) : "0.0"
-                return "The optimizer moves each filter to the measured problem and chooses its width; Q means width (a smaller Q is broader, a larger Q is narrower). It adds a filter only when a separate held-out repeat also improves. Cuts are preferred and each is limited to −6 dB. With built-in microphones, at most six broad filters are allowed and bass/extreme-treble cuts stay tighter. Boosts are capped at +"
+                return "The optimizer moves each filter to the measured problem and chooses its width; Q means width (a smaller Q is broader, a larger Q is narrower). It adds a filter only when a separate held-out repeat also improves. Cuts are preferred: one section may cut up to 12 dB, and the whole correction never goes deeper than 15 dB at any frequency, shallower toward the band edges with built-in microphones. A residual that stays high all the way to the bass or treble end is handled by a shelf instead of several overlapping filters. With built-in microphones, at most six sections are allowed. Boosts are capped at +"
                   + maximum + " dB and require a broad, repeatable, high-confidence deficit that passes the same holdout check. "
-                  + "Protection: automatic input trim, dual 55 Hz high-pass, −1 dBFS limiter, no makeup gain."
+                  + "Protection: automatic input trim, dual 55 Hz high-pass, −1 dBFS limiter; loudness make-up only when selected."
               }
               color: root.dim
               font.family: root.fontFamily
@@ -660,7 +666,8 @@ Panel {
             }
             Button {
               width: parent.width
-              text: service.busy && service.phase === "install" ? "Installing…" : "Install profile"
+              text: service.busy && service.phase === "install" ? "Installing…"
+                : "Install and play: " + service.optionsLabel(service.proposal)
               iconText: "󰄬"
               bordered: true
               selected: true
@@ -671,13 +678,24 @@ Panel {
             }
           }
 
+          Text {
+            visible: service.status.enabled && service.status.compare !== undefined
+              && service.status.compare.available === true
+            width: parent.width
+            text: "COMPARE — now playing: " + service.playingLabel()
+              + "\nThe other stored profile: " + service.otherLabel()
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
           Button {
             visible: service.status.enabled && service.status.compare !== undefined
               && service.status.compare.available === true
             width: parent.width
             text: service.busy && service.phase === "compare" ? "Switching…"
-              : (service.status.compare && service.status.compare.active === "previous"
-                  ? "Switch back to the current profile" : "Hear the previous profile")
+              : "Switch to: " + service.otherLabel()
             iconText: "󰓦"
             bordered: true
             enabled: !service.busy

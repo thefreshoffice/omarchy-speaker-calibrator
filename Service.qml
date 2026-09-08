@@ -31,6 +31,29 @@ Item {
                        "/usr/bin/python3", "-s", helperPath].concat(arguments)
     process.running = true
   }
+  // Short human label for a profile or proposal: "warm · full bass · matched".
+  function optionsLabel(profile) {
+    if (!profile) return ""
+    var voicing = profile.voicing === "neutral" ? "flat" : "warm"
+    var bass = profile.bass === "full" ? "full bass" : "normal bass"
+    var loudness = profile.loudness || "protected"
+    return voicing + " · " + bass + " · " + loudness
+  }
+  // Label of the profile that is playing right now, if the helper knows it.
+  function playingLabel() {
+    var compare = status.compare
+    if (compare && compare.available && compare[compare.active] && compare[compare.active].label)
+      return compare[compare.active].label
+    if (compare && compare.current && compare.current.label) return compare.current.label
+    return status.profile ? optionsLabel(status.profile) : ""
+  }
+  // Label of the profile the compare button would switch to.
+  function otherLabel() {
+    var compare = status.compare
+    if (!compare || !compare.available) return ""
+    var other = compare.active === "previous" ? compare.current : compare.previous
+    return other && other.label ? other.label : (compare.active === "previous" ? "current" : "previous")
+  }
   function refresh() { if (!busy) start("devices", ["devices-json"]) }
   function refreshStatus() { start("status", ["status-json"]) }
   function measure(sink, mic, channel, voicing, micCalibrationFile, loudness, bass) {
@@ -87,23 +110,25 @@ Item {
           root.proposal = JSON.parse(raw)
           if (root.proposal.quality && root.proposal.quality.accepted) {
             var count = root.proposal.fit ? Number(root.proposal.fit.filter_count || 0) : 0
-            root.message = "Measurement accepted — " + count
-              + (count === 1 ? " adaptive filter passed" : " adaptive filters passed")
-              + " repeat validation"
+            root.message = (root.phase === "refit" ? "Refit ready: " : "Measurement accepted: ")
+              + root.optionsLabel(root.proposal) + " · " + count
+              + (count === 1 ? " section" : " sections")
+              + " · nothing changes until you press Install"
           }
           else
             root.message = "Measurement rejected — follow the retry guidance below"
         } else if (root.phase === "install") {
-          root.status = { service: "active", enabled: true, profile: JSON.parse(raw),
+          var installed = JSON.parse(raw)
+          root.status = { service: "active", enabled: true, profile: installed,
                           compare: root.status.compare }
-          root.message = "Profile installed and enabled"
+          root.message = "Installed and playing: " + root.optionsLabel(installed)
+            + (installed.activation === "restart" ? " · tuning restarted" : " · switched live")
           Qt.callLater(root.refreshStatus)
         } else if (root.phase === "compare") {
           var compare = JSON.parse(raw)
           var playing = compare[compare.active]
           root.status = Object.assign({}, root.status, { compare: compare })
-          root.message = "Now playing the " + compare.active + " profile"
-            + (playing && playing.label ? " · " + playing.label : "")
+          root.message = "Now playing: " + (playing && playing.label ? playing.label : compare.active)
             + (compare.method === "restart" ? " · tuning restarted" : " · switched live")
         } else if (root.phase === "disable") {
           root.status = { service: "inactive", enabled: false, profile: root.status.profile }
