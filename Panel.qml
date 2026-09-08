@@ -281,14 +281,20 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
-  // The shell's tooltip is a single unbounded line; this one wraps at a sane
-  // width so a sentence of advice does not run across the whole screen.
+  // The shell's tooltip is one unbounded line of text, so a sentence of advice
+  // runs off the screen.  Capping contentWidth is not enough: the popup still
+  // sizes itself from the content item's natural width.  The width is set
+  // outright instead, measured from the text with TextMetrics so short hints
+  // stay small, and PanelToolTip has no padding, so the content item is handed
+  // exactly that width and the text wraps inside it.
   component WrapTip: PanelToolTip {
     id: tip
-    property real maxWidth: Style.space(300)
+    property real maxWidth: Style.space(240)
     fontFamily: root.fontFamily
-    contentWidth: Math.min(implicitContentWidth, maxWidth)
+    margins: Style.space(6)
+    width: Math.min(tipMetrics.width + tipText.leftPadding + tipText.rightPadding, tip.maxWidth)
     contentItem: Text {
+      id: tipText
       textFormat: Text.PlainText
       text: tip.text
       color: tip.panelForeground
@@ -299,6 +305,13 @@ Panel {
       rightPadding: Border.right(tip.panelBorderSpec) + Style.spacing.controlPaddingX
       topPadding: Border.top(tip.panelBorderSpec) + Style.spacing.controlPaddingY
       bottomPadding: Border.bottom(tip.panelBorderSpec) + Style.spacing.controlPaddingY
+
+      TextMetrics {
+        id: tipMetrics
+        font.family: tipText.font.family
+        font.pixelSize: tipText.font.pixelSize
+        text: tip.text
+      }
     }
   }
   // A clickable row in the shell's control style: glyph, short title, and a
