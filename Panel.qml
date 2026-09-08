@@ -88,6 +88,7 @@ Panel {
     if (!service.proposal || !service.proposal.quality) return ""
     var metrics = service.proposal.quality.metrics || {}
     var result = "prominence " + Number(metrics.minimum_broadband_prominence_db || 0).toFixed(1) + " dB"
+      + (metrics.snr_mid_db !== undefined ? "   ·   SNR mid " + Number(metrics.snr_mid_db).toFixed(1) + " dB" : "")
       + "   ·   repeatability " + Number(metrics.worst_repeatability_db || 0).toFixed(1) + " dB"
       + "   ·   stable " + Number(metrics.minimum_stable_band_percent || 0).toFixed(0) + "%"
       + "   ·   gain drift " + Number(metrics.worst_gain_stability_db || 0).toFixed(1) + " dB"

@@ -238,25 +238,167 @@ def _log_grid(start_hz: float, end_hz: float, points_per_octave: int = 24) -> np
     return start_hz * 2.0 ** (np.arange(count, dtype=float) / points_per_octave)
 
 
-def regularized_response(
-    response: np.ndarray,
-    sweep: np.ndarray,
-    spec: SweepSpec,
-    frequencies: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return a regularized deconvolved impulse response and sampled magnitude."""
+# Recording kept in front of every sweep so the direct sound never sits at the
+# edge of the deconvolved buffer, and so the noise-floor buffer can be gated at
+# the same nominal position.
+GATE_PRE_ARRIVAL_SECONDS = 0.05
+# Length of the frequency-dependent gate in cycles of each analysis frequency:
+# 150 ms at 100 Hz, 15 ms at 1 kHz, 1.5 ms at 10 kHz.  Long enough to keep the
+# desk reflection that a listener at the laptop also hears, short enough above
+# a few hundred hertz to drop wall and ceiling reflections and the distortion
+# products that a sine sweep folds into negative time.
+DEFAULT_GATE_CYCLES = 15.0
+
+
+def _band_limit_weights(bins: np.ndarray, spec: SweepSpec) -> np.ndarray:
+    """Raised-cosine edges just outside the sweep band.
+
+    Dividing by the sweep spectrum outside the band divides by almost nothing
+    and turns recording noise into a huge out-of-band impulse-response
+    artefact.  Rolling those bins off keeps the time domain honest.
+    """
+    low_start, low_end = 0.71 * spec.start_hz, spec.start_hz
+    high_start = spec.end_hz
+    high_end = min(1.12 * spec.end_hz, 0.5 * spec.rate)
+    weights = np.ones_like(bins)
+    below = bins < low_end
+    weights[below] = 0.5 - 0.5 * np.cos(
+        np.pi * np.clip((bins[below] - low_start) / (low_end - low_start), 0.0, 1.0)
+    )
+    above = bins > high_start
+    weights[above] = 0.5 + 0.5 * np.cos(
+        np.pi * np.clip((bins[above] - high_start) / max(high_end - high_start, 1e-9), 0.0, 1.0)
+    )
+    return weights
+
+
+def deconvolve(
+    response: np.ndarray, sweep: np.ndarray, spec: SweepSpec
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the band-limited impulse response, transfer function, and bins."""
     fft_size = 1 << (response.size + sweep.size - 1).bit_length()
     excitation = np.fft.rfft(sweep, fft_size)
     observed = np.fft.rfft(response, fft_size)
     power = np.abs(excitation) ** 2
     regularizer = max(float(np.max(power)) * 1e-9, 1e-18)
     transfer = observed * np.conj(excitation) / (power + regularizer)
-    impulse = np.fft.irfft(transfer, fft_size)
-
     bins = np.fft.rfftfreq(fft_size, 1.0 / spec.rate)
-    magnitude_db = 20.0 * np.log10(np.maximum(np.abs(transfer), 1e-12))
-    sampled = np.interp(frequencies, bins, magnitude_db)
-    return impulse, sampled
+    transfer *= _band_limit_weights(bins, spec)
+    impulse = np.fft.irfft(transfer, fft_size)
+    return impulse, transfer, bins
+
+
+def locate_direct_sound(
+    impulse: np.ndarray, rate: int, nominal_index: int,
+    *, before_seconds: float = 0.005, after_seconds: float = 0.03,
+) -> int:
+    """Index of the direct-sound peak near where the sweep alignment put it."""
+    low = max(0, nominal_index - int(round(before_seconds * rate)))
+    high = min(impulse.size, nominal_index + int(round(after_seconds * rate)))
+    if high <= low:
+        return int(np.clip(nominal_index, 0, impulse.size - 1))
+    return low + int(np.argmax(np.abs(impulse[low:high])))
+
+
+def gated_magnitude_db(
+    impulse: np.ndarray,
+    rate: int,
+    frequencies: np.ndarray,
+    peak_index: int,
+    cycles: float,
+    *,
+    minimum_pre_seconds: float = 0.0005,
+) -> np.ndarray:
+    """Magnitude at each frequency through a window of ``cycles`` periods.
+
+    For every analysis frequency the impulse response is windowed with a short
+    rising half-Hann before the direct-sound peak and a falling half-Hann of
+    ``cycles / f`` after it, and the response at that one frequency is read
+    directly from the windowed samples.  This is the frequency-dependent
+    window that room-measurement tools apply before equalisation, evaluated
+    only on the analysis grid, which keeps it cheap and exact.
+    """
+    size = impulse.size
+    out = np.empty(frequencies.size, dtype=float)
+    minimum_pre = max(1, int(round(minimum_pre_seconds * rate)))
+    for position, frequency in enumerate(frequencies):
+        length = max(8, int(round(cycles / float(frequency) * rate)))
+        pre = max(minimum_pre, length // 8)
+        offsets = np.arange(-pre, length)
+        window = np.empty(offsets.size)
+        window[:pre] = 0.5 - 0.5 * np.cos(np.pi * np.arange(pre) / pre)
+        window[pre:] = 0.5 + 0.5 * np.cos(np.pi * np.arange(length) / length)
+        samples = impulse[(peak_index + offsets) % size] * window
+        phasor = np.exp(-2j * np.pi * float(frequency) * offsets / rate)
+        out[position] = 20.0 * np.log10(max(abs(np.dot(samples, phasor)), 1e-12))
+    return out
+
+
+def regularized_response(
+    response: np.ndarray,
+    sweep: np.ndarray,
+    spec: SweepSpec,
+    frequencies: np.ndarray,
+    *,
+    gate_cycles: float | None = DEFAULT_GATE_CYCLES,
+    nominal_peak_index: int = 0,
+    locate_peak: bool = True,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return the impulse response, its (gated) magnitude, and the peak index.
+
+    ``gate_cycles=None`` returns the whole-buffer magnitude, which includes
+    every room reflection, the noise, and the folded distortion products.
+    """
+    impulse, transfer, bins = deconvolve(response, sweep, spec)
+    peak_index = (
+        locate_direct_sound(impulse, spec.rate, nominal_peak_index)
+        if locate_peak else int(nominal_peak_index)
+    )
+    if gate_cycles is None:
+        magnitude_db = 20.0 * np.log10(np.maximum(np.abs(transfer), 1e-12))
+        return impulse, np.interp(frequencies, bins, magnitude_db), peak_index
+    return impulse, gated_magnitude_db(
+        impulse, spec.rate, frequencies, peak_index, gate_cycles
+    ), peak_index
+
+
+def silence_buffer(
+    capture: np.ndarray,
+    starts: list[int],
+    spec: SweepSpec,
+    record_lead_seconds: float,
+    length: int,
+) -> np.ndarray:
+    """Recorded room sound from between the sweeps, tiled to ``length``.
+
+    Running this through the same deconvolution and gate as a sweep measures
+    the noise floor in exactly the units of the response, at every frequency,
+    without any assumption about how the inverse filter spreads noise in time.
+    """
+    rate = spec.rate
+    margin = int(round(min(0.1, spec.block_gap / 4.0) * rate))
+    tail = int(round(spec.response_tail * rate))
+    pieces = []
+    first_end = starts[0] - margin
+    first_start = max(0, first_end - int(round(
+        (0.75 * record_lead_seconds + spec.pre_silence) * rate
+    )))
+    if first_end > first_start:
+        pieces.append(capture[first_start:first_end])
+    for previous, following in zip(starts, starts[1:]):
+        begin = previous + spec.frames + tail + margin
+        end = following - margin
+        if end > begin:
+            pieces.append(capture[begin:end])
+    silence = np.concatenate(pieces) if pieces else np.zeros(0)
+    if silence.size == 0:
+        return np.zeros(length)
+    return np.resize(silence, length)
+
+
+def snr_uncertainty_db(snr_db: np.ndarray) -> np.ndarray:
+    """Largest magnitude error additive noise at this SNR can cause."""
+    return 20.0 * np.log10(1.0 + 10.0 ** (-np.asarray(snr_db, dtype=float) / 20.0))
 
 
 def estimate_harmonic_residual_db(
@@ -342,11 +484,12 @@ def _quality_summary(
     clock_drift_ppm: float, worst_repeatability_db: float,
     minimum_stable_band_percent: float, worst_gain_stability_db: float,
     worst_harmonic_residual_db: float, clipped_samples: int,
-    excluded_sweeps: int,
+    excluded_sweeps: int, snr_bands_db: dict | None = None,
 ) -> dict:
     failures: list[str] = []
     warnings: list[str] = []
     guidance: list[str] = []
+    snr_bands_db = snr_bands_db or {}
 
     if clipped_samples:
         failures.append(f"The microphone clipped {clipped_samples} sample(s).")
@@ -406,6 +549,13 @@ def _quality_summary(
         warnings.append(
             f"Discarded {excluded_sweeps} contaminated sweep(s); two repeatable captures per speaker remained."
         )
+    mid_snr = snr_bands_db.get("snr_mid_db")
+    if mid_snr is not None and mid_snr < 20.0:
+        warnings.append(
+            f"Mid-band signal-to-noise ratio is low ({mid_snr:.1f} dB); "
+            "corrections shrink where the noise floor is close."
+        )
+        guidance.append("Reduce background noise or raise the level, then measure again.")
     if internal_mic:
         warnings.append(
             "Built-in microphone mode is a relative estimate; chassis coupling and unknown mic response remain."
@@ -437,6 +587,7 @@ def _quality_summary(
             "worst_harmonic_residual_db": round(worst_harmonic_residual_db, 2),
             "clipped_samples": int(clipped_samples),
             "excluded_sweeps": int(excluded_sweeps),
+            **{key: round(float(value), 2) for key, value in snr_bands_db.items()},
         },
     }
 
@@ -468,6 +619,26 @@ def _add_measurement_level_guidance(quality: dict, maximum_peak_dbfs: float) -> 
         quality["verdict"] = "warning" if quality["warnings"] else "pass"
 
 
+SNR_BANDS_HZ = {
+    "snr_low_db": (80.0, 250.0),
+    "snr_mid_db": (250.0, 4_000.0),
+    "snr_high_db": (4_000.0, 16_000.0),
+}
+
+
+def _snr_bands(frequencies: np.ndarray, snr_curves: list[np.ndarray]) -> dict:
+    """Worst channel's median signal-to-noise ratio in three bands."""
+    if not snr_curves:
+        return {}
+    stack = np.vstack(snr_curves)
+    bands = {}
+    for key, (low, high) in SNR_BANDS_HZ.items():
+        band = (frequencies >= low) & (frequencies < high)
+        if np.any(band):
+            bands[key] = float(np.min(np.median(stack[:, band], axis=1)))
+    return bands
+
+
 def analyse_capture(
     capture: np.ndarray,
     schedule: list[dict],
@@ -476,6 +647,7 @@ def analyse_capture(
     record_lead_seconds: float,
     internal_mic: bool,
     calibration: dict | None = None,
+    gate_cycles: float | None = DEFAULT_GATE_CYCLES,
 ) -> dict:
     """Analyze a mono capture of the generated stereo measurement program."""
     sweep = make_sweep(spec)
@@ -490,14 +662,28 @@ def analyse_capture(
     frequencies = _log_grid(max(80.0, spec.start_hz), min(16_000.0, spec.end_hz))
     calibration_curve = _calibration_curve(calibration, frequencies)
     tail_frames = int(round(spec.response_tail * spec.rate))
+    pre_frames = int(round(GATE_PRE_ARRIVAL_SECONDS * spec.rate))
+    segment_frames = pre_frames + sweep.size + tail_frames
+
+    # The noise floor is the room sound between sweeps, put through the same
+    # deconvolution and gate as the sweeps and read at the same position.
+    _, noise_floor, _ = regularized_response(
+        silence_buffer(capture, starts, spec, record_lead_seconds, segment_frames),
+        sweep, spec, frequencies,
+        gate_cycles=gate_cycles, nominal_peak_index=pre_frames, locate_peak=False,
+    )
+    noise_floor = noise_floor + calibration_curve
 
     per_channel: dict[int, list[dict]] = {0: [], 1: []}
     for event, start, correlation in zip(schedule, starts, correlations):
         segment = _drift_corrected_segment(
-            capture, start, sweep.size + tail_frames, clock_ratio
+            capture, start - pre_frames, segment_frames, clock_ratio
         )
-        sweep_part = segment[:sweep.size]
-        impulse, curve = regularized_response(segment, sweep, spec, frequencies)
+        sweep_part = segment[pre_frames:pre_frames + sweep.size]
+        impulse, curve, peak_index = regularized_response(
+            segment, sweep, spec, frequencies,
+            gate_cycles=gate_cycles, nominal_peak_index=pre_frames,
+        )
         curve += calibration_curve
         segment_rms = rms(sweep_part)
         item = {
@@ -512,7 +698,9 @@ def analyse_capture(
                 estimate_harmonic_residual_db(sweep_part, spec, noise_level), 3
             ),
             "response_db": curve,
+            "snr_db": curve - noise_floor,
             "impulse_peak": round(float(np.max(np.abs(impulse))), 7),
+            "direct_sound_ms": round((peak_index - pre_frames) / spec.rate * 1000.0, 3),
         }
         per_channel[event["output_channel"]].append(item)
 
@@ -527,6 +715,7 @@ def analyse_capture(
     excluded_sweeps = 0
     accepted_clipped_samples = 0
     channel_curves = []
+    channel_snrs = []
     validation_curves = []
     for output_channel in (0, 1):
         items = per_channel[output_channel]
@@ -550,10 +739,17 @@ def analyse_capture(
         gain_stability = max(levels) - min(levels) if levels else 0.0
         accepted_stack = np.vstack(accepted_curves)
         aggregate = np.median(accepted_stack, axis=0)
-        uncertainty = (
-            np.max(accepted_stack, axis=0) - np.min(accepted_stack, axis=0)
-        ) / 2.0
+        snr = np.median(np.vstack([
+            item["snr_db"] for item in accepted_items
+        ]), axis=0)
+        # Repeat spread catches anything that changed between sweeps; the
+        # noise floor catches what is wrong in every sweep the same way.
+        uncertainty = np.hypot(
+            (np.max(accepted_stack, axis=0) - np.min(accepted_stack, axis=0)) / 2.0,
+            snr_uncertainty_db(snr),
+        )
         channel_curves.append(aggregate)
+        channel_snrs.append(snr)
         harmonics = [item["harmonic_residual_db"] for item in accepted_items]
         worst_harmonic = max(harmonics) if harmonics else -120.0
         all_repeatabilities.append(repeatability["repeatability_db"])
@@ -567,7 +763,10 @@ def analyse_capture(
         excluded_sweeps += len(excluded_indices)
         public_sweeps = []
         for index, item in enumerate(items):
-            public = {key: value for key, value in item.items() if key != "response_db"}
+            public = {
+                key: value for key, value in item.items()
+                if key not in ("response_db", "snr_db")
+            }
             public["accepted"] = index in accepted_indices
             public_sweeps.append(public)
             if index in accepted_indices:
@@ -587,10 +786,12 @@ def analyse_capture(
             "harmonic_residual_db": round(worst_harmonic, 3),
             "response_db": np.round(aggregate, 3).tolist(),
             "uncertainty_db": np.round(uncertainty, 3).tolist(),
+            "snr_db": np.round(snr, 3).tolist(),
             "sweeps": public_sweeps,
         })
 
     combined = np.mean(np.vstack(channel_curves), axis=0)
+    snr_bands = _snr_bands(frequencies, channel_snrs)
     quality = _quality_summary(
         internal_mic=internal_mic,
         calibration=calibration,
@@ -604,11 +805,18 @@ def analyse_capture(
         worst_harmonic_residual_db=max(all_harmonics),
         clipped_samples=accepted_clipped_samples,
         excluded_sweeps=excluded_sweeps,
+        snr_bands_db=snr_bands,
     )
     _add_measurement_level_guidance(quality, max(accepted_peaks))
     return {
         "method": "repeated-exponential-sine-sweep",
         "rate_hz": spec.rate,
+        "gate": {
+            "method": "frequency-dependent window" if gate_cycles else "none",
+            "cycles": gate_cycles,
+            "pre_arrival_seconds": GATE_PRE_ARRIVAL_SECONDS,
+        },
+        "noise_floor_db": np.round(noise_floor, 3).tolist(),
         "sweep": {
             "start_hz": spec.start_hz,
             "end_hz": spec.end_hz,
@@ -771,6 +979,10 @@ def combine_microphone_measurements(
             "harmonic_residual_db": round(max(source["harmonic_residual_db"] for source in sources), 3),
             "response_db": np.round(aggregate, 3).tolist(),
             "uncertainty_db": np.round(uncertainty, 3).tolist(),
+            "snr_db": np.round(np.max(np.vstack([
+                np.asarray(source.get("snr_db", np.zeros(frequencies.size)), dtype=float)
+                for source in sources
+            ]), axis=0), 3).tolist(),
             "sweeps": [],
         })
 
@@ -826,6 +1038,13 @@ def combine_microphone_measurements(
         "microphone_channels_rejected": len(input_channels) - len(selected),
         "inter_microphone_spread_db": round(max(spread_errors, default=0.0), 2),
     }
+    # The best microphone sets the usable signal-to-noise ratio, because the
+    # combination is a median across microphones, not a sum of their noise.
+    snr_bands = {
+        key: max(quality["metrics"][key] for quality in used_qualities)
+        for key in SNR_BANDS_HZ
+        if all(key in quality["metrics"] for quality in used_qualities)
+    }
     quality = _quality_summary(
         internal_mic=True,
         calibration=measurements[0]["microphone_calibration"],
@@ -839,6 +1058,7 @@ def combine_microphone_measurements(
         worst_harmonic_residual_db=metrics["worst_harmonic_residual_db"],
         clipped_samples=metrics["clipped_samples"],
         excluded_sweeps=metrics["excluded_sweeps"],
+        snr_bands_db=snr_bands,
     )
     _add_measurement_level_guidance(
         quality, metrics["maximum_accepted_peak_dbfs"]
@@ -872,6 +1092,13 @@ def combine_microphone_measurements(
         "method": "repeated-exponential-sine-sweep-multi-microphone",
         "rate_hz": measurements[0]["rate_hz"],
         "sweep": measurements[0]["sweep"],
+        "gate": measurements[0].get("gate"),
+        # The quietest microphone's floor, level-aligned like its response.
+        "noise_floor_db": np.round(np.min(np.vstack([
+            np.asarray(measurements[index].get("noise_floor_db", np.zeros(frequencies.size)), dtype=float)
+            + offsets[position]
+            for position, index in enumerate(selected)
+        ]), axis=0), 3).tolist(),
         "microphone_calibration": measurements[0]["microphone_calibration"],
         "clock_ratio": round(float(np.median([
             measurement["clock_ratio"] for measurement in used_measurements

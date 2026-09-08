@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy import signal
+from scipy.ndimage import gaussian_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -24,6 +25,7 @@ from calibration_dsp import (  # noqa: E402
     parse_mic_calibration,
     plan_probe_level,
     search_measurement_level,
+    snr_uncertainty_db,
 )
 
 
@@ -41,12 +43,16 @@ class CalibrationDspTests(unittest.TestCase):
             response_tail=0.08,
         )
 
-    def synthetic_capture(self, *, clip=False, drift_ratio=None):
+    def synthetic_capture(self, *, clip=False, drift_ratio=None, noise=2e-5,
+                          late_reflection=None):
         program, schedule = build_measurement_signal(self.spec)
         mono = np.sum(program, axis=1)
-        impulse = np.zeros(90)
+        impulse = np.zeros(400)
         impulse[32] = 0.72
         impulse[46] = 0.13
+        if late_reflection is not None:
+            delay_samples, amplitude = late_reflection
+            impulse[32 + delay_samples] = amplitude
         response = signal.fftconvolve(mono, impulse)
         lead = np.zeros(int(0.25 * self.spec.rate))
         capture = np.concatenate((lead, response, np.zeros(self.spec.rate // 2)))
@@ -54,10 +60,81 @@ class CalibrationDspTests(unittest.TestCase):
             numerator = int(round(drift_ratio * 10_000))
             capture = signal.resample_poly(capture, numerator, 10_000)
         rng = np.random.default_rng(42)
-        capture += rng.normal(0.0, 2e-5, capture.size)
+        capture += rng.normal(0.0, noise, capture.size)
         if clip:
             capture = np.clip(capture * 30.0, -1.0, 1.0)
         return capture, schedule
+
+    @staticmethod
+    def ripple_db(result, low_hz, high_hz):
+        frequencies = np.asarray(result["frequency_hz"])
+        curve = np.asarray(result["channels"][0]["response_db"])
+        band = (frequencies >= low_hz) & (frequencies <= high_hz)
+        smooth = gaussian_filter1d(curve, sigma=4.0, mode="nearest")
+        return float(np.std((curve - smooth)[band]))
+
+    def test_gate_removes_a_late_room_reflection(self):
+        # A reflection 30 ms after the direct sound combs the whole-buffer
+        # response; a 15-cycle gate is 15 ms long at 1 kHz and excludes it.
+        capture, schedule = self.synthetic_capture(late_reflection=(240, 0.45))
+        gated = analyse_capture(
+            capture, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True
+        )
+        ungated = analyse_capture(
+            capture, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True,
+            gate_cycles=None,
+        )
+        ungated_ripple = self.ripple_db(ungated, 800.0, 2_800.0)
+        gated_ripple = self.ripple_db(gated, 800.0, 2_800.0)
+        self.assertGreater(ungated_ripple, 2.0)
+        self.assertLess(gated_ripple, 1.0)
+        self.assertLess(gated_ripple, ungated_ripple / 2.0)
+        self.assertEqual(gated["gate"]["cycles"], 15.0)
+        self.assertEqual(ungated["gate"]["method"], "none")
+        self.assertTrue(gated["quality"]["accepted"], gated["quality"])
+
+    def test_gate_keeps_the_broad_response_of_a_clean_speaker(self):
+        capture, schedule = self.synthetic_capture()
+        gated = analyse_capture(
+            capture, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True
+        )
+        ungated = analyse_capture(
+            capture, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True,
+            gate_cycles=None,
+        )
+        frequencies = np.asarray(gated["frequency_hz"])
+        band = (frequencies >= 150.0) & (frequencies <= 2_500.0)
+        difference = np.asarray(gated["level_dbfs"]) - np.asarray(ungated["level_dbfs"])
+        self.assertLess(float(np.max(np.abs(difference[band]))), 1.0)
+        for sweep in gated["channels"][0]["sweeps"]:
+            self.assertLess(abs(sweep["direct_sound_ms"]), 2.0)
+
+    def test_noise_floor_lowers_snr_and_widens_uncertainty(self):
+        quiet, schedule = self.synthetic_capture(noise=2e-5)
+        noisy, _ = self.synthetic_capture(noise=1e-3)
+        quiet_result = analyse_capture(
+            quiet, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True
+        )
+        noisy_result = analyse_capture(
+            noisy, schedule, self.spec, record_lead_seconds=0.25, internal_mic=True
+        )
+        self.assertEqual(len(quiet_result["noise_floor_db"]), len(quiet_result["frequency_hz"]))
+        quiet_snr = quiet_result["quality"]["metrics"]["snr_mid_db"]
+        noisy_snr = noisy_result["quality"]["metrics"]["snr_mid_db"]
+        self.assertGreater(quiet_snr, noisy_snr + 20.0)
+        quiet_uncertainty = np.mean(quiet_result["channels"][0]["uncertainty_db"])
+        noisy_uncertainty = np.mean(noisy_result["channels"][0]["uncertainty_db"])
+        self.assertGreater(noisy_uncertainty, 10.0 * quiet_uncertainty)
+        self.assertGreater(noisy_uncertainty, 0.1)
+        quiet_floor = np.median(quiet_result["noise_floor_db"])
+        noisy_floor = np.median(noisy_result["noise_floor_db"])
+        # 2e-5 to 1e-3 is 34 dB more noise; the measured floor must follow it.
+        self.assertAlmostEqual(noisy_floor - quiet_floor, 34.0, delta=2.0)
+        self.assertAlmostEqual(snr_uncertainty_db(np.asarray([20.0]))[0], 0.83, delta=0.02)
+        self.assertAlmostEqual(snr_uncertainty_db(np.asarray([0.0]))[0], 6.02, delta=0.02)
+        # The test sweep stops at 3 kHz, so only the low and mid bands exist.
+        self.assertIn("snr_low_db", noisy_result["quality"]["metrics"])
+        self.assertNotIn("snr_high_db", noisy_result["quality"]["metrics"])
 
     def test_signal_alternates_left_and_right_three_times(self):
         program, schedule = build_measurement_signal(self.spec)

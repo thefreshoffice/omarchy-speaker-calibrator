@@ -8,10 +8,20 @@ EQ, a protective 55 Hz high-pass, automatic headroom, and a -1 dBFS
 look-ahead limiter.
 
 Phase 1 uses three repeated exponential sine sweeps per speaker. Left and right
-are measured independently. The analyzer deconvolves the response, estimates and
-corrects playback/recording clock drift, and checks clipping, sweep prominence,
-alignment, repeatability, microphone gain stability, and harmonic residuals.
-Measurements that fail a quality gate cannot be installed.
+are measured independently. The analyzer deconvolves the response with the
+band outside the sweep rolled off, finds the direct sound, and reads the
+magnitude through a frequency-dependent window of 15 cycles: 150 ms at 100 Hz,
+15 ms at 1 kHz, 1.5 ms at 10 kHz. That keeps the desk reflection a listener at
+the laptop also hears, while dropping later room reflections and the distortion
+products a sine sweep folds into negative time, so the filters are fitted to
+the sound of the speaker rather than to the room around the microphone. The
+room sound recorded between sweeps is put through the identical deconvolution
+and window to measure the noise floor at every frequency; the resulting
+signal-to-noise ratio widens the optimizer's uncertainty wherever the noise
+floor is close, which on small speakers is mostly the bass. The analyzer also
+estimates and corrects playback/recording clock drift, and checks clipping,
+sweep prominence, alignment, repeatability, microphone gain stability, and
+harmonic residuals. Measurements that fail a quality gate cannot be installed.
 
 When a built-in microphone source exposes two or more input channels, the panel
 recommends **All built-in microphones**. Every channel is analyzed independently;
