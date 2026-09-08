@@ -21,7 +21,8 @@ Item {
     error = ""
     message = operation === "measure"
       ? "Checking the level, then playing six left/right sweeps — about 30 seconds…"
-      : operation === "compare" ? "Switching profiles…" : "Working…"
+      : operation === "compare" ? "Switching profiles…"
+      : operation === "refit" ? "Refitting the saved measurement…" : "Working…"
     _stdout = ""
     _stderr = ""
     // Keep mise/user-site packages from shadowing Arch's matched NumPy/SciPy
@@ -32,13 +33,20 @@ Item {
   }
   function refresh() { if (!busy) start("devices", ["devices-json"]) }
   function refreshStatus() { start("status", ["status-json"]) }
-  function measure(sink, mic, channel, voicing, micCalibrationFile) {
+  function measure(sink, mic, channel, voicing, micCalibrationFile, loudness, bass) {
     proposal = null
     var arguments = ["calibrate-json", "--sink", sink, "--mic", mic,
-                     "--channel", String(channel), "--voicing", voicing]
+                     "--channel", String(channel), "--voicing", voicing,
+                     "--loudness", loudness || "protected", "--bass", bass || "normal"]
     if (micCalibrationFile && micCalibrationFile.length > 0)
       arguments.push("--mic-cal-file", micCalibrationFile)
     start("measure", arguments)
+  }
+  // Re-fit the last recorded sweeps with different options, without playing
+  // anything.
+  function refit(voicing, loudness, bass) {
+    start("refit", ["reanalyze-saved-json", "--voicing", voicing,
+                    "--loudness", loudness || "protected", "--bass", bass || "normal"])
   }
   function install() { start("install", ["install-proposal"]) }
   function disable() { start("disable", ["disable"]) }
@@ -75,7 +83,7 @@ Item {
           root.proposal = statusPayload.proposal || null
           root.message = ""
         }
-        else if (root.phase === "measure") {
+        else if (root.phase === "measure" || root.phase === "refit") {
           root.proposal = JSON.parse(raw)
           if (root.proposal.quality && root.proposal.quality.accepted) {
             var count = root.proposal.fit ? Number(root.proposal.fit.filter_count || 0) : 0

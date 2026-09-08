@@ -12,6 +12,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    MAKEUP_CAP_DB,
+    loudness_makeup_db,
+    pink_loudness_db,
     pleasant_in_room_target,
     optimize_peq,
 )
@@ -69,6 +72,61 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertGreater(at(100), at(1000) + 2.0)
         self.assertAlmostEqual(at(500), at(1000), delta=0.05)
         self.assertLess(at(10_000), at(1000) - 3.0)
+
+    def test_full_bass_adds_a_paid_for_shelf_at_the_knee(self):
+        response = np.full(self.frequencies.size, -30.0)
+        # A speaker that gives up below 400 Hz: 12 dB/octave roll-off.
+        low = self.frequencies < 400.0
+        response[low] -= 12.0 * np.log2(400.0 / self.frequencies[low])
+        normal = optimize_peq(self.measurement(response), "neutral", internal_mic=True)
+        full = optimize_peq(
+            self.measurement(response), "neutral", internal_mic=True, bass="full"
+        )
+        self.assertIsNone(normal["low_shelf"])
+        shelf = full["low_shelf"]
+        self.assertEqual(shelf["gain_db"], 3.0)
+        self.assertGreaterEqual(shelf["frequency_hz"], 150.0)
+        self.assertLessEqual(shelf["frequency_hz"], 600.0)
+        self.assertEqual(full["gains_db"], normal["gains_db"])
+        at = lambda result, hz: float(np.interp(
+            np.log(hz), np.log(self.frequencies), result["correction_response_db"]
+        ))
+        self.assertAlmostEqual(at(full, 100) - at(normal, 100), 3.0, delta=0.4)
+        self.assertAlmostEqual(at(full, 5000) - at(normal, 5000), 0.0, delta=0.1)
+        # The shelf is a positive correction, so headroom and input trim pay for it.
+        self.assertGreaterEqual(full["headroom_db"], normal["headroom_db"] + 2.0)
+        self.assertLess(full["input_gain_linear"], normal["input_gain_linear"])
+
+    def test_loudness_modes_pay_back_a_capped_share_of_the_loss(self):
+        self.assertEqual(loudness_makeup_db(4.0, "protected"), 0.0)
+        self.assertEqual(loudness_makeup_db(4.0, "balanced"), 2.0)
+        self.assertEqual(loudness_makeup_db(4.0, "matched"), 4.0)
+        self.assertEqual(loudness_makeup_db(9.0, "matched"), MAKEUP_CAP_DB)
+        self.assertEqual(loudness_makeup_db(9.0, "balanced"), MAKEUP_CAP_DB / 2.0)
+        self.assertEqual(loudness_makeup_db(-3.0, "matched"), 0.0)
+        flat = np.zeros(self.frequencies.size)
+        cut = flat.copy()
+        cut[(self.frequencies > 600) & (self.frequencies < 1500)] -= 10.0
+        self.assertGreater(
+            pink_loudness_db(self.frequencies, flat) - pink_loudness_db(self.frequencies, cut),
+            1.0,
+        )
+
+    def test_matched_loudness_raises_input_gain_by_the_estimated_loss(self):
+        # A loud hump the optimizer will cut, so the corrected speaker loses loudness.
+        response = np.full(self.frequencies.size, -30.0)
+        response[(self.frequencies > 600) & (self.frequencies < 1500)] += 9.0
+        protected = optimize_peq(self.measurement(response), "neutral", internal_mic=True)
+        matched = optimize_peq(
+            self.measurement(response), "neutral", internal_mic=True, loudness="matched"
+        )
+        self.assertEqual(protected["makeup_db"], 0.0)
+        self.assertGreater(matched["loudness_loss_db"], 0.5)
+        self.assertEqual(matched["makeup_db"], min(MAKEUP_CAP_DB, matched["loudness_loss_db"]))
+        self.assertEqual(matched["gains_db"], protected["gains_db"])
+        expected = 10.0 ** ((matched["makeup_db"] - matched["headroom_db"]) / 20.0)
+        self.assertAlmostEqual(matched["input_gain_linear"], expected, places=5)
+        self.assertGreater(matched["input_gain_linear"], protected["input_gain_linear"])
 
     def test_flat_response_is_solved_with_cuts_not_boosts(self):
         response = np.full(self.frequencies.size, -30.0)
@@ -274,7 +332,7 @@ class CompareToggleTests(unittest.TestCase):
                 "plugin_version": "0.8.0",
             }))
             summary = speaker_calibrate.profile_summary(path)
-            self.assertEqual(summary["label"], "2026-09-08 20:00 · 4 filters · flat")
+            self.assertEqual(summary["label"], "2026-09-08 20:00 · 4 filters · flat · normal bass · protected")
             self.assertEqual(summary["plugin_version"], "0.8.0")
             self.assertIsNone(speaker_calibrate.profile_summary(Path(folder) / "missing.json"))
 

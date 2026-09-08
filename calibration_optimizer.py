@@ -37,13 +37,38 @@ def _log_interpolate(frequencies: np.ndarray, anchors_hz, anchors_db) -> np.ndar
     )
 
 
+VOICINGS = ("neutral", "warm")
+# Bass rise of the target: where it starts, how steep it is, and its cap.
+BASS_RISE = {
+    "neutral": (250.0, 2.0, 3.5),
+    "warm": (250.0, 2.0, 3.5),
+}
+
+# How much of the loudness lost to the cuts is added back as input gain.
+LOUDNESS_MODES = {"protected": 0.0, "balanced": 0.5, "matched": 1.0}
+# Beyond this the limiter would be working on most peaks of loud music.  With
+# the 1 dB limiter margin this also bounds the electrical drive in any band
+# to 5 dB above the uncorrected speaker, whatever else is selected.
+MAKEUP_CAP_DB = 6.0
+
+# "Full" bass is a low shelf whose corner sits at the measured knee, where
+# the speaker stops keeping up with its midband, so the lift lands where the
+# driver still turns voltage into sound.  It is paid for by input trim like
+# any other positive correction.
+BASS_MODES = ("normal", "full")
+BASS_SHELF_DB = 3.0
+BASS_SHELF_Q = 0.707
+BASS_SHELF_CORNER_HZ = (150.0, 600.0)
+
+
 def pleasant_in_room_target(frequencies: np.ndarray, voicing: str) -> np.ndarray:
     """Return the broad in-room loudspeaker target relative to the midband."""
     frequencies = np.asarray(frequencies, dtype=float)
     target = np.zeros_like(frequencies)
-    low = frequencies < 250.0
+    knee, slope, cap = BASS_RISE.get(voicing, BASS_RISE["neutral"])
+    low = frequencies < knee
     high = frequencies > 2000.0
-    target[low] = np.minimum(3.5, 2.0 * np.log2(250.0 / frequencies[low]))
+    target[low] = np.minimum(cap, slope * np.log2(knee / frequencies[low]))
     target[high] = np.maximum(-4.5, -1.5 * np.log2(frequencies[high] / 2000.0))
     if voicing == "warm":
         target += _log_interpolate(
@@ -52,6 +77,43 @@ def pleasant_in_room_target(frequencies: np.ndarray, voicing: str) -> np.ndarray
             [0.0, 0.0, -0.25, -0.7, -1.2, -1.35, -1.1, -0.7],
         )
     return target
+
+
+def a_weighting_db(frequencies: np.ndarray) -> np.ndarray:
+    """IEC 61672 A-weighting, in dB."""
+    f2 = np.asarray(frequencies, dtype=float) ** 2
+    ra = (12194.0 ** 2 * f2 ** 2) / (
+        (f2 + 20.6 ** 2)
+        * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
+        * (f2 + 12194.0 ** 2)
+    )
+    return 20.0 * np.log10(np.maximum(ra, 1e-12)) + 2.0
+
+
+def pink_loudness_db(
+    frequencies: np.ndarray, response_db: np.ndarray,
+    *, low_hz: float = 100.0, high_hz: float = 10_000.0,
+) -> float:
+    """A-weighted level of pink noise played through this response.
+
+    The analysis grid is log-spaced, so an unweighted mean over its bins is
+    already pink (equal energy per octave).  Only the difference between two
+    responses is used, so the absolute scale does not matter.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    band = (frequencies >= low_hz) & (frequencies <= high_hz)
+    weighted = np.asarray(response_db, dtype=float)[band] + a_weighting_db(frequencies[band])
+    return 10.0 * math.log10(float(np.mean(10.0 ** (weighted / 10.0))))
+
+
+def loudness_makeup_db(loudness_loss_db: float, loudness: str) -> float:
+    """Input gain that pays back part of the loudness the cuts removed.
+
+    The share applies to the capped loss, so "balanced" is always a real
+    step between "protected" and "matched", even when the loss is large.
+    """
+    fraction = LOUDNESS_MODES.get(loudness, 0.0)
+    return round(min(MAKEUP_CAP_DB, max(0.0, loudness_loss_db)) * fraction, 2)
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:
@@ -85,6 +147,37 @@ def _peaking_response_db(
     numerator = b0 + b1 * z1 + b2 * z2
     denominator = a0 + a1 * z1 + a2 * z2
     return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
+
+
+def _lowshelf_response_db(
+    frequencies: np.ndarray, corner: float, q: float, gain_db: float, rate: int
+) -> np.ndarray:
+    """Exact RBJ low-shelf magnitude response."""
+    amplitude = 10.0 ** (gain_db / 40.0)
+    omega0 = 2.0 * math.pi * corner / rate
+    alpha = math.sin(omega0) / (2.0 * q)
+    cos0 = math.cos(omega0)
+    root_term = 2.0 * math.sqrt(amplitude) * alpha
+    b0 = amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cos0 + root_term)
+    b1 = 2.0 * amplitude * ((amplitude - 1.0) - (amplitude + 1.0) * cos0)
+    b2 = amplitude * ((amplitude + 1.0) - (amplitude - 1.0) * cos0 - root_term)
+    a0 = (amplitude + 1.0) + (amplitude - 1.0) * cos0 + root_term
+    a1 = -2.0 * ((amplitude - 1.0) + (amplitude + 1.0) * cos0)
+    a2 = (amplitude + 1.0) + (amplitude - 1.0) * cos0 - root_term
+    omega = 2.0 * math.pi * frequencies / rate
+    z1 = np.exp(-1j * omega)
+    z2 = z1 * z1
+    numerator = b0 + b1 * z1 + b2 * z2
+    denominator = a0 + a1 * z1 + a2 * z2
+    return 20.0 * np.log10(np.maximum(np.abs(numerator / denominator), 1e-12))
+
+
+def bass_shelf(knee_hz: float, bass: str) -> dict | None:
+    """The full-bass shelf for this measurement, or None for normal bass."""
+    if bass != "full":
+        return None
+    corner = float(np.clip(knee_hz, BASS_SHELF_CORNER_HZ[0], BASS_SHELF_CORNER_HZ[1]))
+    return {"frequency_hz": round(corner, 1), "q": BASS_SHELF_Q, "gain_db": BASS_SHELF_DB}
 
 
 def _highpass_response_db(
@@ -431,7 +524,14 @@ def _new_filter(
     }
 
 
-def optimize_peq(measurement: dict, voicing: str, *, internal_mic: bool) -> dict:
+def optimize_peq(
+    measurement: dict,
+    voicing: str,
+    *,
+    internal_mic: bool,
+    loudness: str = "protected",
+    bass: str = "normal",
+) -> dict:
     frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
     measured = np.asarray(measurement["level_dbfs"], dtype=float)
     measured_smooth = gaussian_filter1d(measured, sigma=4.0, mode="nearest")
@@ -665,9 +765,24 @@ def optimize_peq(measurement: dict, voicing: str, *, internal_mic: bool) -> dict
         centers_hz=centers,
         q_values=q_values,
     )
+    shelf = bass_shelf(safe_boost_floor, bass)
+    if shelf is not None:
+        correction = correction + _lowshelf_response_db(
+            frequencies, shelf["frequency_hz"], shelf["q"], shelf["gain_db"],
+            measurement["rate_hz"],
+        )
     predicted = measured_smooth + correction
     positive_peak = max(0.0, float(np.max(correction)))
     headroom_db = max(1.0, math.ceil((positive_peak + 1.0) * 100.0) / 100.0)
+    # The cuts land where the speaker was loudest, so the corrected speaker
+    # plays quieter at the same volume setting.  Estimate how much, and let
+    # the loudness mode decide how much of it to add back before the limiter.
+    loudness_loss_db = max(0.0, (
+        pink_loudness_db(frequencies, measured_smooth)
+        - pink_loudness_db(frequencies, measured_smooth + correction)
+    ))
+    makeup_db = loudness_makeup_db(loudness_loss_db, loudness)
+    net_input_gain_db = makeup_db - headroom_db
     before_rmse = _weighted_rmse(
         measured_smooth, np.zeros_like(frequencies), aligned_target, weights, valid
     )
@@ -711,7 +826,13 @@ def optimize_peq(measurement: dict, voicing: str, *, internal_mic: bool) -> dict
         "safe_boost_floor_hz": round(safe_boost_floor, 1),
         "boost_decisions": boost_decisions,
         "headroom_db": headroom_db,
-        "input_gain_linear": round(10.0 ** (-headroom_db / 20.0), 6),
+        "bass_mode": bass,
+        "low_shelf": shelf,
+        "loudness_mode": loudness,
+        "loudness_loss_db": round(loudness_loss_db, 2),
+        "makeup_db": makeup_db,
+        "net_input_gain_db": round(net_input_gain_db, 2),
+        "input_gain_linear": round(10.0 ** (net_input_gain_db / 20.0), 6),
         "weighted_rmse_before_db": round(before_rmse, 3),
         "weighted_rmse_after_db": round(after_rmse, 3),
         "cross_validation": {

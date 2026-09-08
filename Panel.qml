@@ -72,6 +72,23 @@ Panel {
     }
     return rows.join("   ·   ")
   }
+  function selectedVoicing() {
+    return ["warm", "neutral"][voicingBox.currentIndex] || "warm"
+  }
+  function selectedBass() {
+    return bassBox.currentIndex === 1 ? "full" : "normal"
+  }
+  function selectedLoudness() {
+    return ["protected", "balanced", "matched"][loudnessBox.currentIndex] || "protected"
+  }
+  function voicingIndex(voicing) {
+    var index = ["warm", "neutral"].indexOf(voicing)
+    return index < 0 ? 0 : index
+  }
+  function loudnessIndex(loudness) {
+    var index = ["protected", "balanced", "matched"].indexOf(loudness)
+    return index < 0 ? 0 : index
+  }
   function fitSummaryText() {
     if (!service.proposal || !service.proposal.fit) return ""
     var fit = service.proposal.fit
@@ -83,6 +100,14 @@ Panel {
       + " → " + Number(validation.rmse_after_db || 0).toFixed(2) + " dB"
       + "   ·   max boost " + Number(fit.actual_maximum_boost_db || 0).toFixed(2) + " dB"
       + "   ·   protected headroom " + Number(fit.headroom_db || 1).toFixed(2) + " dB"
+      + (fit.low_shelf
+          ? "   ·   bass shelf +" + Number(fit.low_shelf.gain_db).toFixed(1) + " dB below "
+            + Number(fit.low_shelf.frequency_hz).toFixed(0) + " Hz"
+          : "")
+      + (fit.loudness_loss_db !== undefined
+          ? "   ·   loudness lost to cuts " + Number(fit.loudness_loss_db).toFixed(1) + " dB"
+            + "   ·   make-up +" + Number(fit.makeup_db || 0).toFixed(1) + " dB (" + (fit.loudness_mode || "protected") + ")"
+          : "")
   }
   function qualityMetricsText() {
     if (!service.proposal || !service.proposal.quality) return ""
@@ -243,6 +268,25 @@ Panel {
               model: ["Warm — softer, less sharp", "Flat — balanced, more detail"]
               enabled: !service.busy
             }
+
+            Text { text: "BASS"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+            QQC.ComboBox {
+              id: bassBox
+              Layout.fillWidth: true
+              model: ["Normal — the measured correction only",
+                      "Full — +3 dB shelf below the speaker's knee"]
+              enabled: !service.busy
+            }
+
+            Text { text: "LOUDNESS"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+            QQC.ComboBox {
+              id: loudnessBox
+              Layout.fillWidth: true
+              model: ["Protected — cleanest, a little quieter",
+                      "Balanced — half the lost loudness added back",
+                      "Matched — as loud as before, limiter works harder"]
+              enabled: !service.busy
+            }
           }
 
           Text {
@@ -257,7 +301,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "WARM — Makes sharp voices, cymbals, and hiss gentler. It sounds softer and can be easier to enjoy for a long time.\n\nFLAT — Keeps the sound more balanced, without adding Warm’s extra softness. It preserves more clarity and may sound a little brighter. ‘Flat’ does not mean the graph must become a perfectly straight line."
+            text: "WARM — Makes sharp voices, cymbals, and hiss gentler. It sounds softer and can be easier to enjoy for a long time.\n\nFLAT — Keeps the sound more balanced, without adding Warm’s extra softness. It preserves more clarity and may sound a little brighter. ‘Flat’ does not mean the graph must become a perfectly straight line.\n\nFULL BASS — Adds a +3 dB low shelf whose corner sits at the measured knee, where the speaker stops keeping up with its midband, so the lift lands where the driver still makes sound. It is paid for by input trim like any boost; pair it with Balanced or Matched loudness to keep the level.\n\nLOUDNESS — Every correction here is a cut, and the deepest cuts land where the speaker was loudest, so a protected profile plays a little quieter. Balanced and Matched add part or all of that loss back before the limiter, up to 6 dB; at high volume the limiter then works harder. Refit the saved measurement to try these without new sweeps."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -296,9 +340,19 @@ Panel {
               var sink = service.sinks[sinkBox.currentIndex]
               var mic = service.microphones[micBox.currentIndex]
               service.measure(sink.name, mic.name, root.selectedChannelValue(),
-                              voicingBox.currentIndex === 0 ? "warm" : "neutral",
-                              micCalPath.text.trim())
+                              root.selectedVoicing(), micCalPath.text.trim(),
+                              root.selectedLoudness(), root.selectedBass())
             }
+          }
+
+          Button {
+            visible: service.proposal !== null
+            width: parent.width
+            text: service.busy && service.phase === "refit" ? "Refitting…" : "Refit saved measurement with these options"
+            iconText: "󰑓"
+            bordered: true
+            enabled: !service.busy
+            onClicked: service.refit(root.selectedVoicing(), root.selectedLoudness(), root.selectedBass())
           }
 
           Column {
@@ -363,7 +417,9 @@ Panel {
             PanelSectionHeader {
               text: "MEASURED RESPONSE — LEFT / RIGHT"
                 + (service.proposal && service.proposal.fit
-                  ? " · " + (service.proposal.voicing === "warm" ? "WARM" : "FLAT")
+                  ? " · " + (service.proposal.voicing === "neutral" ? "FLAT" : "WARM")
+                    + (service.proposal.bass === "full" ? " · FULL BASS" : "")
+                    + " · " + String(service.proposal.loudness || "protected").toUpperCase()
                     + " TARGET" : "")
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -536,7 +592,9 @@ Panel {
                 function onProposalChanged() {
                   responseCanvas.requestPaint()
                   if (service.proposal && service.proposal.voicing) {
-                    voicingBox.currentIndex = service.proposal.voicing === "warm" ? 0 : 1
+                    voicingBox.currentIndex = root.voicingIndex(service.proposal.voicing)
+                    loudnessBox.currentIndex = root.loudnessIndex(service.proposal.loudness)
+                    bassBox.currentIndex = service.proposal.bass === "full" ? 1 : 0
                     var savedChannel = service.proposal.microphone
                       ? service.proposal.microphone.channel : 0
                     if (root.multiMicAvailable())

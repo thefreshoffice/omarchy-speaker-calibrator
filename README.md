@@ -128,6 +128,33 @@ sweep sequence.
   It preserves more clarity and may sound a little brighter. Flat does not mean
   the measured graph must become a perfectly straight line.
 
+### Bass: Normal or Full?
+
+- **Normal** applies the measured correction only.
+- **Full** adds a +3 dB low shelf whose corner sits at the measured knee, the
+  frequency where the speaker stops keeping up with its midband, clamped to
+  150–600 Hz. The lift therefore lands where the driver still turns voltage
+  into sound. Like any boost it is paid for by input trim, so pair it with
+  Balanced or Matched loudness to keep the level.
+
+### Loudness: Protected, Balanced, or Matched?
+
+Every correction is a cut, and the deepest cuts land where the speaker was
+loudest, so a corrected speaker plays quieter at the same volume setting. The
+optimizer estimates that loss as the A-weighted level of pink noise through the
+response before and after correction.
+
+- **Protected** adds nothing back. It is the cleanest choice and keeps the full
+  1 dB limiter margin plus any boost headroom.
+- **Balanced** adds back half of the lost loudness as input gain.
+- **Matched** adds back all of it, up to 6 dB. The -1 dBFS limiter absorbs the
+  peaks, so at high volume it works harder and loud passages are held down.
+
+Both choices can be changed after a measurement: **Refit saved measurement**
+re-runs the analysis and the fit on the recorded sweeps without playing
+anything, and installing the result switches live, so the variants can be
+compared by ear against the previous profile.
+
 The built-in microphone is useful for a rough first profile. A measurement mic
 placed on-axis at normal listening distance is recommended for final tuning.
 
@@ -157,6 +184,11 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
   tighter frequency-dependent limits; the full -6 dB range remains available in
   the more reliable midrange.
 - Positive correction is matched by automatic input trim plus 1 dB margin.
+- Loudness make-up is limited to 6 dB and only ever pays back loudness that
+  the cuts removed; the limiter ceiling stays at -1 dBFS. Because the input
+  trim already pays for every positive correction, including the full-bass
+  shelf, no band is ever driven more than 5 dB harder than the uncorrected
+  speaker at the same volume setting.
 - Two 55 Hz high-pass sections reduce wasteful driver excursion.
 - The limiter has auto-level and boost disabled.
 - The limiter ceiling is -1 dBFS.

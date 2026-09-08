@@ -317,7 +317,9 @@ def profile_summary(path):
     return {
         "created_at": profile.get("created_at"),
         "label": f"{created} · {fit.get('filter_count', 0)} filters · "
-                 f"{'flat' if profile.get('voicing') == 'neutral' else 'warm'}",
+                 f"{VOICING_LABELS.get(profile.get('voicing'), 'warm')} · "
+                 f"{BASS_LABELS.get(profile.get('bass'), 'normal bass')} · "
+                 f"{LOUDNESS_LABELS.get(profile.get('loudness'), 'protected')}",
         "plugin_version": profile.get("plugin_version"),
     }
 
@@ -637,7 +639,14 @@ def attach_level_search(measurement, level_search):
         quality["verdict"] = "warning" if quality["warnings"] else "pass"
 
 
-def profile_from_measurement(sink, mic, channel, voicing, measurement):
+VOICING_LABELS = {"neutral": "flat", "warm": "warm"}
+LOUDNESS_LABELS = {"protected": "protected", "balanced": "balanced", "matched": "matched"}
+BASS_LABELS = {"normal": "normal bass", "full": "full bass"}
+
+
+def profile_from_measurement(
+    sink, mic, channel, voicing, measurement, loudness="protected", bass="normal"
+):
     quality = measurement["quality"]
     internal_mic = mic["name"].startswith("alsa_input.pci-")
     fit_payload = None
@@ -646,6 +655,8 @@ def profile_from_measurement(sink, mic, channel, voicing, measurement):
             measurement,
             voicing,
             internal_mic=internal_mic,
+            loudness=loudness,
+            bass=bass,
         )
     profile = {
         "schema_version": 5,
@@ -661,14 +672,18 @@ def profile_from_measurement(sink, mic, channel, voicing, measurement):
                 if measurement["microphone_calibration"] else None,
         },
         "voicing": voicing,
+        "loudness": loudness,
+        "bass": bass,
         "safety": {
             "eq_max_db": fit_payload["maximum_allowed_boost_db"] if fit_payload else 0,
             "eq_min_db": -6,
             "highpass_hz": 55,
             "limiter_ceiling_dbfs": -1,
             "input_trim_db": -fit_payload["headroom_db"] if fit_payload else -1,
-            "makeup_gain": False,
+            "makeup_gain_db": fit_payload["makeup_db"] if fit_payload else 0,
             "boost_policy": "Cuts are preferred; any boost must be broad, reliable, and improve a held-out repeat.",
+            "loudness_policy": "Make-up gain pays back part of the loudness the cuts removed, never more than 6 dB; the -1 dBFS limiter absorbs the peaks.",
+            "bass_policy": "Full bass is a +3 dB low shelf at the measured knee, paid for by input trim like any boost.",
         },
         "measurement": measurement,
         "quality": quality,
@@ -678,14 +693,18 @@ def profile_from_measurement(sink, mic, channel, voicing, measurement):
     return profile
 
 
-def build_profile(sink, mic, channel, voicing, mic_cal_file=None):
+def build_profile(
+    sink, mic, channel, voicing, mic_cal_file=None, loudness="protected", bass="normal"
+):
     measurement = capture_measurement(
         sink["name"], mic["name"], channel, mic_cal_file
     )
-    return profile_from_measurement(sink, mic, channel, voicing, measurement)
+    return profile_from_measurement(
+        sink, mic, channel, voicing, measurement, loudness, bass
+    )
 
 
-def reanalyze_saved_capture(voicing=None, channel_override=None):
+def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, bass=None):
     """Re-run current analysis and optimization on the last capture, without sound."""
     recording = DATA / "measurement.wav"
     if not PROPOSAL.exists() or not recording.exists():
@@ -717,7 +736,9 @@ def reanalyze_saved_capture(voicing=None, channel_override=None):
     )
     attach_level_search(measurement, previous_measurement.get("level_search"))
     return profile_from_measurement(
-        sink, mic, channel, voicing or previous.get("voicing", "warm"), measurement
+        sink, mic, channel, voicing or previous.get("voicing", "warm"), measurement,
+        loudness or previous.get("loudness", "protected"),
+        bass or previous.get("bass", "normal"),
     )
 
 
@@ -730,7 +751,10 @@ def parse_channel_selection(value):
         raise SystemExit("Microphone channel must be a zero-based number or 'all'.") from error
 
 
-def calibrate_noninteractive(sink_name, mic_name, channel, voicing, mic_cal_file=None):
+def calibrate_noninteractive(
+    sink_name, mic_name, channel, voicing, mic_cal_file=None, loudness="protected",
+    bass="normal",
+):
     sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
     mic = next((item for item in microphones() if item["name"] == mic_name), None)
     if sink is None or mic is None:
@@ -743,7 +767,7 @@ def calibrate_noninteractive(sink_name, mic_name, channel, voicing, mic_cal_file
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
     try:
-        return build_profile(sink, mic, channel, voicing, mic_cal_file)
+        return build_profile(sink, mic, channel, voicing, mic_cal_file, loudness, bass)
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
@@ -809,6 +833,17 @@ def wizard():
           "\n  Flat: balanced with more clarity; may sound a little brighter.")
     answer = input("Choose [w]arm (recommended) or [f]lat? [w]: ").strip().lower()
     voicing = "neutral" if answer.startswith(("f", "n")) else "warm"
+    print("\nBass:\n  Normal: the measured correction only."
+          "\n  Full: a +3 dB low shelf at the speaker's knee, paid for by input trim.")
+    answer = input("Choose [n]ormal (recommended) or [f]ull? [n]: ").strip().lower()
+    bass = "full" if answer.startswith("f") else "normal"
+    print("\nLoudness:\n  Protected: cleanest; the cuts make the speaker a little quieter."
+          "\n  Balanced: half of the lost loudness is added back."
+          "\n  Matched: as loud as before; the limiter works harder at high volume.")
+    answer = input("Choose [p]rotected (recommended), [b]alanced, or [m]atched? [p]: ").strip().lower()
+    loudness = "matched" if answer.startswith("m") else (
+        "balanced" if answer.startswith("b") else "protected"
+    )
     mic_cal_file = None
     if not mic["name"].startswith("alsa_input.pci-"):
         mic_cal_file = input("Microphone calibration file (optional): ").strip() or None
@@ -821,7 +856,7 @@ def wizard():
     print("  A short level check runs first and sets the sweep level automatically.")
     input("Press Enter when ready. The level check and repeated left/right sweeps take about 30 seconds...")
     try:
-        profile = build_profile(sink, mic, channel, voicing, mic_cal_file)
+        profile = build_profile(sink, mic, channel, voicing, mic_cal_file, loudness, bass)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     quality = profile["quality"]
@@ -849,7 +884,12 @@ def wizard():
         fit_payload["centers_hz"], fit_payload["q"], gains
     ):
         print(f"  {center:7.1f} Hz  Q {q:4.2f}  {gain:5.2f} dB")
+    if fit_payload.get("low_shelf"):
+        shelf = fit_payload["low_shelf"]
+        print(f"  Bass shelf: {shelf['gain_db']:+.1f} dB below {shelf['frequency_hz']:.0f} Hz")
     print(f"  Input headroom: {fit_payload['headroom_db']:.2f} dB")
+    print(f"  Loudness lost to cuts: {fit_payload['loudness_loss_db']:.1f} dB; "
+          f"make-up {fit_payload['makeup_db']:+.1f} dB ({fit_payload['loudness_mode']})")
     print(f"  Target-fit error: {fit_payload['weighted_rmse_before_db']:.2f} → "
           f"{fit_payload['weighted_rmse_after_db']:.2f} dB")
     print(f"  Background level: {metrics['background_dbfs']:.1f} dBFS")
@@ -873,8 +913,11 @@ def status():
     if profile:
         print(f"Speaker: {profile['speaker']['description']}\nMicrophone: {profile['microphone']['description']}")
         gains = profile.get("fit", {}).get("gains_db") if profile.get("fit") else None
-        voicing = "flat" if profile["voicing"] == "neutral" else "warm"
-        print(f"Voicing: {voicing}\nGains: {gains or 'not installable'}")
+        voicing = VOICING_LABELS.get(profile.get("voicing"), "warm")
+        loudness = LOUDNESS_LABELS.get(profile.get("loudness"), "protected")
+        bass = BASS_LABELS.get(profile.get("bass"), "normal bass")
+        print(f"Voicing: {voicing}\nBass: {bass}\nLoudness: {loudness}\n"
+              f"Gains: {gains or 'not installable'}")
     else:
         print("No saved calibration profile.")
 
@@ -899,9 +942,14 @@ def main():
     calibrate.add_argument("--mic", required=True)
     calibrate.add_argument("--channel", default="0")
     calibrate.add_argument("--voicing", choices=("warm", "neutral"), default="warm")
+    calibrate.add_argument("--loudness", choices=("protected", "balanced", "matched"),
+                           default="protected")
+    calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")
     calibrate.add_argument("--mic-cal-file")
     reanalyze = sub.add_parser("reanalyze-saved-json")
     reanalyze.add_argument("--voicing", choices=("warm", "neutral"))
+    reanalyze.add_argument("--loudness", choices=("protected", "balanced", "matched"))
+    reanalyze.add_argument("--bass", choices=("normal", "full"))
     reanalyze.add_argument("--channel")
     args = parser.parse_args()
     command = args.command or "wizard"
@@ -911,10 +959,13 @@ def main():
         print(json.dumps(status_payload()))
     elif command == "calibrate-json":
         print(json.dumps(calibrate_noninteractive(
-            args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file
+            args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,
+            args.loudness, args.bass,
         )))
     elif command == "reanalyze-saved-json":
-        print(json.dumps(reanalyze_saved_capture(args.voicing, args.channel)))
+        print(json.dumps(reanalyze_saved_capture(
+            args.voicing, args.channel, args.loudness, args.bass
+        )))
     elif command == "install-proposal":
         print(json.dumps(install_proposal()))
     elif command == "compare-toggle":
