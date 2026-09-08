@@ -107,6 +107,20 @@ long-lived Omarchy shell process.
 
 - Click the speaker icon to open or close the calibration panel.
 - Middle-click refreshes the detected audio devices.
+- The panel is built for someone with no audio knowledge: pick the speakers
+  and microphone (the built-in ones are preselected), press **Calibrate
+  speakers**, and the result installs itself when the measurement passes.
+  Two toggles change the sound at once from the last measurement, without new
+  sweeps: **Loudness** for a fuller sound with more bass, like the loudness
+  button on a stereo, and **Make it louder** to give back the volume the
+  correction takes away. A **Calibration** toggle switches the filters off and
+  on live, so anyone can hear before and after. An equalizer view shows each
+  filter as a coloured band with a node at its frequency and gain, and the
+  combined curve on top.
+- **Advanced** reveals the voicing, the three-level loudness setting, the
+  microphone channel and calibration file, refit and install controls, the
+  measurement quality and response graph, the list of sections, the switch
+  between the two stored profiles, and the stop button.
 - For a multi-microphone laptop, keep **All built-in microphones — recommended**
   selected. Individual channels remain available for troubleshooting.
 - Measure first, review the proposed filters and graph, then explicitly install

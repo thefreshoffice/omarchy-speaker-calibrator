@@ -401,5 +401,62 @@ class CompareToggleTests(unittest.TestCase):
             self.assertIsNone(speaker_calibrate.profile_summary(Path(folder) / "missing.json"))
 
 
+class BypassTests(unittest.TestCase):
+    def test_bypass_regenerates_an_old_graph_before_zeroing_it(self):
+        module = speaker_calibrate
+        saved = {name: getattr(module, name) for name in (
+            "DATA", "PROFILE", "PREVIOUS_PROFILE", "COMPARE_STATE", "FRAGMENT",
+            "service_active", "apply_controls_live", "activate_profile", "restart_tuning",
+        )}
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            module.DATA = base
+            module.PROFILE = base / "active-profile.json"
+            module.PREVIOUS_PROFILE = base / "previous-profile.json"
+            module.COMPARE_STATE = base / "compare-state.json"
+            module.FRAGMENT = base / "90-tuning.conf"
+            module.PROFILE.write_text(json.dumps({
+                "speaker": {"name": "alsa_output.x"}, "voicing": "warm",
+                "fit": {"centers_hz": [1000], "q": [1.0], "gains_db": [-3.0], "input_gain_linear": 0.9},
+            }))
+            applied = []
+            attempts = {"count": 0}
+            def fake_apply(controls):
+                attempts["count"] += 1
+                applied.append(controls)
+                return attempts["count"] > 1   # the old-shape graph refuses the first time
+            activated = []
+            def fake_activate(profile):
+                activated.append(profile["speaker"]["name"])
+                return "restart"
+            try:
+                module.service_active = lambda: True
+                module.apply_controls_live = fake_apply
+                module.activate_profile = fake_activate
+                module.restart_tuning = lambda: (_ for _ in ()).throw(AssertionError("no bare restart"))
+                payload = module.bypass_toggle()
+            finally:
+                for name, value in saved.items():
+                    setattr(module, name, value)
+            self.assertTrue(payload["bypass"])
+            self.assertEqual(payload["method"], "restart")
+            self.assertEqual(activated, ["alsa_output.x"])
+            self.assertEqual(attempts["count"], 2)
+            self.assertEqual(applied[-1]["limiter:g_in"], 1.0)
+            self.assertEqual(applied[-1]["hp1_l:Freq"], 10.0)
+
+    def test_transparent_controls_pass_audio_through(self):
+        controls = speaker_calibrate.transparent_controls()
+        self.assertEqual(controls["limiter:g_in"], 1.0)
+        for name, value in controls.items():
+            if name.endswith(":Gain"):
+                self.assertEqual(value, 0.0, name)
+            if name.startswith("hp") and name.endswith(":Freq"):
+                self.assertEqual(value, 10.0, name)
+        self.assertEqual(set(controls), set(speaker_calibrate.graph_controls(
+            {"filters": [], "input_gain_linear": 1.0}
+        )))
+
+
 if __name__ == "__main__":
     unittest.main()

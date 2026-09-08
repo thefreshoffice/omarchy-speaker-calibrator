@@ -6,7 +6,7 @@ Item {
   property string helperPath: ""
   property var sinks: []
   property var microphones: []
-  property var status: ({ service: "unknown", enabled: false, profile: null })
+  property var status: ({ service: "unknown", enabled: false, profile: null, bypass: false })
   property var proposal: null
   property bool busy: process.running
   property string phase: ""
@@ -20,9 +20,10 @@ Item {
     phase = operation
     error = ""
     message = operation === "measure"
-      ? "Checking the level, then playing six left/right sweeps — about 30 seconds…"
+      ? "Measuring — a short level check, then six sweeps, about 30 seconds. Keep quiet…"
       : operation === "compare" ? "Switching profiles…"
-      : operation === "refit" ? "Refitting the saved measurement…" : "Working…"
+      : operation === "bypass" ? "Switching…"
+      : operation === "refit" ? "Applying…" : "Working…"
     _stdout = ""
     _stderr = ""
     // Keep mise/user-site packages from shadowing Arch's matched NumPy/SciPy
@@ -31,7 +32,19 @@ Item {
                        "/usr/bin/python3", "-s", helperPath].concat(arguments)
     process.running = true
   }
-  // Short human label for a profile or proposal: "warm · full bass · matched".
+
+  // Plain-language label for a profile: what the two simple toggles are set to.
+  function simpleLabel(profile) {
+    if (!profile) return ""
+    var parts = []
+    parts.push(profile.bass === "full" ? "Loudness on" : "Loudness off")
+    var loudness = profile.loudness || "protected"
+    parts.push(loudness === "matched" ? "Louder on"
+      : loudness === "balanced" ? "Louder halfway" : "Louder off")
+    if (profile.voicing === "neutral") parts.push("flat voicing")
+    return parts.join(" · ")
+  }
+  // Technical label: "warm · full bass · matched".
   function optionsLabel(profile) {
     if (!profile) return ""
     var voicing = profile.voicing === "neutral" ? "flat" : "warm"
@@ -39,12 +52,16 @@ Item {
     var loudness = profile.loudness || "protected"
     return voicing + " · " + bass + " · " + loudness
   }
-  // Label of the profile that is playing right now, if the helper knows it.
-  function playingLabel() {
+  // The summary of the profile that is playing right now.
+  function playingSummary() {
     var compare = status.compare
-    if (compare && compare.available && compare[compare.active] && compare[compare.active].label)
-      return compare[compare.active].label
-    if (compare && compare.current && compare.current.label) return compare.current.label
+    if (compare && compare.available && compare[compare.active]) return compare[compare.active]
+    if (compare && compare.current) return compare.current
+    return null
+  }
+  function playingLabel() {
+    var summary = playingSummary()
+    if (summary && summary.label) return summary.label
     return status.profile ? optionsLabel(status.profile) : ""
   }
   // Label of the profile the compare button would switch to.
@@ -54,26 +71,36 @@ Item {
     var other = compare.active === "previous" ? compare.current : compare.previous
     return other && other.label ? other.label : (compare.active === "previous" ? "current" : "previous")
   }
+  function optionArguments(options) {
+    return ["--voicing", options.voicing || "warm",
+            "--loudness", options.loudness || "protected",
+            "--bass", options.bass || "normal"]
+  }
+
   function refresh() { if (!busy) start("devices", ["devices-json"]) }
   function refreshStatus() { start("status", ["status-json"]) }
-  function measure(sink, mic, channel, voicing, micCalibrationFile, loudness, bass) {
+  // Measure; with install=true the result is installed and played as soon as
+  // it passes, so one press does the whole job.
+  function measure(sink, mic, channel, options, install) {
     proposal = null
     var arguments = ["calibrate-json", "--sink", sink, "--mic", mic,
-                     "--channel", String(channel), "--voicing", voicing,
-                     "--loudness", loudness || "protected", "--bass", bass || "normal"]
-    if (micCalibrationFile && micCalibrationFile.length > 0)
-      arguments.push("--mic-cal-file", micCalibrationFile)
+                     "--channel", String(channel)].concat(optionArguments(options))
+    if (options.micCalibrationFile && options.micCalibrationFile.length > 0)
+      arguments.push("--mic-cal-file", options.micCalibrationFile)
+    if (install) arguments.push("--install")
     start("measure", arguments)
   }
   // Re-fit the last recorded sweeps with different options, without playing
-  // anything.
-  function refit(voicing, loudness, bass) {
-    start("refit", ["reanalyze-saved-json", "--voicing", voicing,
-                    "--loudness", loudness || "protected", "--bass", bass || "normal"])
+  // anything; with install=true the result is applied immediately.
+  function refit(options, install) {
+    var arguments = ["reanalyze-saved-json"].concat(optionArguments(options))
+    if (install) arguments.push("--install")
+    start("refit", arguments)
   }
   function install() { start("install", ["install-proposal"]) }
   function disable() { start("disable", ["disable"]) }
   function compare() { start("compare", ["compare-toggle"]) }
+  function bypass() { start("bypass", ["bypass-toggle"]) }
 
   Process {
     id: process
@@ -95,7 +122,7 @@ Item {
           var devices = JSON.parse(raw)
           root.sinks = devices.sinks || []
           root.microphones = devices.microphones || []
-          root.message = "Devices refreshed"
+          root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
           return
@@ -104,35 +131,46 @@ Item {
           var statusPayload = JSON.parse(raw)
           root.status = statusPayload
           root.proposal = statusPayload.proposal || null
-          root.message = ""
         }
         else if (root.phase === "measure" || root.phase === "refit") {
-          root.proposal = JSON.parse(raw)
-          if (root.proposal.quality && root.proposal.quality.accepted) {
-            var count = root.proposal.fit ? Number(root.proposal.fit.filter_count || 0) : 0
+          var result = JSON.parse(raw)
+          root.proposal = result
+          var accepted = result.quality && result.quality.accepted
+          if (accepted && result.installed) {
+            root.status = Object.assign({}, root.status, { enabled: true, profile: result, bypass: false })
+            root.message = (root.phase === "measure" ? "Calibrated and playing: " : "Applied: ")
+              + root.simpleLabel(result)
+              + (result.activation === "restart" ? " · tuning restarted once" : "")
+            Qt.callLater(root.refreshStatus)
+          } else if (accepted) {
+            var count = result.fit ? Number(result.fit.filter_count || 0) : 0
             root.message = (root.phase === "refit" ? "Refit ready: " : "Measurement accepted: ")
-              + root.optionsLabel(root.proposal) + " · " + count
+              + root.optionsLabel(result) + " · " + count
               + (count === 1 ? " section" : " sections")
               + " · nothing changes until you press Install"
-          }
-          else
-            root.message = "Measurement rejected — follow the retry guidance below"
+          } else
+            root.message = "The measurement was rejected — see the guidance below and try again"
         } else if (root.phase === "install") {
           var installed = JSON.parse(raw)
-          root.status = { service: "active", enabled: true, profile: installed,
-                          compare: root.status.compare }
+          root.status = Object.assign({}, root.status, { enabled: true, profile: installed, bypass: false })
           root.message = "Installed and playing: " + root.optionsLabel(installed)
             + (installed.activation === "restart" ? " · tuning restarted" : " · switched live")
           Qt.callLater(root.refreshStatus)
         } else if (root.phase === "compare") {
           var compare = JSON.parse(raw)
           var playing = compare[compare.active]
-          root.status = Object.assign({}, root.status, { compare: compare })
+          root.status = Object.assign({}, root.status, { compare: compare, bypass: false })
           root.message = "Now playing: " + (playing && playing.label ? playing.label : compare.active)
             + (compare.method === "restart" ? " · tuning restarted" : " · switched live")
+        } else if (root.phase === "bypass") {
+          var bypassPayload = JSON.parse(raw)
+          root.status = Object.assign({}, root.status, { compare: bypassPayload, bypass: bypassPayload.bypass })
+          root.message = bypassPayload.bypass
+            ? "Calibration switched off — you are hearing the plain speakers"
+            : "Calibration switched on"
         } else if (root.phase === "disable") {
-          root.status = { service: "inactive", enabled: false, profile: root.status.profile }
-          root.message = "Calibration disabled"
+          root.status = Object.assign({}, root.status, { service: "inactive", enabled: false })
+          root.message = "Calibration stopped and removed from the output"
         }
       } catch (exception) {
         root.error = "Invalid response from calibration helper"

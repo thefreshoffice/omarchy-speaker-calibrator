@@ -334,7 +334,26 @@ def compare_state():
         state = {}
     if state.get("active") not in ("current", "previous"):
         state["active"] = "current"
+    state["bypass"] = bool(state.get("bypass", False))
     return state
+
+
+def write_compare_state(state):
+    DATA.mkdir(parents=True, exist_ok=True)
+    COMPARE_STATE.write_text(json.dumps(state) + "\n")
+
+
+def transparent_controls():
+    """Controls that make the running graph pass audio through unchanged.
+
+    The high-pass sections drop to 10 Hz, every gain goes to 0 dB, and the
+    limiter input gain returns to unity; only the -1 dBFS ceiling remains.
+    """
+    controls = graph_controls({"filters": [], "input_gain_linear": 1.0})
+    for name in list(controls):
+        if name.startswith("hp") and name.endswith(":Freq"):
+            controls[name] = 10.0
+    return controls
 
 
 def profile_summary(path):
@@ -351,6 +370,9 @@ def profile_summary(path):
                  f"{VOICING_LABELS.get(profile.get('voicing'), 'warm')} · "
                  f"{BASS_LABELS.get(profile.get('bass'), 'normal bass')} · "
                  f"{LOUDNESS_LABELS.get(profile.get('loudness'), 'protected')}",
+        "voicing": profile.get("voicing", "warm"),
+        "bass": profile.get("bass", "normal"),
+        "loudness": profile.get("loudness", "protected"),
         "plugin_version": profile.get("plugin_version"),
     }
 
@@ -361,7 +383,7 @@ def keep_previous_profile():
         shutil.copy2(PROFILE, PREVIOUS_PROFILE)
     # When the previous profile was playing, it stays "previous": that is the
     # sound the new install will be compared against.
-    COMPARE_STATE.write_text(json.dumps({"active": "current"}) + "\n")
+    write_compare_state({"active": "current", "bypass": False})
 
 
 def service_active():
@@ -438,11 +460,50 @@ def activate_profile(profile):
     controls = graph_controls(fit)
     FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
     FRAGMENT.write_text(filter_config(profile["speaker"]["name"], fit))
+    state = compare_state()
+    if state["bypass"]:
+        state["bypass"] = False
+        write_compare_state(state)
     if service_active() and apply_controls_live(controls):
         run(["systemctl", "--user", "daemon-reload"], check=False)
         return "live"
     restart_tuning()
     return "restart"
+
+
+def playing_profile():
+    """The profile that should be audible now, per the compare state."""
+    state = compare_state()
+    target = PREVIOUS_PROFILE if state["active"] == "previous" else PROFILE
+    return load_profile(target) or load_profile(PROFILE)
+
+
+def bypass_toggle():
+    """Switch the running graph between unity and the playing profile, live."""
+    state = compare_state()
+    profile = playing_profile()
+    if profile is None:
+        raise SystemExit("No calibration is installed, so there is nothing to switch off.")
+    if not state["bypass"]:
+        method = "live"
+        if not (service_active() and apply_controls_live(transparent_controls())):
+            # The running graph has an older shape, so its controls cannot be
+            # zeroed by name.  Activating the profile regenerates the graph in
+            # the current shape (restarting once); then unity can be applied.
+            method = activate_profile(profile)
+            if not apply_controls_live(transparent_controls()):
+                raise SystemExit(
+                    "Could not switch the calibration off; the tuning was restarted with it on."
+                )
+        state = compare_state()
+        state["bypass"] = True
+        write_compare_state(state)
+    else:
+        # activate_profile clears the bypass flag itself.
+        method = activate_profile(profile)
+    payload = compare_payload()
+    payload["method"] = method
+    return payload
 
 
 def restart_tuning():
@@ -488,6 +549,7 @@ def compare_payload():
         "available": load_profile(PREVIOUS_PROFILE) is not None
         and load_profile(PROFILE) is not None,
         "active": state["active"],
+        "bypass": state["bypass"],
         "current": profile_summary(PROFILE),
         "previous": profile_summary(PREVIOUS_PROFILE),
     }
@@ -500,9 +562,11 @@ def compare_toggle():
     target = load_profile(PREVIOUS_PROFILE if state["active"] == "previous" else PROFILE)
     if target is None:
         raise SystemExit("No previous profile to compare with; install a second profile first.")
-    COMPARE_STATE.write_text(json.dumps(state) + "\n")
+    state["bypass"] = False
+    write_compare_state(state)
     payload = compare_payload()
     payload["method"] = activate_profile(target)
+    payload["bypass"] = False
     return payload
 
 
@@ -808,11 +872,24 @@ def install_proposal():
     if not PROPOSAL.exists():
         raise SystemExit("No measured proposal is available.")
     profile = json.loads(PROPOSAL.read_text())
+    return install_now(profile)
+
+
+def install_now(profile):
     if not profile.get("quality", {}).get("accepted") or not profile.get("fit"):
         raise SystemExit("This measurement failed its quality checks and cannot be installed.")
     profile["activation"] = install_profile(
         profile, filter_config(profile["speaker"]["name"], profile["fit"])
     )
+    profile["installed"] = True
+    return profile
+
+
+def install_if_accepted(profile):
+    """Install a fresh profile when it passed, otherwise return it unchanged."""
+    if profile.get("quality", {}).get("accepted") and profile.get("fit"):
+        return install_now(profile)
+    profile["installed"] = False
     return profile
 
 
@@ -821,10 +898,12 @@ def status_payload():
     proposal = json.loads(PROPOSAL.read_text()) if PROPOSAL.exists() else None
     active = run(["systemctl", "--user", "is-active", SERVICE], check=False, capture=True).stdout.strip()
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
+    compare = compare_payload()
     return {"service": active or "inactive", "defaultSink": default or "unknown",
             "profile": profile, "proposal": proposal,
             "enabled": active == "active" and default == VIRTUAL_SINK,
-            "compare": compare_payload()}
+            "bypass": compare["bypass"],
+            "compare": compare}
 
 
 def choose_mic():
@@ -936,6 +1015,8 @@ def status():
     profile = payload["profile"]
     print(f"Service: {payload['service']}\nDefault output: {payload['defaultSink']}")
     compare = payload["compare"]
+    if payload.get("bypass"):
+        print("Calibration is switched off (bypassed); run 'bypass-toggle' to switch it on.")
     if compare["available"]:
         playing = compare[compare["active"]]
         print(f"Playing: {compare['active']} profile"
@@ -966,7 +1047,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
-                 "disable", "compare-toggle"):
+                 "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
     calibrate = sub.add_parser("calibrate-json")
     calibrate.add_argument("--sink", required=True)
@@ -977,11 +1058,15 @@ def main():
                            default="protected")
     calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")
     calibrate.add_argument("--mic-cal-file")
+    calibrate.add_argument("--install", action="store_true",
+                           help="install and play the result when it passes")
     reanalyze = sub.add_parser("reanalyze-saved-json")
     reanalyze.add_argument("--voicing", choices=("warm", "neutral"))
     reanalyze.add_argument("--loudness", choices=("protected", "balanced", "matched"))
     reanalyze.add_argument("--bass", choices=("normal", "full"))
     reanalyze.add_argument("--channel")
+    reanalyze.add_argument("--install", action="store_true",
+                           help="install and play the result when it passes")
     args = parser.parse_args()
     command = args.command or "wizard"
     if command == "devices-json":
@@ -989,18 +1074,22 @@ def main():
     elif command == "status-json":
         print(json.dumps(status_payload()))
     elif command == "calibrate-json":
-        print(json.dumps(calibrate_noninteractive(
+        profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,
             args.loudness, args.bass,
-        )))
+        )
+        print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "reanalyze-saved-json":
-        print(json.dumps(reanalyze_saved_capture(
+        profile = reanalyze_saved_capture(
             args.voicing, args.channel, args.loudness, args.bass
-        )))
+        )
+        print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "install-proposal":
         print(json.dumps(install_proposal()))
     elif command == "compare-toggle":
         print(json.dumps(compare_toggle()))
+    elif command == "bypass-toggle":
+        print(json.dumps(bypass_toggle()))
     else:
         {"wizard": wizard, "status": status, "disable": disable}[command]()
 
