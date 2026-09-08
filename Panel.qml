@@ -30,10 +30,6 @@ Panel {
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
   property int micIndex: -1
-  readonly property string internalMicHint:
-    "Built-in microphones sit right next to the speakers. They hear the speaker itself very well but not what reaches you, so the calibration stays deliberately cautious with them. Still a big improvement."
-  readonly property string externalMicHint:
-    "A measurement microphone placed where you listen captures what actually reaches you, desk and all, so the correction can be finer and go further. This makes a big difference."
 
   function open() { root.controller.show(); service.refresh() }
   function close() { root.controller.hide() }
@@ -281,39 +277,6 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
-  // The shell's tooltip is one unbounded line of text, so a sentence of advice
-  // runs off the screen.  Capping contentWidth is not enough: the popup still
-  // sizes itself from the content item's natural width.  The width is set
-  // outright instead, measured from the text with TextMetrics so short hints
-  // stay small, and PanelToolTip has no padding, so the content item is handed
-  // exactly that width and the text wraps inside it.
-  component WrapTip: PanelToolTip {
-    id: tip
-    property real maxWidth: Style.space(240)
-    fontFamily: root.fontFamily
-    margins: Style.space(6)
-    width: Math.min(tipMetrics.width + tipText.leftPadding + tipText.rightPadding, tip.maxWidth)
-    contentItem: Text {
-      id: tipText
-      textFormat: Text.PlainText
-      text: tip.text
-      color: tip.panelForeground
-      font.family: tip.fontFamily
-      font.pixelSize: tip.fontSize
-      wrapMode: Text.WordWrap
-      leftPadding: Border.left(tip.panelBorderSpec) + Style.spacing.controlPaddingX
-      rightPadding: Border.right(tip.panelBorderSpec) + Style.spacing.controlPaddingX
-      topPadding: Border.top(tip.panelBorderSpec) + Style.spacing.controlPaddingY
-      bottomPadding: Border.bottom(tip.panelBorderSpec) + Style.spacing.controlPaddingY
-
-      TextMetrics {
-        id: tipMetrics
-        font.family: tipText.font.family
-        font.pixelSize: tipText.font.pixelSize
-        text: tip.text
-      }
-    }
-  }
   // A clickable row in the shell's control style: glyph, short title, and a
   // dim description.  Long option lists belong in the description, never in
   // the title, so nothing overflows or gets centred into unreadability.
@@ -679,7 +642,6 @@ Panel {
             Repeater {
               model: service.sinks
               Button {
-                id: sinkRow
                 width: parent.width
                 leftAlign: true
                 bordered: true
@@ -690,12 +652,6 @@ Panel {
                 fontFamily: root.fontFamily
                 enabled: !service.busy
                 onClicked: root.sinkIndex = index
-                WrapTip {
-                  visible: sinkRow.hot
-                  text: modelData.internal
-                    ? "The laptop's own speakers."
-                    : "An external output. The sweeps play through it and the correction is installed in front of it."
-                }
               }
             }
             Text {
@@ -717,7 +673,6 @@ Panel {
             Repeater {
               model: service.microphones
               Button {
-                id: micRow
                 width: parent.width
                 leftAlign: true
                 bordered: true
@@ -731,10 +686,6 @@ Panel {
                 fontFamily: root.fontFamily
                 enabled: !service.busy
                 onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
-                WrapTip {
-                  visible: micRow.hot
-                  text: modelData.internal ? root.internalMicHint : root.externalMicHint
-                }
               }
             }
             Text {
@@ -750,32 +701,17 @@ Panel {
             RowLayout {
               width: parent.width
               spacing: Style.space(8)
-              Item {
+              Text {
                 Layout.alignment: Qt.AlignTop
-                width: Style.space(22)
-                height: Style.space(22)
-                Text {
-                  anchors.centerIn: parent
-                  text: "󰋽"
-                  color: infoMouse.containsMouse ? root.foreground : root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.icon
-                }
-                MouseArea {
-                  id: infoMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.WhatsThisCursor
-                }
-                WrapTip {
-                  visible: infoMouse.containsMouse
-                  text: root.selectedMicIsInternal() ? root.internalMicHint : root.externalMicHint
-                }
+                text: "󰋽"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
               }
               Text {
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
-                text: "The built-in microphones already give a big improvement. An external measurement microphone placed where you sit makes a big difference."
+                text: "The built-in mics already make a big difference. For an even better result, plug in a measurement mic and put it where you sit."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

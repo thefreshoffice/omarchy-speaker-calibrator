@@ -131,6 +131,9 @@ Item {
           var statusPayload = JSON.parse(raw)
           root.status = statusPayload
           root.proposal = statusPayload.proposal || null
+          // A background refresh has nothing to report; leaving "Working…" on
+          // screen makes an idle panel look busy.
+          if (root.message === "Working…") root.message = ""
         }
         else if (root.phase === "measure" || root.phase === "refit") {
           var result = JSON.parse(raw)
