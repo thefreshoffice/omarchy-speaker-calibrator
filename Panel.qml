@@ -281,6 +281,78 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
+  // A clickable row in the shell's control style: glyph, short title, and a
+  // dim description.  Long option lists belong in the description, never in
+  // the title, so nothing overflows or gets centred into unreadability.
+  component ActionRow: BorderSurface {
+    id: actionRow
+    property string icon: ""
+    property string label: ""
+    property string description: ""
+    signal clicked()
+    readonly property bool _hot: actionMouse.containsMouse
+    radius: Style.cornerRadius
+    implicitHeight: Math.max(Style.space(44), actionContent.implicitHeight + Style.space(16))
+    color: Style.controlFill(false, _hot && enabled, root.foreground, Color.accent)
+    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal", root.foreground, Color.accent)
+    opacity: enabled ? 1.0 : 0.55
+    Behavior on color { ColorAnimation { duration: 100 } }
+
+    Row {
+      id: actionContent
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: actionRow.borderLeft + Style.spacing.rowPaddingX
+      anchors.rightMargin: actionRow.borderRight + Style.spacing.rowPaddingX
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        text: actionRow.icon
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.title
+        width: Style.space(22)
+        horizontalAlignment: Text.AlignHCenter
+        anchors.verticalCenter: parent.verticalCenter
+      }
+      Column {
+        width: parent.width - Style.space(22) - parent.spacing
+        spacing: Style.spacing.xs
+        anchors.verticalCenter: parent.verticalCenter
+        Text {
+          textFormat: Text.PlainText
+          text: actionRow.label
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.subtitle
+          font.bold: true
+          elide: Text.ElideRight
+          width: parent.width
+        }
+        Text {
+          textFormat: Text.PlainText
+          visible: actionRow.description !== ""
+          text: actionRow.description
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+          width: parent.width
+        }
+      }
+    }
+
+    MouseArea {
+      id: actionMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: actionRow.clicked()
+    }
+  }
+
   component DetailRow: RowLayout {
     property string key: ""
     property string value: ""
@@ -880,66 +952,63 @@ Panel {
               width: parent.width
               spacing: Style.space(6)
 
-              Button {
+              ActionRow {
                 visible: root.hasMeasurement()
                 width: parent.width
-                text: service.busy && service.phase === "refit" ? "Refitting…"
-                  : "Refit and play  ·  " + service.optionsLabel(root.options())
-                iconText: "󰑓"
-                bordered: true
+                icon: "󰑓"
+                label: service.busy && service.phase === "refit" ? "Refitting…" : "Refit and play"
+                description: "Apply " + service.optionsLabel(root.options()) + " to the last measurement and play it"
                 enabled: !service.busy
                 onClicked: service.refit(root.options(), true)
               }
-              Button {
+              ActionRow {
                 visible: root.hasMeasurement()
                 width: parent.width
-                text: "Refit only, keep playing the current profile"
-                iconText: "󰑓"
-                bordered: true
+                icon: "󰑓"
+                label: "Refit only"
+                description: "Compute with the settings above, keep playing what is playing now"
                 enabled: !service.busy
                 onClicked: service.refit(root.options(), false)
               }
-              Button {
+              ActionRow {
                 visible: service.proposal !== null && service.proposal !== undefined
                   && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
                   && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
                 width: parent.width
-                text: service.busy && service.phase === "install" ? "Installing…"
-                  : "Install the last measurement  ·  " + service.optionsLabel(service.proposal)
-                iconText: "󰄬"
-                bordered: true
+                icon: "󰄬"
+                label: service.busy && service.phase === "install" ? "Installing…" : "Install last measurement"
+                description: service.optionsLabel(service.proposal)
+                  + (service.proposal && service.proposal.created_at
+                      ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
                 enabled: !service.busy
                 onClicked: service.install()
               }
-              Button {
+              ActionRow {
                 visible: service.status.enabled && service.status.compare !== undefined
                   && service.status.compare.available === true
                 width: parent.width
-                text: service.busy && service.phase === "compare" ? "Switching…"
-                  : "Switch to the other stored profile"
-                iconText: "󰓦"
-                bordered: true
+                icon: "󰓦"
+                label: service.busy && service.phase === "compare" ? "Switching…" : "Switch profile"
+                description: "Play the other stored profile: " + service.otherLabel()
                 enabled: !service.busy
                 onClicked: service.compare()
               }
-              Button {
+              ActionRow {
                 visible: service.status.enabled
                 width: parent.width
-                text: "Stop calibration and remove it from the output"
-                iconText: "󰅖"
-                bordered: true
+                icon: "󰅖"
+                label: "Stop calibration"
+                description: "Remove it from the output; the profiles stay saved"
                 enabled: !service.busy
                 onClicked: service.disable()
               }
             }
 
-            Column {
-              visible: service.status.enabled && service.status.compare !== undefined
-                && service.status.compare.available === true
+            DetailRow {
+              visible: service.status.enabled && service.playingLabel() !== ""
               width: parent.width
-              spacing: Style.space(3)
-              DetailRow { width: parent.width; key: "Playing"; value: service.playingLabel() }
-              DetailRow { width: parent.width; key: "Other stored"; value: service.otherLabel() }
+              key: "Playing"
+              value: service.playingLabel()
             }
 
             // ---------------------------------------------------------- measurement
