@@ -65,6 +65,20 @@ LOUDNESS_MODES = {"protected": 0.0, "balanced": 0.5, "matched": 1.0}
 # to 5 dB above the uncorrected speaker, whatever else is selected.
 MAKEUP_CAP_DB = 6.0
 
+# Protective high-pass.  Below the point where a speaker stops keeping up, the
+# cone still travels as far as ever while producing almost nothing, so that
+# content costs excursion, distortion, and headroom for no sound.  The corner
+# is put where this measurement says that happens instead of at a fixed
+# frequency that may sit two octaves below the real limit.
+HIGHPASS_Q = 0.707
+HIGHPASS_BOUNDS_HZ = (50.0, 200.0)
+HIGHPASS_SEARCH_CEILING_HZ = 400.0
+# How far short of the target the speaker must fall to count as finished.
+KNEE_SHORTFALL_DB = 15.0
+# A second section doubles the slope.  That is free where nothing is audible
+# and heavy-handed where something still is, so it is only used down low.
+HIGHPASS_TWO_STAGE_BELOW_HZ = 100.0
+
 # "Full" bass is a low shelf whose corner sits at the measured knee, where
 # the speaker stops keeping up with its midband, so the lift lands where the
 # driver still turns voltage into sound.  It is paid for by input trim like
@@ -217,6 +231,35 @@ def _section_response_db(
     if shape == "highshelf":
         return _highshelf_response_db(frequencies, center, q, gain_db, rate)
     return _peaking_response_db(frequencies, center, q, gain_db, rate)
+
+
+def estimate_highpass(
+    frequencies: np.ndarray, measured_db: np.ndarray, target_db: np.ndarray
+) -> dict:
+    """Corner and stage count for the protective high-pass.
+
+    The knee is the highest frequency below the search ceiling where the
+    speaker falls more than ``KNEE_SHORTFALL_DB`` short of the target it is
+    being fitted to.  Measuring the shortfall against the target rather than
+    against a passband average keeps one loud resonance from dragging the
+    estimate upward, which matters on laptop speakers whose response is mostly
+    one big peak.  Recording noise can only raise the measured level, so a
+    noisy measurement understates the shortfall and lowers the corner, which is
+    the safe direction to be wrong in.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    shortfall = np.asarray(target_db, dtype=float) - np.asarray(measured_db, dtype=float)
+    failing = (frequencies <= HIGHPASS_SEARCH_CEILING_HZ) & (shortfall >= KNEE_SHORTFALL_DB)
+    knee = float(np.max(frequencies[failing])) if np.any(failing) else 0.0
+    corner = float(np.clip(knee, HIGHPASS_BOUNDS_HZ[0], HIGHPASS_BOUNDS_HZ[1]))
+    return {
+        "frequency_hz": round(corner, 1),
+        "q": HIGHPASS_Q,
+        "stages": 2 if corner <= HIGHPASS_TWO_STAGE_BELOW_HZ else 1,
+        "knee_hz": round(knee, 1) if knee > 0.0 else None,
+        "shortfall_db": KNEE_SHORTFALL_DB,
+        "bounds_hz": list(HIGHPASS_BOUNDS_HZ),
+    }
 
 
 def bass_shelf(knee_hz: float, bass: str) -> dict | None:
@@ -704,9 +747,16 @@ def optimize_peq(
         training[valid] - selected_target[valid], confidence[valid], 0.22
     )
     aligned_target = selected_target + offset
-    safety_highpass = 2.0 * _highpass_response_db(
-        frequencies, 55.0, 0.707, measurement["rate_hz"]
+    highpass = estimate_highpass(frequencies, training, aligned_target)
+    safety_highpass = highpass["stages"] * _highpass_response_db(
+        frequencies, highpass["frequency_hz"], highpass["q"], measurement["rate_hz"]
     )
+    # The high-pass is a protection decision, not an error to be corrected.
+    # Folding it into the target stops the optimizer from spending filters and
+    # headroom trying to boost back what was deliberately removed, and makes
+    # the drawn target roll off with the speaker instead of promising bass it
+    # cannot make.
+    aligned_target = aligned_target + safety_highpass
     total_cut_limit = _total_cut_limit(frequencies, internal_mic)
     desired = np.clip(aligned_target - training - safety_highpass, -16.0, 4.0)
     safe_boost_floor = _safe_boost_floor(frequencies, training, confidence)
@@ -982,6 +1032,10 @@ def optimize_peq(
         "safe_boost_floor_hz": round(safe_boost_floor, 1),
         "boost_decisions": boost_decisions,
         "headroom_db": headroom_db,
+        "highpass": highpass,
+        # Flat keys for the graph and for older panels.
+        "highpass_hz": highpass["frequency_hz"],
+        "highpass_stages": highpass["stages"],
         "bass_mode": bass,
         "bass_shelf": shelf,
         "loudness_mode": loudness,

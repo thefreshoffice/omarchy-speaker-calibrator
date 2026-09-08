@@ -250,7 +250,11 @@ Panel {
     if (fit.bass_shelf)
       rows.push(["B", "bass shelf", root.fmt(fit.bass_shelf.frequency_hz, 0) + " Hz",
                  root.fmt(fit.bass_shelf.q, 2), "+" + root.fmt(fit.bass_shelf.gain_db, 2) + " dB"])
-    rows.push(["HP", "high-pass ×2", root.fmt(fit.highpass_hz || 55, 0) + " Hz", "0.71", "–"])
+    var highpass = fit.highpass || {}
+    var stages = Number(highpass.stages || fit.highpass_stages || 2)
+    rows.push(["HP", "high-pass" + (stages > 1 ? " ×" + stages : ""),
+               root.fmt(highpass.frequency_hz || fit.highpass_hz || 55, 0) + " Hz",
+               root.fmt(highpass.q || 0.707, 2), "–"])
     return rows
   }
   function fitRows() {
@@ -265,6 +269,12 @@ Panel {
       { key: "Largest boost", value: "+" + root.fmt(fit.actual_maximum_boost_db, 2) + " dB of +" + root.fmt(fit.maximum_allowed_boost_db, 1) + " dB allowed" },
       { key: "Headroom trim", value: "−" + root.fmt(fit.headroom_db, 2) + " dB" }
     ]
+    if (fit.highpass)
+      rows.push({ key: "High-pass", value: root.fmt(fit.highpass.frequency_hz, 0) + " Hz  ·  "
+        + (Number(fit.highpass.stages) > 1 ? "4th" : "2nd") + " order  ·  "
+        + (fit.highpass.knee_hz
+            ? "measured knee " + root.fmt(fit.highpass.knee_hz, 0) + " Hz"
+            : "no knee found, kept at the minimum") })
     if (fit.bass_shelf)
       rows.push({ key: "Bass shelf", value: "+" + root.fmt(fit.bass_shelf.gain_db, 1) + " dB below " + root.fmt(fit.bass_shelf.frequency_hz, 0) + " Hz" })
     if (fit.loudness_loss_db !== undefined) {
@@ -424,9 +434,12 @@ Panel {
   function eqSections(fit) {
     var sections = []
     if (!fit) return sections
-    var highpass = Number(fit.highpass_hz || 55)
-    sections.push({ shape: "highpass", frequency: highpass, q: 0.707, gain: 0, label: "HP", node: false })
-    sections.push({ shape: "highpass", frequency: highpass, q: 0.707, gain: 0, label: "HP", node: false })
+    var highpass = fit.highpass || {}
+    var corner = Number(highpass.frequency_hz || fit.highpass_hz || 55)
+    var stages = Number(highpass.stages || fit.highpass_stages || 2)
+    for (var stage = 0; stage < stages; stage++)
+      sections.push({ shape: "highpass", frequency: corner, q: Number(highpass.q || 0.707),
+                      gain: 0, label: "HP", node: false })
     var filters = fit.filters || []
     for (var index = 0; index < filters.length; index++) {
       var item = filters[index]
@@ -711,7 +724,7 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
-                text: "The built-in mics already make a big difference. For an even better result, plug in a measurement mic and put it where you sit."
+                text: "The built-in mics already give a big improvement. An external measuring mic, placed where you sit, improves the sound a lot more."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1317,7 +1330,7 @@ Panel {
               DetailRow { width: parent.width; key: "Measure"; value: "three sine sweeps per speaker, gated to the direct sound, noise floor measured between sweeps" }
               DetailRow { width: parent.width; key: "Fit"; value: "sections are added one at a time and kept only when a held-out repeat also improves" }
               DetailRow { width: parent.width; key: "Limits"; value: "cuts preferred; whole correction never below -15 dB, boosts capped, shelves cut-only" }
-              DetailRow { width: parent.width; key: "Protect"; value: "input trim pays for every boost; dual 55 Hz high-pass; -1 dBFS limiter; make-up only when chosen" }
+              DetailRow { width: parent.width; key: "Protect"; value: "high-pass at the frequency where the speaker gives up; input trim pays for every boost; -1 dBFS limiter; make-up only when chosen" }
             }
           }
         }

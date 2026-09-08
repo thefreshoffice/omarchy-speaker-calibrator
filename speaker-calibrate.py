@@ -167,6 +167,10 @@ def select(items, title, predicate=None):
 # biquad at 0 dB is unity.
 PEAKING_SLOTS = 12
 DEFAULT_HIGHPASS_HZ = 55.0
+# A high-pass section is switched off by moving it below the audible band
+# rather than by removing it, so the graph keeps its fixed shape and a profile
+# with fewer stages can still be applied to the running filter.
+PARKED_HIGHPASS_HZ = 10.0
 SECTION_LABELS = {
     "hp": "bq_highpass",
     "ls": "bq_lowshelf",
@@ -220,6 +224,17 @@ def _shelf_controls(controls, name, shelf, default_hz):
     controls[f"{name}:Gain"] = float(shelf.get("gain_db", 0.0))
 
 
+def highpass_settings(fit_payload):
+    """(corner, q, stages) of the protective high-pass, with old defaults."""
+    highpass = fit_payload.get("highpass") or {}
+    corner = float(highpass.get(
+        "frequency_hz", fit_payload.get("highpass_hz", DEFAULT_HIGHPASS_HZ)
+    ))
+    q = float(highpass.get("q", 0.707))
+    stages = int(highpass.get("stages", fit_payload.get("highpass_stages", 2)))
+    return corner, q, max(1, min(2, stages))
+
+
 def graph_controls(fit_payload):
     """Every control of the fixed-shape graph, for both channels, in order."""
     peaking, low_shelf, high_shelf, bass = fit_sections(fit_payload)
@@ -227,12 +242,14 @@ def graph_controls(fit_payload):
         raise ValueError(
             f"The graph has {PEAKING_SLOTS} parametric slots; this fit needs {len(peaking)}."
         )
-    highpass = float(fit_payload.get("highpass_hz", DEFAULT_HIGHPASS_HZ))
+    corner, highpass_q, stages = highpass_settings(fit_payload)
     controls = {}
     for side in ("l", "r"):
         for index in (1, 2):
-            controls[f"hp{index}_{side}:Freq"] = highpass
-            controls[f"hp{index}_{side}:Q"] = 0.707
+            controls[f"hp{index}_{side}:Freq"] = (
+                corner if index <= stages else PARKED_HIGHPASS_HZ
+            )
+            controls[f"hp{index}_{side}:Q"] = highpass_q
         _shelf_controls(controls, f"ls_{side}", low_shelf, 100.0)
         _shelf_controls(controls, f"bs_{side}", bass, 100.0)
         for slot in range(1, PEAKING_SLOTS + 1):
@@ -773,7 +790,8 @@ def profile_from_measurement(
             "eq_max_db": fit_payload["maximum_allowed_boost_db"] if fit_payload else 0,
             "eq_min_db": fit_payload["cut_limit_db"] if fit_payload else 0,
             "per_filter_min_db": fit_payload["per_filter_cut_limit_db"] if fit_payload else 0,
-            "highpass_hz": 55,
+            "highpass_hz": fit_payload["highpass_hz"] if fit_payload else DEFAULT_HIGHPASS_HZ,
+            "highpass_stages": fit_payload["highpass_stages"] if fit_payload else 2,
             "limiter_ceiling_dbfs": -1,
             "input_trim_db": -fit_payload["headroom_db"] if fit_payload else -1,
             "makeup_gain_db": fit_payload["makeup_db"] if fit_payload else 0,
@@ -994,6 +1012,12 @@ def wizard():
     for item in fit_payload["filters"]:
         print(f"  {item['type']:9s} {item['frequency_hz']:7.1f} Hz  Q {item['q']:4.2f}  "
               f"{item['gain_db']:6.2f} dB")
+    highpass = fit_payload.get("highpass") or {}
+    if highpass:
+        knee = highpass.get("knee_hz")
+        print(f"  High-pass: {highpass['frequency_hz']:.0f} Hz, "
+              f"{'2nd' if highpass['stages'] == 1 else '4th'} order"
+              + (f" (measured knee {knee:.0f} Hz)" if knee else " (no knee found)"))
     if fit_payload.get("bass_shelf"):
         shelf = fit_payload["bass_shelf"]
         print(f"  Bass shelf: {shelf['gain_db']:+.1f} dB below {shelf['frequency_hz']:.0f} Hz")

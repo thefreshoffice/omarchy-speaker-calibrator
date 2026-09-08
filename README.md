@@ -208,13 +208,23 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
   the more reliable midrange.
 - Shelves are cut-only; the only shelf boost is the full-bass option, which
   is paid for by input trim.
+- A protective high-pass is placed where the measurement says the speaker
+  stops keeping up: the highest frequency below 400 Hz at which it falls more
+  than 15 dB short of its target, clamped to 50-200 Hz. Below the corner the
+  cone still travels as far as ever while producing almost nothing, so that
+  content is removed rather than amplified. The slope doubles to 4th order
+  only when the corner is at or below 100 Hz, where a steep filter cannot be
+  heard. The high-pass is added to the target as well, so the optimizer never
+  spends filters or headroom boosting back what was deliberately removed.
 - Positive correction is matched by automatic input trim plus 1 dB margin.
 - Loudness make-up is limited to 6 dB and only ever pays back loudness that
   the cuts removed; the limiter ceiling stays at -1 dBFS. Because the input
   trim already pays for every positive correction, including the full-bass
   shelf, no band is ever driven more than 5 dB harder than the uncorrected
   speaker at the same volume setting.
-- Two 55 Hz high-pass sections reduce wasteful driver excursion.
+- The high-pass sections reduce wasteful driver excursion; an unused second
+  section is parked at 10 Hz rather than removed, so the graph keeps its shape
+  and profiles stay switchable without restarting the tuning.
 - The limiter has auto-level and boost disabled.
 - The limiter ceiling is -1 dBFS.
 - The generated filter output is pinned to the selected physical sink.

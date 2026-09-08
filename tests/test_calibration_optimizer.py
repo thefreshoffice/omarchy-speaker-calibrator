@@ -12,7 +12,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    HIGHPASS_BOUNDS_HZ,
     MAKEUP_CAP_DB,
+    estimate_highpass,
     loudness_makeup_db,
     pink_loudness_db,
     pleasant_in_room_target,
@@ -73,6 +75,55 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertAlmostEqual(at(500), at(1000), delta=0.05)
         self.assertLess(at(10_000), at(1000) - 3.0)
 
+    def rolled_off(self, knee_hz, slope_db_per_octave=24.0):
+        """A flat speaker that gives up below ``knee_hz``."""
+        response = np.full(self.frequencies.size, -30.0)
+        low = self.frequencies < knee_hz
+        response[low] -= slope_db_per_octave * np.log2(knee_hz / self.frequencies[low])
+        return response
+
+    def test_highpass_corner_follows_the_measured_roll_off(self):
+        target = np.zeros(self.frequencies.size)
+        shallow = estimate_highpass(self.frequencies, self.rolled_off(150.0) + 30.0, target)
+        steep = estimate_highpass(self.frequencies, self.rolled_off(300.0) + 30.0, target)
+        self.assertLess(shallow["frequency_hz"], steep["frequency_hz"])
+        # 24 dB/octave: 15 dB short a bit more than half an octave below the knee.
+        self.assertAlmostEqual(shallow["frequency_hz"], 150.0 / 2 ** (15.0 / 24.0), delta=8.0)
+        self.assertAlmostEqual(steep["frequency_hz"], 300.0 / 2 ** (15.0 / 24.0), delta=8.0)
+        self.assertEqual(shallow["knee_hz"], shallow["frequency_hz"])
+        self.assertEqual(steep["stages"], 1, "a corner this high must stay 2nd order")
+        self.assertEqual(shallow["stages"], 2, "a low corner may use the steeper slope")
+
+    def test_full_range_speaker_keeps_the_minimum_corner(self):
+        flat = np.full(self.frequencies.size, -30.0)
+        highpass = estimate_highpass(self.frequencies, flat, np.full(self.frequencies.size, -30.0))
+        self.assertEqual(highpass["frequency_hz"], HIGHPASS_BOUNDS_HZ[0])
+        self.assertIsNone(highpass["knee_hz"])
+        self.assertEqual(highpass["stages"], 2)
+
+    def test_corner_never_leaves_its_bounds(self):
+        target = np.zeros(self.frequencies.size)
+        hopeless = estimate_highpass(self.frequencies, self.rolled_off(2000.0) + 30.0, target)
+        self.assertLessEqual(hopeless["frequency_hz"], HIGHPASS_BOUNDS_HZ[1])
+        self.assertGreaterEqual(hopeless["frequency_hz"], HIGHPASS_BOUNDS_HZ[0])
+
+    def test_optimizer_does_not_correct_its_own_highpass(self):
+        result = optimize_peq(
+            self.measurement(self.rolled_off(300.0)), "neutral", internal_mic=True
+        )
+        highpass = result["highpass"]
+        self.assertGreater(highpass["frequency_hz"], 100.0)
+        self.assertEqual(result["highpass_hz"], highpass["frequency_hz"])
+        # The target rolls off with the filter instead of asking for the bass back.
+        target = np.asarray(result["target"]["aligned_db"])
+        at = lambda curve, hz: float(np.interp(np.log(hz), np.log(self.frequencies), curve))
+        self.assertLess(at(target, highpass["frequency_hz"] / 4.0),
+                        at(target, 1000.0) - 12.0)
+        # No section tries to boost the removed region back.
+        for item in result["filters"]:
+            if item["frequency_hz"] <= highpass["frequency_hz"]:
+                self.assertLessEqual(item["gain_db"], 0.0, item)
+
     def test_full_bass_adds_a_paid_for_shelf_at_the_knee(self):
         response = np.full(self.frequencies.size, -30.0)
         # A speaker that gives up below 400 Hz: 12 dB/octave roll-off.
@@ -93,8 +144,10 @@ class CalibrationOptimizerTests(unittest.TestCase):
         ))
         self.assertAlmostEqual(at(full, 100) - at(normal, 100), 3.0, delta=0.4)
         self.assertAlmostEqual(at(full, 5000) - at(normal, 5000), 0.0, delta=0.1)
-        # The shelf is a positive correction, so headroom and input trim pay for it.
-        self.assertGreaterEqual(full["headroom_db"], normal["headroom_db"] + 2.0)
+        # The shelf is a positive correction, so headroom and input trim pay for
+        # it.  The high-pass cancels the part of it that sits below the
+        # speaker's limit, so what is paid for is only the audible part.
+        self.assertGreater(full["headroom_db"], normal["headroom_db"])
         self.assertLess(full["input_gain_linear"], normal["input_gain_linear"])
 
     def test_rising_treble_is_handled_by_a_high_shelf(self):
@@ -297,6 +350,22 @@ class CalibrationOptimizerTests(unittest.TestCase):
                 "gains_db": [-1.0] * (slots + 1),
                 "input_gain_linear": 1.0,
             })
+
+    def test_graph_parks_the_second_highpass_when_one_stage_is_enough(self):
+        base = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.0], "input_gain_linear": 0.9}
+        one = speaker_calibrate.graph_controls(dict(
+            base, highpass={"frequency_hz": 160.0, "q": 0.707, "stages": 1}))
+        self.assertEqual(one["hp1_l:Freq"], 160.0)
+        self.assertEqual(one["hp2_l:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
+        self.assertEqual(one["hp2_r:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
+        two = speaker_calibrate.graph_controls(dict(
+            base, highpass={"frequency_hz": 80.0, "q": 0.707, "stages": 2}))
+        self.assertEqual(two["hp1_r:Freq"], 80.0)
+        self.assertEqual(two["hp2_r:Freq"], 80.0)
+        # A profile from before the high-pass was measured keeps its old chain.
+        legacy = speaker_calibrate.graph_controls(base)
+        self.assertEqual(legacy["hp1_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
+        self.assertEqual(legacy["hp2_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
 
     def test_optimizer_payload_is_json_serializable(self):
         response = np.full(self.frequencies.size, -30.0)
