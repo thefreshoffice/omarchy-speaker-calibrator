@@ -188,6 +188,131 @@ Panel {
       + "agreement is trusted, while differences reduce correction confidence."
   }
 
+  // ---- rows for the advanced view ---------------------------------------------
+  function fmt(value, digits) {
+    return (value === undefined || value === null || isNaN(Number(value))) ? "–" : Number(value).toFixed(digits)
+  }
+  function measurementRows() {
+    if (!service.proposal || !service.proposal.quality) return []
+    var m = service.proposal.quality.metrics || {}
+    var rows = []
+    var level = (service.proposal.measurement || {}).level_search
+    if (level && level.selected_level_dbfs !== undefined) {
+      var probes = (level.attempts || []).length
+      rows.push({ key: "Sweep level", value: root.fmt(level.selected_level_dbfs, 1) + " dBFS after "
+        + probes + (probes === 1 ? " probe" : " probes") + "  ·  " + String(level.status || "") })
+    }
+    rows.push({ key: "Mic peak", value: root.fmt(m.maximum_accepted_peak_dbfs, 1) + " dBFS  ·  " + String(m.measurement_level || "") })
+    rows.push({ key: "Background", value: root.fmt(m.background_dbfs, 1) + " dBFS  ·  prominence " + root.fmt(m.minimum_broadband_prominence_db, 1) + " dB" })
+    if (m.snr_mid_db !== undefined)
+      rows.push({ key: "Signal to noise", value: "low " + root.fmt(m.snr_low_db, 0) + "  ·  mid " + root.fmt(m.snr_mid_db, 0)
+        + (m.snr_high_db !== undefined ? "  ·  high " + root.fmt(m.snr_high_db, 0) : "") + " dB" })
+    rows.push({ key: "Repeatability", value: root.fmt(m.worst_repeatability_db, 2) + " dB  ·  " + root.fmt(m.minimum_stable_band_percent, 0) + "% of the band stable" })
+    rows.push({ key: "Gain drift", value: root.fmt(m.worst_gain_stability_db, 2) + " dB between sweeps" })
+    rows.push({ key: "Clock drift", value: root.fmt(m.clock_drift_ppm, 0) + " ppm, corrected" })
+    rows.push({ key: "Harmonic residual", value: root.fmt(m.worst_harmonic_residual_db, 1) + " dB" })
+    if (Number(m.excluded_sweeps || 0) > 0)
+      rows.push({ key: "Discarded sweeps", value: String(m.excluded_sweeps) })
+    if (Number(m.microphone_channels_requested || 0) > 1)
+      rows.push({ key: "Microphones", value: String(m.microphone_channels_used) + " of " + String(m.microphone_channels_requested)
+        + " used  ·  spread " + root.fmt(m.inter_microphone_spread_db, 1) + " dB" })
+    return rows
+  }
+  function issueLines() {
+    if (!service.proposal || !service.proposal.quality) return []
+    var quality = service.proposal.quality
+    return (quality.failures || []).concat(quality.warnings || [])
+  }
+  function guidanceLines() {
+    if (!service.proposal || !service.proposal.quality) return []
+    return service.proposal.quality.guidance || []
+  }
+  function sectionRows() {
+    if (!service.proposal || !service.proposal.fit) return []
+    var fit = service.proposal.fit
+    var names = { peaking: "peak", lowshelf: "low shelf", highshelf: "high shelf" }
+    var rows = []
+    var filters = fit.filters || []
+    for (var index = 0; index < filters.length; index++) {
+      var item = filters[index]
+      var gain = Number(item.gain_db)
+      rows.push([String(index + 1), names[item.type] || String(item.type),
+                 root.fmt(item.frequency_hz, 0) + " Hz", root.fmt(item.q, 2),
+                 (gain > 0 ? "+" : "") + gain.toFixed(2) + " dB"])
+    }
+    if (fit.bass_shelf)
+      rows.push(["B", "bass shelf", root.fmt(fit.bass_shelf.frequency_hz, 0) + " Hz",
+                 root.fmt(fit.bass_shelf.q, 2), "+" + root.fmt(fit.bass_shelf.gain_db, 2) + " dB"])
+    rows.push(["HP", "high-pass ×2", root.fmt(fit.highpass_hz || 55, 0) + " Hz", "0.71", "–"])
+    return rows
+  }
+  function fitRows() {
+    if (!service.proposal || !service.proposal.fit) return []
+    var fit = service.proposal.fit
+    var validation = fit.cross_validation || {}
+    var rows = [
+      { key: "Sections", value: String(fit.filter_count || 0) + " used of " + String(fit.maximum_filter_count || "?") + " allowed" },
+      { key: "Target error", value: root.fmt(fit.weighted_rmse_before_db, 2) + " → " + root.fmt(fit.weighted_rmse_after_db, 2) + " dB weighted" },
+      { key: "Held-out repeat", value: root.fmt(validation.rmse_before_db, 2) + " → " + root.fmt(validation.rmse_after_db, 2) + " dB  ·  " + String(validation.mode || "") },
+      { key: "Deepest cut", value: root.fmt(fit.deepest_correction_db, 1) + " dB of " + root.fmt(fit.cut_limit_db, 0) + " dB allowed" },
+      { key: "Largest boost", value: "+" + root.fmt(fit.actual_maximum_boost_db, 2) + " dB of +" + root.fmt(fit.maximum_allowed_boost_db, 1) + " dB allowed" },
+      { key: "Headroom trim", value: "−" + root.fmt(fit.headroom_db, 2) + " dB" }
+    ]
+    if (fit.bass_shelf)
+      rows.push({ key: "Bass shelf", value: "+" + root.fmt(fit.bass_shelf.gain_db, 1) + " dB below " + root.fmt(fit.bass_shelf.frequency_hz, 0) + " Hz" })
+    if (fit.loudness_loss_db !== undefined) {
+      rows.push({ key: "Loudness lost", value: root.fmt(fit.loudness_loss_db, 1) + " dB, pink noise A-weighted" })
+      rows.push({ key: "Make-up", value: "+" + root.fmt(fit.makeup_db, 1) + " dB  ·  " + String(fit.loudness_mode || "protected") })
+      rows.push({ key: "Net input gain", value: (Number(fit.net_input_gain_db) > 0 ? "+" : "") + root.fmt(fit.net_input_gain_db, 1) + " dB before the limiter" })
+    }
+    rows.push({ key: "Optimizer", value: (fit.optimizer_success ? "converged" : "did not converge") + "  ·  " + String(fit.algorithm || "") })
+    return rows
+  }
+
+  // ---- row components for the advanced view -----------------------------------
+  component DetailRow: RowLayout {
+    property string key: ""
+    property string value: ""
+    spacing: Style.space(10)
+    Text {
+      Layout.preferredWidth: Style.space(130)
+      Layout.alignment: Qt.AlignTop
+      text: key
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+    Text {
+      Layout.fillWidth: true
+      text: value
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.WordWrap
+    }
+  }
+  component TableRow: RowLayout {
+    id: tableRow
+    property var cells: []
+    property bool header: false
+    spacing: Style.space(8)
+    Repeater {
+      model: tableRow.cells
+      Text {
+        Layout.preferredWidth: [Style.space(26), Style.space(92), Style.space(84), Style.space(46), Style.space(76)][index]
+        horizontalAlignment: index >= 2 ? Text.AlignRight : Text.AlignLeft
+        text: String(modelData)
+        color: tableRow.header ? root.dim : root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: tableRow.header ? Style.font.caption : Style.font.bodySmall
+        font.bold: tableRow.header
+        elide: Text.ElideRight
+      }
+    }
+  }
+
+
   // ---- biquad magnitudes for the equalizer view ----------------------------------
   function biquadDb(b0, b1, b2, a0, a1, a2, w) {
     var c1 = Math.cos(w), s1 = Math.sin(w), c2 = Math.cos(2 * w), s2 = Math.sin(2 * w)
@@ -591,7 +716,11 @@ Panel {
           Column {
             visible: root.advanced
             width: parent.width
-            spacing: Style.space(12)
+            spacing: Style.space(10)
+
+            // ---------------------------------------------------------- settings
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "SETTINGS"; foreground: root.foreground; fontFamily: root.fontFamily }
 
             GridLayout {
               width: parent.width
@@ -614,8 +743,8 @@ Panel {
                 id: loudnessBox
                 Layout.fillWidth: true
                 model: ["Protected — cleanest, a little quieter",
-                        "Balanced — half the lost loudness added back",
-                        "Matched — as loud as before, limiter works harder"]
+                        "Balanced — half the lost loudness back",
+                        "Matched — as loud as before"]
                 enabled: !service.busy
                 currentIndex: ["protected", "balanced", "matched"].indexOf(root.loudnessMode)
                 onActivated: function(index) { root.loudnessMode = ["protected", "balanced", "matched"][index] }
@@ -625,8 +754,8 @@ Panel {
               QQC.ComboBox {
                 id: bassBox
                 Layout.fillWidth: true
-                model: ["Normal — the measured correction only",
-                        "Full — +3 dB shelf below the speaker's knee (the Loudness toggle)"]
+                model: ["Normal — measured correction only",
+                        "Full — +3 dB shelf below the knee"]
                 enabled: !service.busy
                 currentIndex: root.bassMode === "full" ? 1 : 0
                 onActivated: function(index) { root.bassMode = index === 1 ? "full" : "normal" }
@@ -660,91 +789,168 @@ Panel {
 
             Text {
               width: parent.width
-              text: "WARM softens sharp voices, cymbals, and hiss; FLAT keeps more clarity. LOUDER adds back part or all of the loudness the cuts removed, up to 6 dB, before the limiter. BASS full is the Loudness toggle: a +3 dB shelf at the measured knee, paid for by input trim. Refit applies the selectors to the last measurement without new sweeps."
+              text: "Loudness toggle = Bass full. Make it louder = Louder matched. Refit applies these to the last measurement without new sweeps."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
 
-            Button {
-              visible: root.hasMeasurement()
+            // ---------------------------------------------------------- actions
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+            Column {
               width: parent.width
-              text: service.busy && service.phase === "refit" ? "Refitting…"
-                : "Refit and play: " + service.optionsLabel(root.options())
-              iconText: "󰑓"
-              bordered: true
-              enabled: !service.busy
-              onClicked: service.refit(root.options(), true)
+              spacing: Style.space(6)
+
+              Button {
+                visible: root.hasMeasurement()
+                width: parent.width
+                text: service.busy && service.phase === "refit" ? "Refitting…"
+                  : "Refit and play  ·  " + service.optionsLabel(root.options())
+                iconText: "󰑓"
+                bordered: true
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), true)
+              }
+              Button {
+                visible: root.hasMeasurement()
+                width: parent.width
+                text: "Refit only, keep playing the current profile"
+                iconText: "󰑓"
+                bordered: true
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), false)
+              }
+              Button {
+                visible: service.proposal !== null && service.proposal !== undefined
+                  && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
+                  && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
+                width: parent.width
+                text: service.busy && service.phase === "install" ? "Installing…"
+                  : "Install the last measurement  ·  " + service.optionsLabel(service.proposal)
+                iconText: "󰄬"
+                bordered: true
+                enabled: !service.busy
+                onClicked: service.install()
+              }
+              Button {
+                visible: service.status.enabled && service.status.compare !== undefined
+                  && service.status.compare.available === true
+                width: parent.width
+                text: service.busy && service.phase === "compare" ? "Switching…"
+                  : "Switch to the other stored profile"
+                iconText: "󰓦"
+                bordered: true
+                enabled: !service.busy
+                onClicked: service.compare()
+              }
+              Button {
+                visible: service.status.enabled
+                width: parent.width
+                text: "Stop calibration and remove it from the output"
+                iconText: "󰅖"
+                bordered: true
+                enabled: !service.busy
+                onClicked: service.disable()
+              }
             }
 
-            Button {
-              visible: root.hasMeasurement()
+            Column {
+              visible: service.status.enabled && service.status.compare !== undefined
+                && service.status.compare.available === true
               width: parent.width
-              text: "Refit only, do not install"
-              iconText: "󰑓"
-              bordered: true
-              enabled: !service.busy
-              onClicked: service.refit(root.options(), false)
+              spacing: Style.space(3)
+              DetailRow { width: parent.width; key: "Playing"; value: service.playingLabel() }
+              DetailRow { width: parent.width; key: "Other stored"; value: service.otherLabel() }
+            }
+
+            // ---------------------------------------------------------- measurement
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader {
+              text: service.proposal && service.proposal.quality
+                ? "LAST MEASUREMENT  ·  " + String(service.proposal.quality.verdict).toUpperCase()
+                  + (service.status.profile && service.status.profile.created_at === service.proposal.created_at
+                      ? "  ·  INSTALLED" : "  ·  NOT INSTALLED")
+                : "LAST MEASUREMENT  ·  NONE YET"
+              foreground: service.proposal && service.proposal.quality
+                && !service.proposal.quality.accepted
+                ? (bar ? bar.urgent : Color.urgent) : root.foreground
+              fontFamily: root.fontFamily
             }
 
             Column {
               visible: service.proposal !== null && service.proposal !== undefined
                 && service.proposal.quality !== undefined
               width: parent.width
-              spacing: Style.space(7)
-
-              PanelSectionHeader {
-                text: service.proposal && service.proposal.quality
-                  ? "LAST MEASUREMENT: " + service.optionsLabel(service.proposal).toUpperCase()
-                    + (service.status.profile && service.status.profile.created_at === service.proposal.created_at
-                        ? " — INSTALLED" : " — NOT INSTALLED")
-                    + " · QUALITY " + String(service.proposal.quality.verdict).toUpperCase()
-                  : "MEASUREMENT QUALITY"
-                foreground: service.proposal && service.proposal.quality
-                  && !service.proposal.quality.accepted
-                  ? (bar ? bar.urgent : Color.urgent) : root.foreground
-                fontFamily: root.fontFamily
-              }
-              Text {
+              spacing: Style.space(3)
+              DetailRow {
                 width: parent.width
-                text: root.qualityMetricsText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
+                key: "Options"
+                value: service.optionsLabel(service.proposal)
+                  + (service.proposal && service.proposal.plugin_version ? "  ·  plugin " + service.proposal.plugin_version : "")
               }
-              Text {
-                visible: root.qualityIssuesText() !== ""
-                width: parent.width
-                text: root.qualityIssuesText()
-                color: service.proposal && service.proposal.quality
-                  && !service.proposal.quality.accepted
-                  ? (bar ? bar.urgent : Color.urgent) : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-              Text {
-                visible: root.qualityGuidanceText() !== ""
-                width: parent.width
-                text: "Retry guidance:\n" + root.qualityGuidanceText()
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-              Text {
-                visible: root.microphoneArrayText() !== ""
-                width: parent.width
-                text: root.microphoneArrayText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+              Repeater {
+                model: root.measurementRows()
+                DetailRow { width: parent.width; key: modelData.key; value: modelData.value }
               }
             }
 
+            Column {
+              visible: root.issueLines().length > 0
+              width: parent.width
+              spacing: Style.space(2)
+              Repeater {
+                model: root.issueLines()
+                Text {
+                  width: parent.width
+                  text: "•  " + modelData
+                  color: service.proposal && service.proposal.quality
+                    && !service.proposal.quality.accepted
+                    ? (bar ? bar.urgent : Color.urgent) : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+            }
+
+            Column {
+              visible: root.guidanceLines().length > 0
+              width: parent.width
+              spacing: Style.space(2)
+              Text {
+                text: "TRY"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+              }
+              Repeater {
+                model: root.guidanceLines()
+                Text {
+                  width: parent.width
+                  text: "→  " + modelData
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+            }
+
+            Text {
+              visible: root.microphoneArrayText() !== ""
+              width: parent.width
+              text: root.microphoneArrayText()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            // ---------------------------------------------------------- response
             Column {
               visible: service.proposal !== null && service.proposal !== undefined
                 && service.proposal.measurement !== undefined
@@ -752,10 +958,9 @@ Panel {
               width: parent.width
               spacing: Style.space(7)
 
+              PanelSeparator { foreground: root.foreground }
               PanelSectionHeader {
-                text: "MEASURED RESPONSE — LEFT / RIGHT"
-                  + (service.proposal && service.proposal.fit
-                    ? " · " + service.optionsLabel(service.proposal).toUpperCase() + " TARGET" : "")
+                text: "MEASURED RESPONSE  ·  LEFT / RIGHT"
                 foreground: root.foreground
                 fontFamily: root.fontFamily
               }
@@ -924,102 +1129,59 @@ Panel {
                 onVisibleChanged: if (visible) requestPaint()
                 onWidthChanged: requestPaint()
               }
-              Text {
+              Column {
                 width: parent.width
-                text: "Solid: measured L/R   ·   accent dashed: predicted correction   ·   dotted: target   ·   top ticks: section centres   ·   shaded: repeat uncertainty   ·   ±12 dB relative scale"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                spacing: Style.space(2)
+                DetailRow { width: parent.width; key: "Solid lines"; value: "measured left (bright) and right (dim), ±12 dB around the 250–1000 Hz median" }
+                DetailRow { width: parent.width; key: "Shaded band"; value: "repeat and noise uncertainty" }
+                DetailRow { width: parent.width; key: "Accent dashed"; value: "predicted response after correction" }
+                DetailRow { width: parent.width; key: "Dotted"; value: "target curve  ·  top ticks mark section centres" }
               }
             }
 
+            // ---------------------------------------------------------- sections
             Column {
               visible: service.proposal !== null && service.proposal !== undefined
                 && service.proposal.fit !== null && service.proposal.fit !== undefined
               width: parent.width
               spacing: Style.space(7)
 
-              PanelSectionHeader {
-                text: "SECTIONS OF THE LAST MEASUREMENT"
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-              }
-              Text {
+              PanelSeparator { foreground: root.foreground }
+              PanelSectionHeader { text: "SECTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+              Column {
                 width: parent.width
-                text: root.gainsText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                wrapMode: Text.WordWrap
-              }
-              Text {
-                width: parent.width
-                text: root.fitSummaryText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-              Text {
-                width: parent.width
-                text: {
-                  var fit = service.proposal && service.proposal.fit
-                  var maximum = fit ? Number(fit.maximum_allowed_boost_db || 0).toFixed(1) : "0.0"
-                  return "The optimizer moves each section to the measured problem and chooses its width; Q means width (a smaller Q is broader, a larger Q is narrower). It adds a section only when a separate held-out repeat also improves. Cuts are preferred: the whole correction never goes deeper than 15 dB at any frequency, shallower toward the band edges with built-in microphones. A residual that stays high all the way to the bass or treble end is handled by a shelf instead of several overlapping filters. Boosts are capped at +"
-                    + maximum + " dB and require a broad, repeatable, high-confidence deficit that passes the same holdout check. "
-                    + "Protection: automatic input trim, dual 55 Hz high-pass, −1 dBFS limiter; loudness make-up only when selected."
+                spacing: Style.space(3)
+                TableRow { width: parent.width; header: true; cells: ["#", "TYPE", "FREQUENCY", "Q", "GAIN"] }
+                Repeater {
+                  model: root.sectionRows()
+                  TableRow { width: parent.width; cells: modelData }
                 }
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
               }
-              Button {
+
+              PanelSeparator { foreground: root.foreground }
+              PanelSectionHeader { text: "FIT"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+              Column {
                 width: parent.width
-                text: service.busy && service.phase === "install" ? "Installing…"
-                  : "Install and play: " + service.optionsLabel(service.proposal)
-                iconText: "󰄬"
-                bordered: true
-                enabled: !service.busy && service.proposal !== null
-                  && service.proposal.quality !== undefined
-                  && service.proposal.quality.accepted === true
-                onClicked: service.install()
+                spacing: Style.space(3)
+                Repeater {
+                  model: root.fitRows()
+                  DetailRow { width: parent.width; key: modelData.key; value: modelData.value }
+                }
               }
             }
 
-            Text {
-              visible: service.status.enabled && service.status.compare !== undefined
-                && service.status.compare.available === true
+            // ---------------------------------------------------------- how it works
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "HOW IT WORKS"; foreground: root.foreground; fontFamily: root.fontFamily }
+            Column {
               width: parent.width
-              text: "STORED PROFILES — now playing: " + service.playingLabel()
-                + "\nThe other one: " + service.otherLabel()
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            Button {
-              visible: service.status.enabled && service.status.compare !== undefined
-                && service.status.compare.available === true
-              width: parent.width
-              text: service.busy && service.phase === "compare" ? "Switching…"
-                : "Switch to: " + service.otherLabel()
-              iconText: "󰓦"
-              bordered: true
-              enabled: !service.busy
-              onClicked: service.compare()
-            }
-
-            Button {
-              visible: service.status.enabled
-              width: parent.width
-              text: "Stop calibration and remove it from the output"
-              iconText: "󰅖"
-              bordered: true
-              enabled: !service.busy
-              onClicked: service.disable()
+              spacing: Style.space(3)
+              DetailRow { width: parent.width; key: "Measure"; value: "three sine sweeps per speaker, gated to the direct sound, noise floor measured between sweeps" }
+              DetailRow { width: parent.width; key: "Fit"; value: "sections are added one at a time and kept only when a held-out repeat also improves" }
+              DetailRow { width: parent.width; key: "Limits"; value: "cuts preferred; whole correction never below -15 dB, boosts capped, shelves cut-only" }
+              DetailRow { width: parent.width; key: "Protect"; value: "input trim pays for every boost; dual 55 Hz high-pass; -1 dBFS limiter; make-up only when chosen" }
             }
           }
         }
