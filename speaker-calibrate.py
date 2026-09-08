@@ -14,12 +14,16 @@ import time
 from pathlib import Path
 
 from calibration_dsp import (
+    LEVEL_SEARCH_ABORT_STATUSES,
     SweepSpec,
     analyse_capture,
+    analyse_level_probe,
     build_measurement_signal,
     combine_microphone_measurements,
+    level_search_advice,
     parse_mic_calibration,
     read_pcm16_wave_channels,
+    search_measurement_level,
     write_pcm16_wave,
 )
 from calibration_optimizer import optimize_peq
@@ -28,6 +32,20 @@ SWEEP_SPEC = SweepSpec()
 RATE = SWEEP_SPEC.rate
 RECORD_LEAD_SECONDS = 1.0
 INTERNAL_SPEAKER_LEVEL_DBFS = -12.0
+# Before the long sweeps, a short two-sided sweep is played at a quiet level,
+# the microphone peak is measured, and the level is moved toward the target so
+# the real measurement neither clips nor sinks into the room noise.  Bounds and
+# the first probe are relative to the sink's default sweep level.
+LEVEL_PROBE_SPEC = dict(
+    seconds=0.4, repeats=1, pre_silence=0.1, block_gap=0.05, response_tail=0.15
+)
+# The lead must exceed the probe's background window (0.3 s) by more than
+# pw-record's start-up time, so the opening of every recording is room sound.
+LEVEL_PROBE_LEAD_SECONDS = 0.8
+LEVEL_PROBE_TAIL_SECONDS = 0.25
+LEVEL_SEARCH_ATTEMPTS = 3
+LEVEL_SEARCH_START_OFFSET_DB = -12.0
+LEVEL_SEARCH_BOUNDS_DB = (-24.0, 6.0)
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-speaker-calibrator"
@@ -274,32 +292,105 @@ def analyze_recording(
     return measurement
 
 
-def capture_measurement(sink_name, mic_name, channel, mic_cal_file=None):
-    """Play the Phase 1 program, capture it, and return gated measurement data."""
-    channels = next(
-        (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
-    )
-    DATA.mkdir(parents=True, exist_ok=True)
-    sweeps = DATA / "calibration-sweeps.wav"
-    recording = DATA / "measurement.wav"
-    measurement_spec = SweepSpec(
-        level_dbfs=INTERNAL_SPEAKER_LEVEL_DBFS
-        if sink_name.startswith("alsa_output.pci-") else SWEEP_SPEC.level_dbfs
-    )
-    program, schedule = build_measurement_signal(measurement_spec)
-    write_pcm16_wave(sweeps, program, RATE)
+def default_sweep_level(sink_name):
+    """Built-in speakers get a louder sweep than external outputs."""
+    if sink_name.startswith("alsa_output.pci-"):
+        return INTERNAL_SPEAKER_LEVEL_DBFS
+    return SWEEP_SPEC.level_dbfs
+
+
+def record_while_playing(
+    sink_name, mic_name, channels, program, recording, lead_seconds, tail_seconds
+):
+    """Record the microphone while a program plays on the selected sink."""
     recorder = subprocess.Popen([
         "pw-record", f"--target={mic_name}", f"--rate={RATE}",
         f"--channels={channels}", "--format=s16", str(recording)])
     try:
-        time.sleep(RECORD_LEAD_SECONDS)
-        run(["pw-play", f"--target={sink_name}", str(sweeps)])
-        time.sleep(0.75)
+        time.sleep(lead_seconds)
+        run(["pw-play", f"--target={sink_name}", str(program)])
+        time.sleep(tail_seconds)
     finally:
         recorder.send_signal(signal.SIGINT)
         recorder.wait(timeout=5)
+
+
+def playing_applications():
+    """Names of applications with an unpaused playback stream right now."""
+    names = []
+    try:
+        streams = pactl_json("sink-inputs")
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return names
+    for stream in streams:
+        if stream.get("corked") or stream.get("mute"):
+            continue
+        properties = stream.get("properties", {})
+        name = properties.get("application.name") or properties.get("media.name")
+        if name and name not in ("pw-play", "pw-record", "(null)") and name not in names:
+            names.append(name)
+    return names
+
+
+def find_measurement_level(sink_name, mic_name, channel, channels):
+    """Probe the speaker/microphone pair and choose the sweep level."""
+    default_level = default_sweep_level(sink_name)
+    probe_program = DATA / "level-probe.wav"
+    probe_recording = DATA / "level-probe-recording.wav"
+
+    def run_probe(level_dbfs):
+        spec = SweepSpec(level_dbfs=level_dbfs, **LEVEL_PROBE_SPEC)
+        program, _ = build_measurement_signal(spec)
+        write_pcm16_wave(probe_program, program, RATE)
+        record_while_playing(
+            sink_name, mic_name, channels, probe_program, probe_recording,
+            LEVEL_PROBE_LEAD_SECONDS, LEVEL_PROBE_TAIL_SECONDS,
+        )
+        captures = read_pcm16_wave_channels(probe_recording, RATE)
+        if channel != "all":
+            if channel < 0 or channel >= captures.shape[1]:
+                raise ValueError(
+                    f"Microphone has {captures.shape[1]} channel(s), not channel {channel + 1}."
+                )
+            captures = captures[:, [channel]]
+        return analyse_level_probe(captures, RATE)
+
+    search = search_measurement_level(
+        run_probe,
+        start_level_dbfs=default_level + LEVEL_SEARCH_START_OFFSET_DB,
+        bounds=(
+            default_level + LEVEL_SEARCH_BOUNDS_DB[0],
+            default_level + LEVEL_SEARCH_BOUNDS_DB[1],
+        ),
+        attempts=LEVEL_SEARCH_ATTEMPTS,
+    )
+    search["default_level_dbfs"] = default_level
+    if search["status"] in LEVEL_SEARCH_ABORT_STATUSES:
+        warnings, guidance = level_search_advice(search)
+        playing = playing_applications()
+        if playing:
+            guidance.append("Currently playing audio: " + ", ".join(playing) + ".")
+        raise ValueError(" ".join(warnings + guidance))
+    return search
+
+
+def capture_measurement(sink_name, mic_name, channel, mic_cal_file=None):
+    """Find a safe level, play the Phase 1 program, capture it, and analyze it."""
+    channels = next(
+        (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
+    )
+    DATA.mkdir(parents=True, exist_ok=True)
+    level_search = find_measurement_level(sink_name, mic_name, channel, channels)
+    sweeps = DATA / "calibration-sweeps.wav"
+    recording = DATA / "measurement.wav"
+    measurement_spec = SweepSpec(level_dbfs=level_search["selected_level_dbfs"])
+    program, schedule = build_measurement_signal(measurement_spec)
+    write_pcm16_wave(sweeps, program, RATE)
+    record_while_playing(
+        sink_name, mic_name, channels, sweeps, recording, RECORD_LEAD_SECONDS, 0.75
+    )
     calibration = parse_mic_calibration(mic_cal_file)
-    return analyze_recording(
+    measurement = analyze_recording(
         recording,
         channel,
         schedule,
@@ -307,6 +398,21 @@ def capture_measurement(sink_name, mic_name, channel, mic_cal_file=None):
         internal_mic=mic_name.startswith("alsa_input.pci-"),
         calibration=calibration,
     )
+    attach_level_search(measurement, level_search)
+    return measurement
+
+
+def attach_level_search(measurement, level_search):
+    """Record the level search and surface an unsettled search as guidance."""
+    if not level_search:
+        return
+    measurement["level_search"] = level_search
+    warnings, guidance = level_search_advice(level_search)
+    quality = measurement["quality"]
+    quality["warnings"] = list(dict.fromkeys(quality["warnings"] + warnings))
+    quality["guidance"] = list(dict.fromkeys(quality["guidance"] + guidance))
+    if quality["accepted"]:
+        quality["verdict"] = "warning" if quality["warnings"] else "pass"
 
 
 def profile_from_measurement(sink, mic, channel, voicing, measurement):
@@ -367,9 +473,13 @@ def reanalyze_saved_capture(voicing=None, channel_override=None):
     channel = parse_channel_selection(
         channel_override if channel_override is not None else mic.get("channel", 0)
     )
+    # The saved capture was recorded at whatever level the search chose, so
+    # the level must come from the saved measurement, not from the sink type.
+    previous_measurement = previous.get("measurement", {})
+    saved_level = previous_measurement.get("sweep", {}).get("level_dbfs")
     measurement_spec = SweepSpec(
-        level_dbfs=INTERNAL_SPEAKER_LEVEL_DBFS
-        if sink["name"].startswith("alsa_output.pci-") else SWEEP_SPEC.level_dbfs
+        level_dbfs=float(saved_level) if saved_level is not None
+        else default_sweep_level(sink["name"])
     )
     _, schedule = build_measurement_signal(measurement_spec)
     calibration_path = mic.get("calibration_file")
@@ -382,6 +492,7 @@ def reanalyze_saved_capture(voicing=None, channel_override=None):
         internal_mic=mic["name"].startswith("alsa_input.pci-"),
         calibration=calibration,
     )
+    attach_level_search(measurement, previous_measurement.get("level_search"))
     return profile_from_measurement(
         sink, mic, channel, voicing or previous.get("voicing", "warm"), measurement
     )
@@ -481,7 +592,8 @@ def wizard():
     else:
         print("  Place the mic on-axis at normal listening distance, centered between speakers.")
     print("  Pause music/video, keep the room quiet, and use 50-70% hardware volume.")
-    input("Press Enter when ready. The repeated left/right sweep test lasts about 24 seconds...")
+    print("  A short level check runs first and sets the sweep level automatically.")
+    input("Press Enter when ready. The level check and repeated left/right sweeps take about 30 seconds...")
     try:
         profile = build_profile(sink, mic, channel, voicing, mic_cal_file)
     except ValueError as error:
@@ -489,6 +601,10 @@ def wizard():
     quality = profile["quality"]
     metrics = quality["metrics"]
     print(f"\nMeasurement quality: {quality['verdict'].upper()}")
+    level_search = profile["measurement"].get("level_search")
+    if level_search:
+        print(f"  Sweep level: {level_search['selected_level_dbfs']:+.1f} dBFS "
+              f"after {len(level_search['attempts'])} probe(s), {level_search['status']}")
     print(f"  Broadband prominence: {metrics['minimum_broadband_prominence_db']:.1f} dB")
     print(f"  Repeatability: {metrics['worst_repeatability_db']:.1f} dB")
     print(f"  Stable broad response: {metrics['minimum_stable_band_percent']:.0f}%")

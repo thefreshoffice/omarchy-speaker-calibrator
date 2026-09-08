@@ -20,7 +20,7 @@ Item {
     phase = operation
     error = ""
     message = operation === "measure"
-      ? "Playing six quiet left/right sweeps — about 24 seconds…"
+      ? "Checking the level, then playing six left/right sweeps — about 30 seconds…"
       : "Working…"
     _stdout = ""
     _stderr = ""

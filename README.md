@@ -30,8 +30,18 @@ the outlier is reported. The panel plots left/right response with a shaded
 repeat-uncertainty band. Accepted repeat-response curves are also retained (never
 the raw microphone waveforms) for independent optimizer validation.
 
-The level check is based on the accepted sweep peaks rather than a fixed laptop
-volume percentage. It reports when the microphone signal was too low or came too
+Before the sweeps, a short level search plays a brief left/right probe at a
+quiet level, measures the microphone peak, and moves the sweep level toward a
+-6 dBFS microphone peak, backing off by 12 dB whenever a probe clips. It
+usually needs two probes and never leaves a window of 24 dB below to 6 dB above
+the output's default sweep level, so a hot microphone is caught before the long
+sweeps and a quiet one is raised instead of measuring into the room noise. The
+search stops with guidance instead of measuring when the room is already loud
+before the probe starts, when the microphone peak does not follow the sweep
+level (automatic gain control, an overloaded microphone, or other audio
+playing), or when nothing is heard at all; the error names any application that
+is playing audio at the time. The level check on the finished measurement is
+based on the accepted sweep peaks rather than a fixed laptop volume percentage. It reports when the microphone signal was too low or came too
 close to clipping. An isolated clipped sweep is discarded when two clean repeats
 for that speaker remain; widespread clipping still rejects the measurement.
 Because built-in calibration is relative, scalar built-in-microphone gain movement
@@ -89,7 +99,8 @@ long-lived Omarchy shell process.
 The wizard asks you to select a physical speaker sink, microphone, microphone
 channel, and flat or warm voicing. For an external microphone, an optional
 serial-number calibration text file can be supplied. Keep the room quiet and do
-not move the computer or microphone during the roughly 24-second sweep sequence.
+not move the computer or microphone during the roughly 30-second level check and
+sweep sequence.
 
 ### Warm or Flat?
 
@@ -134,8 +145,10 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 - The generated filter output is pinned to the selected physical sink.
 - Existing tuning files are backed up before replacement.
 - Failed or clipped measurements are saved for diagnosis but cannot be installed.
-- Built-in speakers use a -12 dBFS sweep at the requested 50-70% hardware level;
-  external outputs retain the quieter -27 dBFS sweep default.
+- Built-in speakers start from a -12 dBFS sweep at the requested 50-70% hardware
+  level and external outputs from a quieter -27 dBFS default; the level search
+  then adjusts within -24/+6 dB of that default and lowers the level whenever a
+  probe clips.
 - Multi-microphone disagreement increases optimizer uncertainty and therefore
   suppresses risky boosts.
 

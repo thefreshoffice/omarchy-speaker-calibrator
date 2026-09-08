@@ -13,11 +13,17 @@ from scipy import signal
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_dsp import (  # noqa: E402
+    LEVEL_SEARCH_ABORT_STATUSES,
+    LevelSearchPolicy,
     SweepSpec,
     analyse_capture,
+    analyse_level_probe,
     build_measurement_signal,
     combine_microphone_measurements,
+    level_search_advice,
     parse_mic_calibration,
+    plan_probe_level,
+    search_measurement_level,
 )
 
 
@@ -254,6 +260,210 @@ class CalibrationDspTests(unittest.TestCase):
             combined["microphone_array"]["rejected_channels"][0]["input_channel"], 2
         )
 
+
+class LevelSearchTests(unittest.TestCase):
+    rate = 8_000
+
+    def probe_capture(self, amplitude, *, noise=1e-4, channels=1, clip=False,
+                      click=0.0, background=0.0):
+        """0.3 s of room sound, a 0.5 s tone burst, and 0.4 s of room sound."""
+        rng = np.random.default_rng(7)
+        frames = int(1.2 * self.rate)
+        capture = rng.normal(0.0, noise, (frames, channels))
+        if background:
+            capture += rng.normal(0.0, background, (frames, channels))
+        t = np.arange(int(0.5 * self.rate)) / self.rate
+        burst = amplitude * np.sin(2.0 * np.pi * 440.0 * t)
+        start = int(0.4 * self.rate)
+        capture[start:start + burst.size, 0] += burst
+        if click:
+            at = int(1.0 * self.rate)
+            capture[at:at + 8, 0] += click
+        if clip:
+            capture = np.clip(capture, -1.0, 1.0)
+        return capture
+
+    def test_probe_reports_peak_noise_prominence_and_background(self):
+        probe = analyse_level_probe(self.probe_capture(0.3), self.rate)
+        self.assertAlmostEqual(probe["peak_dbfs"], 20 * np.log10(0.3), delta=0.2)
+        self.assertLess(probe["noise_dbfs"], -70.0)
+        self.assertLess(probe["background_rms_dbfs"], -70.0)
+        self.assertGreater(probe["prominence_db"], 40.0)
+        self.assertGreaterEqual(probe["tonal_blocks"], 8)
+        self.assertEqual(probe["clipped_samples"], 0)
+
+    def test_probe_counts_clipping_on_any_channel(self):
+        capture = self.probe_capture(1.4, channels=2, clip=True)
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertGreater(probe["clipped_samples"], 0)
+        self.assertAlmostEqual(probe["peak_dbfs"], 0.0, delta=0.1)
+
+    def test_probe_uses_best_channel_for_prominence(self):
+        capture = self.probe_capture(0.1, channels=2)
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertGreater(probe["prominence_db"], 30.0)
+
+    def test_probe_ignores_an_isolated_click_for_the_sweep_peak(self):
+        probe = analyse_level_probe(self.probe_capture(0.1, click=0.9), self.rate)
+        self.assertAlmostEqual(probe["peak_dbfs"], -20.0, delta=0.3)
+        self.assertGreater(probe["transient_peak_dbfs"], -2.0)
+
+    def test_probe_measures_room_sound_before_the_probe(self):
+        probe = analyse_level_probe(self.probe_capture(0.3, background=0.05), self.rate)
+        self.assertAlmostEqual(probe["background_rms_dbfs"], -26.0, delta=1.0)
+
+    def test_silence_has_no_prominence(self):
+        probe = analyse_level_probe(self.probe_capture(0.0), self.rate)
+        self.assertLess(probe["prominence_db"], 3.0)
+
+    def test_plan_raises_a_quiet_probe_proportionally(self):
+        probe = {"peak_dbfs": -32.0, "noise_dbfs": -80.0, "prominence_db": 40.0, "clipped_samples": 0}
+        plan = plan_probe_level(-24.0, probe, (-36.0, -6.0))
+        self.assertFalse(plan["done"])
+        self.assertEqual(plan["status"], "adjusting")
+        # -24 + (-6 - -32) = +2 dBFS, clamped to the upper bound.
+        self.assertAlmostEqual(plan["level_dbfs"], -6.0)
+
+    def test_plan_backs_off_after_clipping(self):
+        probe = {"peak_dbfs": 0.0, "noise_dbfs": -80.0, "prominence_db": 60.0, "clipped_samples": 12}
+        plan = plan_probe_level(-24.0, probe, (-36.0, -6.0))
+        self.assertFalse(plan["done"])
+        self.assertEqual(plan["status"], "clipped")
+        self.assertAlmostEqual(plan["level_dbfs"], -36.0)
+
+    def test_plan_converges_near_target(self):
+        probe = {"peak_dbfs": -7.0, "noise_dbfs": -80.0, "prominence_db": 50.0, "clipped_samples": 0}
+        plan = plan_probe_level(-14.0, probe, (-36.0, -6.0))
+        self.assertTrue(plan["done"])
+        self.assertEqual(plan["status"], "converged")
+        self.assertAlmostEqual(plan["level_dbfs"], -13.0)
+
+    def test_plan_reports_a_bound_that_stops_it_short(self):
+        quiet = {"peak_dbfs": -20.0, "noise_dbfs": -80.0, "prominence_db": 40.0, "clipped_samples": 0}
+        plan = plan_probe_level(-6.0, quiet, (-36.0, -6.0))
+        self.assertTrue(plan["done"])
+        self.assertEqual(plan["status"], "limited-by-maximum-level")
+        hot = {"peak_dbfs": -1.0, "noise_dbfs": -80.0, "prominence_db": 60.0, "clipped_samples": 0}
+        plan = plan_probe_level(-36.0, hot, (-36.0, -6.0))
+        self.assertTrue(plan["done"])
+        self.assertEqual(plan["status"], "limited-by-minimum-level")
+
+    def test_plan_steps_up_blindly_when_nothing_is_heard(self):
+        silent = {"peak_dbfs": -70.0, "noise_dbfs": -72.0, "prominence_db": 1.0, "clipped_samples": 0}
+        plan = plan_probe_level(-24.0, silent, (-36.0, -6.0))
+        self.assertFalse(plan["done"])
+        self.assertEqual(plan["status"], "not-heard")
+        self.assertAlmostEqual(plan["level_dbfs"], -12.0)
+        plan = plan_probe_level(-6.0, silent, (-36.0, -6.0))
+        self.assertTrue(plan["done"])
+        self.assertEqual(plan["status"], "no-signal")
+
+    def test_plan_refuses_a_loud_room_before_anything_else(self):
+        loud = {"peak_dbfs": 0.0, "noise_dbfs": -30.0, "prominence_db": 10.0,
+                "clipped_samples": 3, "background_rms_dbfs": -25.0}
+        plan = plan_probe_level(-24.0, loud, (-36.0, -6.0))
+        self.assertTrue(plan["done"])
+        self.assertEqual(plan["status"], "background-too-loud")
+        self.assertAlmostEqual(plan["level_dbfs"], -24.0)
+
+    def fake_microphone(self, gain_db, *, noise_dbfs=-75.0, background_dbfs=-70.0, agc_peak=None):
+        """A linear speaker/microphone path that clips at full scale."""
+        def run_probe(level_dbfs):
+            peak = min(0.0, level_dbfs + gain_db)
+            if agc_peak is not None:
+                peak = agc_peak
+            return {
+                "peak_dbfs": peak,
+                "noise_dbfs": noise_dbfs,
+                "prominence_db": max(0.0, peak - 3.0 - noise_dbfs),
+                "clipped_samples": 5 if level_dbfs + gain_db >= 0.0 else 0,
+                "background_rms_dbfs": background_dbfs,
+                "background_peak_dbfs": background_dbfs + 10.0,
+                "transient_peak_dbfs": -120.0,
+                "tonal_blocks": 16,
+            }
+        return run_probe
+
+    def test_search_lands_on_target_in_two_probes(self):
+        search = search_measurement_level(
+            self.fake_microphone(8.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "converged")
+        self.assertTrue(search["confirmed"])
+        self.assertEqual(len(search["attempts"]), 2)
+        self.assertAlmostEqual(search["selected_level_dbfs"], -14.0)
+        self.assertEqual(search["attempts"][0]["status"], "adjusting")
+        self.assertEqual(search["attempts"][1]["status"], "converged")
+
+    def test_search_retreats_from_a_hot_microphone(self):
+        search = search_measurement_level(
+            self.fake_microphone(40.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "clipping-at-minimum-level")
+        self.assertAlmostEqual(search["selected_level_dbfs"], -36.0)
+        warnings, guidance = level_search_advice(search)
+        self.assertTrue(any("quietest" in item for item in warnings))
+        self.assertTrue(any("Lower" in item for item in guidance))
+
+    def test_search_stops_at_the_maximum_for_a_quiet_microphone(self):
+        search = search_measurement_level(
+            self.fake_microphone(-20.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "limited-by-maximum-level")
+        self.assertTrue(search["confirmed"])
+        self.assertAlmostEqual(search["selected_level_dbfs"], -6.0)
+        warnings, guidance = level_search_advice(search)
+        self.assertTrue(any("loudest" in item for item in warnings))
+        self.assertTrue(any("Raise" in item for item in guidance))
+
+    def test_search_reports_no_signal_from_a_dead_path(self):
+        search = search_measurement_level(
+            self.fake_microphone(-200.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "no-signal")
+        self.assertFalse(search["confirmed"])
+        self.assertIn(search["status"], LEVEL_SEARCH_ABORT_STATUSES)
+        self.assertEqual([item["status"] for item in search["attempts"]], ["not-heard", "not-heard", "no-signal"])
+
+    def test_search_stops_when_the_peak_ignores_the_level(self):
+        # An automatic-gain microphone (or other audio) pins the peak at -1 dBFS
+        # no matter how quiet the sweep is; the search must not chase it down.
+        search = search_measurement_level(
+            self.fake_microphone(8.0, agc_peak=-1.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "level-independent")
+        self.assertIn(search["status"], LEVEL_SEARCH_ABORT_STATUSES)
+        self.assertEqual(len(search["attempts"]), 2)
+        self.assertAlmostEqual(search["selected_level_dbfs"], -29.0)
+        warnings, guidance = level_search_advice(search)
+        self.assertTrue(any("did not follow" in item for item in warnings))
+        self.assertTrue(any("automatic gain control" in item for item in guidance))
+
+    def test_search_stops_when_the_room_is_loud(self):
+        search = search_measurement_level(
+            self.fake_microphone(8.0, background_dbfs=-22.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(search["status"], "background-too-loud")
+        self.assertEqual(len(search["attempts"]), 1)
+        warnings, guidance = level_search_advice(search)
+        self.assertTrue(any("-22.0 dBFS" in item for item in warnings))
+        self.assertTrue(any("Pause other audio" in item for item in guidance))
+
+    def test_search_honours_a_custom_policy(self):
+        policy = LevelSearchPolicy(target_peak_dbfs=-12.0)
+        search = search_measurement_level(
+            self.fake_microphone(8.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0),
+            policy=policy,
+        )
+        self.assertEqual(search["status"], "converged")
+        self.assertAlmostEqual(search["selected_level_dbfs"], -20.0)
+        self.assertEqual(search["target_peak_dbfs"], -12.0)
+
+    def test_settled_search_has_no_advice(self):
+        search = search_measurement_level(
+            self.fake_microphone(8.0), start_level_dbfs=-24.0, bounds=(-36.0, -6.0)
+        )
+        self.assertEqual(level_search_advice(search), ([], []))
 
 if __name__ == "__main__":
     unittest.main()

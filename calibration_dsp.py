@@ -899,3 +899,247 @@ def combine_microphone_measurements(
         },
         "quality": quality,
     }
+
+
+@dataclass(frozen=True)
+class LevelSearchPolicy:
+    """How the pre-measurement level search steers the sweep level."""
+
+    # Where the microphone peak should land.  -6 dBFS keeps 5 dB of margin
+    # below the clipping gate while sitting inside the window that
+    # _add_measurement_level_guidance reports as a good level.
+    target_peak_dbfs: float = -6.0
+    # A probe that is not at least this far above the room noise did not
+    # measure anything usable, so its peak cannot be used for planning.
+    minimum_prominence_db: float = 6.0
+    # Within this distance of the target the level is accepted as final.
+    convergence_db: float = 1.5
+    # Backing off after clipping is deliberately coarse: once samples have
+    # been flattened the true peak is unknown.
+    clip_step_db: float = 12.0
+    # Stepping up when nothing was heard is equally coarse.
+    blind_step_db: float = 12.0
+    # Room sound recorded before the probe starts.  Music, a call, or typing
+    # next to a built-in microphone sits far above this; a quiet room with a
+    # fan sits well below it.
+    maximum_background_dbfs: float = -30.0
+    # A linear speaker/microphone path moves the peak one-for-one with the
+    # level.  When a level change of at least this size moves the peak by
+    # less than half as much, something else sets the peak: automatic gain
+    # control, an overloaded microphone, or other audio.
+    level_follow_step_db: float = 3.0
+
+
+def analyse_level_probe(
+    captures: np.ndarray,
+    rate: int,
+    *,
+    background_seconds: float = 0.3,
+    block_seconds: float = 0.05,
+) -> dict:
+    """Summarize a short level-probe recording without relying on timing.
+
+    The recorder starts ``background_seconds`` or more before the probe plays,
+    so the opening of the recording is room sound alone and is reported as
+    background.  Everything after it is the probe region.  Peak, noise, and
+    prominence come from short RMS blocks, so a late recorder start or an
+    early stop cannot masquerade as a quiet speaker.  The sweep peak is taken
+    only from tonal blocks, where the peak sits within 12 dB of the block RMS
+    as it does for a sine, so a keyboard click or a pop cannot set it; such
+    transients are reported separately.  Peak and clipping span every supplied
+    channel, because one clipped microphone channel spoils the measurement,
+    while noise and prominence use the best channel, because one working
+    microphone is enough to plan the level.
+    """
+    values = np.asarray(captures, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[:, np.newaxis]
+    frames, channels = values.shape
+    block = max(1, int(round(block_seconds * rate)))
+    usable = (frames // block) * block
+    if usable < 6 * block:
+        raise ValueError("The level probe recording is too short to analyse.")
+    blocks = values[:usable].reshape((usable // block, block, channels))
+    block_rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    block_peak = np.max(np.abs(blocks), axis=1)
+    count = blocks.shape[0]
+    background_blocks = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
+    background_rms = np.sqrt(np.mean(block_rms[:background_blocks] ** 2, axis=0))
+    background_peak = np.max(block_peak[:background_blocks], axis=0)
+
+    region_rms = block_rms[background_blocks:]
+    region_peak = block_peak[background_blocks:]
+    noise = np.percentile(block_rms, 10, axis=0)
+    loud = np.percentile(region_rms, 95, axis=0)
+    prominences = [dbfs(loud[index]) - dbfs(noise[index]) for index in range(channels)]
+    best = int(np.argmax(prominences))
+
+    crest_db = 20.0 * np.log10(region_peak / np.maximum(region_rms, 1e-12))
+    tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
+    if np.any(tonal):
+        peak = float(np.max(region_peak[tonal]))
+    else:
+        peak = float(np.max(region_peak))
+    transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
+    region = values[background_blocks * block:usable]
+    return {
+        "peak_dbfs": round(dbfs(peak), 3),
+        "noise_dbfs": round(dbfs(float(noise[best])), 3),
+        "prominence_db": round(float(prominences[best]), 3),
+        "clipped_samples": int(np.count_nonzero(np.abs(region) >= 0.999)),
+        "background_rms_dbfs": round(dbfs(float(np.max(background_rms))), 3),
+        "background_peak_dbfs": round(dbfs(float(np.max(background_peak))), 3),
+        "transient_peak_dbfs": round(dbfs(transient_peak), 3),
+        "tonal_blocks": int(np.count_nonzero(np.any(tonal, axis=1))),
+    }
+
+
+def plan_probe_level(
+    level_dbfs: float,
+    probe: dict,
+    bounds: tuple[float, float],
+    policy: LevelSearchPolicy = LevelSearchPolicy(),
+) -> dict:
+    """Decide the next sweep level from one probe result."""
+    low, high = float(bounds[0]), float(bounds[1])
+    at_low = level_dbfs <= low + 1e-9
+    at_high = level_dbfs >= high - 1e-9
+    if float(probe.get("background_rms_dbfs", -120.0)) > policy.maximum_background_dbfs:
+        return {"level_dbfs": level_dbfs, "done": True, "status": "background-too-loud"}
+    if probe["clipped_samples"] > 0:
+        if at_low:
+            return {"level_dbfs": low, "done": True, "status": "clipping-at-minimum-level"}
+        return {
+            "level_dbfs": max(low, level_dbfs - policy.clip_step_db),
+            "done": False,
+            "status": "clipped",
+        }
+    if probe["prominence_db"] < policy.minimum_prominence_db:
+        if at_high:
+            return {"level_dbfs": high, "done": True, "status": "no-signal"}
+        return {
+            "level_dbfs": min(high, level_dbfs + policy.blind_step_db),
+            "done": False,
+            "status": "not-heard",
+        }
+    # A sine sweep's microphone peak scales one-for-one with its level, so a
+    # single proportional step lands near the target; the next probe confirms.
+    error = policy.target_peak_dbfs - float(probe["peak_dbfs"])
+    proposed = float(np.clip(level_dbfs + error, low, high))
+    if abs(proposed - level_dbfs) <= policy.convergence_db:
+        if error > policy.convergence_db and proposed >= high - 1e-9:
+            status = "limited-by-maximum-level"
+        elif error < -policy.convergence_db and proposed <= low + 1e-9:
+            status = "limited-by-minimum-level"
+        else:
+            status = "converged"
+        return {"level_dbfs": proposed, "done": True, "status": status}
+    return {"level_dbfs": proposed, "done": False, "status": "adjusting"}
+
+
+def _peak_follows_level(previous: dict, current: dict, policy: LevelSearchPolicy) -> bool:
+    """True unless two clean probes show the peak ignoring a level change."""
+    for probe in (previous, current):
+        if probe["clipped_samples"] > 0 or probe["prominence_db"] < policy.minimum_prominence_db:
+            return True
+    level_change = current["level_dbfs"] - previous["level_dbfs"]
+    if abs(level_change) < policy.level_follow_step_db:
+        return True
+    peak_change = current["peak_dbfs"] - previous["peak_dbfs"]
+    return abs(peak_change) >= 0.5 * abs(level_change)
+
+
+def search_measurement_level(
+    run_probe,
+    *,
+    start_level_dbfs: float,
+    bounds: tuple[float, float],
+    policy: LevelSearchPolicy = LevelSearchPolicy(),
+    attempts: int = 3,
+) -> dict:
+    """Find a sweep level that lands the microphone peak near the target.
+
+    ``run_probe(level_dbfs)`` plays a short probe at that level and returns
+    the dict produced by :func:`analyse_level_probe`.  The search starts
+    quietly and moves in proportional steps, so a hot microphone is caught
+    before anything clips and a quiet one is raised before the long sweeps.
+    It stops early when the room is too loud before the probe starts, or when
+    the peak stops following the level, because no level can rescue either.
+    """
+    low, high = float(bounds[0]), float(bounds[1])
+    level = float(np.clip(start_level_dbfs, low, high))
+    trace: list[dict] = []
+    plan = {"level_dbfs": level, "done": False, "status": "not-run"}
+    for _ in range(max(1, int(attempts))):
+        probe = run_probe(level)
+        plan = plan_probe_level(level, probe, (low, high), policy)
+        entry = {"level_dbfs": round(level, 2), **probe, "status": plan["status"]}
+        if trace and not plan["done"] and not _peak_follows_level(trace[-1], entry, policy):
+            plan = {
+                "level_dbfs": min(level, float(trace[-1]["level_dbfs"])),
+                "done": True,
+                "status": "level-independent",
+            }
+            entry["status"] = plan["status"]
+        trace.append(entry)
+        level = float(plan["level_dbfs"])
+        if plan["done"]:
+            break
+    status = plan["status"]
+    return {
+        "target_peak_dbfs": policy.target_peak_dbfs,
+        "level_bounds_dbfs": [round(low, 2), round(high, 2)],
+        "selected_level_dbfs": round(level, 2),
+        "status": status,
+        "confirmed": status == "converged" or status.startswith("limited-by"),
+        "attempts": trace,
+    }
+
+
+# A search that ends in one of these states cannot produce a usable
+# measurement at any level, so the caller should stop and show the advice.
+LEVEL_SEARCH_ABORT_STATUSES = ("no-signal", "background-too-loud", "level-independent")
+
+
+def level_search_advice(search: dict) -> tuple[list[str], list[str]]:
+    """Return (warnings, guidance) for a level search that could not settle."""
+    status = search.get("status", "")
+    level = float(search.get("selected_level_dbfs", 0.0))
+    attempts = search.get("attempts") or [{}]
+    last = attempts[-1]
+    if status == "background-too-loud":
+        return (
+            [f"Background sound at the microphone is too loud for a measurement "
+             f"({float(last.get('background_rms_dbfs', 0.0)):.1f} dBFS RMS before the probe started)."],
+            ["Pause other audio and calls, stop typing, and keep the room quiet, then measure again."],
+        )
+    if status == "level-independent":
+        return (
+            ["The microphone level did not follow the sweep level between probes."],
+            ["Disable microphone automatic gain control, pause other audio, and lower the "
+             "microphone gain if it is overloaded, then measure again."],
+        )
+    if status == "no-signal":
+        return (
+            ["The microphone did not pick up the level probe even at the loudest allowed sweep level."],
+            ["Check that the selected speaker and microphone are unmuted and raise the "
+             "hardware volume, then measure again."],
+        )
+    if status == "limited-by-maximum-level":
+        return (
+            [f"The level search stopped at the loudest allowed sweep level ({level:+.1f} dBFS) "
+             "with a low microphone signal."],
+            ["Raise the speaker hardware volume or the microphone input gain, then measure again."],
+        )
+    if status in ("limited-by-minimum-level", "clipping-at-minimum-level"):
+        return (
+            [f"The level search stopped at the quietest allowed sweep level ({level:+.1f} dBFS) "
+             "with a hot microphone signal."],
+            ["Lower the microphone input gain or the speaker hardware volume, then measure again."],
+        )
+    if status in ("adjusting", "clipped", "not-heard"):
+        return (
+            [f"The level search did not settle; the sweeps used {level:+.1f} dBFS unconfirmed."],
+            ["Disable microphone automatic gain control and keep the room quiet, then measure again."],
+        )
+    return [], []

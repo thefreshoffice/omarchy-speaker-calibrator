@@ -94,6 +94,11 @@ Panel {
       + "   ·   clock " + Number(metrics.clock_drift_ppm || 0).toFixed(0) + " ppm"
       + "   ·   harmonic residual " + Number(metrics.worst_harmonic_residual_db || -120).toFixed(1) + " dB"
       + "   ·   mic peak " + Number(metrics.maximum_accepted_peak_dbfs || -120).toFixed(1) + " dBFS"
+    var levelSearch = (service.proposal.measurement || {}).level_search
+    if (levelSearch && levelSearch.selected_level_dbfs !== undefined)
+      result += "   ·   sweep level " + Number(levelSearch.selected_level_dbfs).toFixed(1) + " dBFS"
+        + " (" + (levelSearch.attempts || []).length + " probe"
+        + ((levelSearch.attempts || []).length === 1 ? "" : "s") + ")"
     if (Number(metrics.microphone_channels_requested || 0) > 1)
       result += "   ·   microphones " + Number(metrics.microphone_channels_used || 0)
         + "/" + Number(metrics.microphone_channels_requested)
