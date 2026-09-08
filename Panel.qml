@@ -281,6 +281,26 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
+  // The shell's tooltip is a single unbounded line; this one wraps at a sane
+  // width so a sentence of advice does not run across the whole screen.
+  component WrapTip: PanelToolTip {
+    id: tip
+    property real maxWidth: Style.space(300)
+    fontFamily: root.fontFamily
+    contentWidth: Math.min(implicitContentWidth, maxWidth)
+    contentItem: Text {
+      textFormat: Text.PlainText
+      text: tip.text
+      color: tip.panelForeground
+      font.family: tip.fontFamily
+      font.pixelSize: tip.fontSize
+      wrapMode: Text.WordWrap
+      leftPadding: Border.left(tip.panelBorderSpec) + Style.spacing.controlPaddingX
+      rightPadding: Border.right(tip.panelBorderSpec) + Style.spacing.controlPaddingX
+      topPadding: Border.top(tip.panelBorderSpec) + Style.spacing.controlPaddingY
+      bottomPadding: Border.bottom(tip.panelBorderSpec) + Style.spacing.controlPaddingY
+    }
+  }
   // A clickable row in the shell's control style: glyph, short title, and a
   // dim description.  Long option lists belong in the description, never in
   // the title, so nothing overflows or gets centred into unreadability.
@@ -646,19 +666,23 @@ Panel {
             Repeater {
               model: service.sinks
               Button {
+                id: sinkRow
                 width: parent.width
                 leftAlign: true
                 bordered: true
                 selected: index === root.sinkIndex
                 iconText: "󰓃"
                 text: modelData.description + (modelData.internal ? "  ·  built-in" : "  ·  external")
-                tooltipText: modelData.internal
-                  ? "The laptop's own speakers."
-                  : "An external output; the sweeps play through it and the correction is installed in front of it."
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
                 onClicked: root.sinkIndex = index
+                WrapTip {
+                  visible: sinkRow.hot
+                  text: modelData.internal
+                    ? "The laptop's own speakers."
+                    : "An external output. The sweeps play through it and the correction is installed in front of it."
+                }
               }
             }
             Text {
@@ -680,6 +704,7 @@ Panel {
             Repeater {
               model: service.microphones
               Button {
+                id: micRow
                 width: parent.width
                 leftAlign: true
                 bordered: true
@@ -689,11 +714,14 @@ Panel {
                   + (modelData.internal
                       ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
                       : "  ·  external")
-                tooltipText: modelData.internal ? root.internalMicHint : root.externalMicHint
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
                 onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                WrapTip {
+                  visible: micRow.hot
+                  text: modelData.internal ? root.internalMicHint : root.externalMicHint
+                }
               }
             }
             Text {
@@ -709,13 +737,27 @@ Panel {
             RowLayout {
               width: parent.width
               spacing: Style.space(8)
-              PanelActionButton {
-                id: micInfo
+              Item {
                 Layout.alignment: Qt.AlignTop
-                iconText: "󰋽"
-                tooltipText: root.selectedMicIsInternal() ? root.internalMicHint : root.externalMicHint
-                foreground: root.dim
-                fontFamily: root.fontFamily
+                width: Style.space(22)
+                height: Style.space(22)
+                Text {
+                  anchors.centerIn: parent
+                  text: "󰋽"
+                  color: infoMouse.containsMouse ? root.foreground : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.icon
+                }
+                MouseArea {
+                  id: infoMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.WhatsThisCursor
+                }
+                WrapTip {
+                  visible: infoMouse.containsMouse
+                  text: root.selectedMicIsInternal() ? root.internalMicHint : root.externalMicHint
+                }
               }
               Text {
                 Layout.fillWidth: true
