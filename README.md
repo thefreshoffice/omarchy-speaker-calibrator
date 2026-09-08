@@ -105,9 +105,12 @@ long-lived Omarchy shell process.
   selected. Individual channels remain available for troubleshooting.
 - Measure first, review the proposed filters and graph, then explicitly install
   the profile.
-- After a second install, **Hear the previous profile** swaps the profile that
-  was replaced back in, and pressing it again returns to the current one, so two
+- After a second install, **Hear the previous profile** plays the profile you
+  were listening to before, and pressing it again returns to the new one, so two
   measurements or two plugin versions can be compared by ear on the same music.
+  The switch updates the running filter in place, so playback continues; the
+  tuning is only restarted once, when the running graph still has an older
+  shape.
   The command-line equivalent is `compare-toggle`; `status` says which one is
   playing.
 
@@ -158,6 +161,10 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 - The limiter has auto-level and boost disabled.
 - The limiter ceiling is -1 dBFS.
 - The generated filter output is pinned to the selected physical sink.
+- The graph always has the same shape: two high-pass sections, a low shelf,
+  twelve parametric slots, a high shelf, and the limiter, per channel. Unused
+  sections sit at 0 dB. Installing or comparing profiles therefore updates the
+  running filter's controls instead of restarting the PipeWire client.
 - Existing tuning files are backed up before replacement.
 - Failed or clipped measurements are saved for diagnosis but cannot be installed.
 - Built-in speakers start from a -12 dBFS sweep at the requested 50-70% hardware

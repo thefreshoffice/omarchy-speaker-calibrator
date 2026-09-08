@@ -144,6 +144,37 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertIn('"Freq" = 2500 "Q" = 1.2 "Gain" = 0.75', graph)
         self.assertIn('"g_in" = 0.812345', graph)
         self.assertIn('Calibrated Speakers — Protected', graph)
+        # The graph keeps its full fixed shape so profiles can be applied live.
+        self.assertIn('name = p12_l label = bq_peaking', graph)
+        self.assertIn('name = ls_r label = bq_lowshelf', graph)
+        self.assertIn('name = hs_r label = bq_highshelf', graph)
+        self.assertIn('{ output = "hs_r:Out" input = "limiter:in_r" }', graph)
+
+    def test_graph_controls_fill_every_fixed_slot(self):
+        fit = {
+            "centers_hz": [1000, 2500],
+            "q": [1.0, 1.2],
+            "gains_db": [-2.5, 0.75],
+            "input_gain_linear": 0.812345,
+        }
+        controls = speaker_calibrate.graph_controls(fit)
+        slots = speaker_calibrate.PEAKING_SLOTS
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 * slots + 3) + 1)
+        self.assertEqual(controls["p1_l:Freq"], 1000.0)
+        self.assertEqual(controls["p2_r:Gain"], 0.75)
+        self.assertEqual(controls["p3_l:Gain"], 0.0)
+        self.assertEqual(controls[f"p{slots}_r:Gain"], 0.0)
+        self.assertEqual(controls["ls_l:Gain"], 0.0)
+        self.assertEqual(controls["hs_r:Gain"], 0.0)
+        self.assertEqual(controls["hp1_l:Freq"], 55.0)
+        self.assertEqual(controls["limiter:g_in"], 0.812345)
+        with self.assertRaises(ValueError):
+            speaker_calibrate.graph_controls({
+                "centers_hz": [1000] * (slots + 1),
+                "q": [1.0] * (slots + 1),
+                "gains_db": [-1.0] * (slots + 1),
+                "input_gain_linear": 1.0,
+            })
 
     def test_optimizer_payload_is_json_serializable(self):
         response = np.full(self.frequencies.size, -30.0)
@@ -221,15 +252,17 @@ class CalibrationOptimizerTests(unittest.TestCase):
 
 
 class CompareToggleTests(unittest.TestCase):
-    def test_swap_files_exchanges_contents(self):
+    def test_load_profile_requires_filters_and_a_speaker(self):
         with tempfile.TemporaryDirectory() as folder:
-            first = Path(folder) / "a.conf"
-            second = Path(folder) / "b.conf"
-            first.write_text("current graph")
-            second.write_text("previous graph")
-            speaker_calibrate.swap_files(first, second)
-            self.assertEqual(first.read_text(), "previous graph")
-            self.assertEqual(second.read_text(), "current graph")
+            path = Path(folder) / "profile.json"
+            path.write_text(json.dumps({"speaker": {"name": "alsa_output.x"}, "fit": None}))
+            self.assertIsNone(speaker_calibrate.load_profile(path))
+            path.write_text(json.dumps({
+                "speaker": {"name": "alsa_output.x"},
+                "fit": {"centers_hz": [1000], "q": [1.0], "gains_db": [-1.0], "input_gain_linear": 1.0},
+            }))
+            self.assertIsNotNone(speaker_calibrate.load_profile(path))
+            self.assertIsNone(speaker_calibrate.load_profile(Path(folder) / "missing.json"))
 
     def test_profile_summary_labels_a_saved_profile(self):
         with tempfile.TemporaryDirectory() as folder:

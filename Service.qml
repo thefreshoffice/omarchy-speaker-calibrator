@@ -96,6 +96,7 @@ Item {
           root.status = Object.assign({}, root.status, { compare: compare })
           root.message = "Now playing the " + compare.active + " profile"
             + (playing && playing.label ? " · " + playing.label : "")
+            + (compare.method === "restart" ? " · tuning restarted" : " · switched live")
         } else if (root.phase === "disable") {
           root.status = { service: "inactive", enabled: false, profile: root.status.profile }
           root.message = "Calibration disabled"

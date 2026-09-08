@@ -55,8 +55,8 @@ UNIT = CONFIG / "systemd/user/omarchy-speaker-tuning.service"
 PROFILE = DATA / "active-profile.json"
 PROPOSAL = DATA / "proposed-profile.json"
 # The profile that the last install replaced, kept so the two can be swapped
-# in and out for a level-honest listening comparison.
-PREVIOUS_GRAPH = DATA / "previous-tuning.conf"
+# in and out for a listening comparison.  Graphs are regenerated from a
+# profile's filters whenever it is activated, so only the profile is kept.
 PREVIOUS_PROFILE = DATA / "previous-profile.json"
 COMPARE_STATE = DATA / "compare-state.json"
 SERVICE = "omarchy-speaker-tuning.service"
@@ -160,28 +160,81 @@ def select(items, title, predicate=None):
             return choices[int(answer) - 1]
 
 
+# The graph always has the same nodes, in this order per channel, so that any
+# profile can be applied to the running filter by updating its controls instead
+# of restarting the PipeWire client, which would drop the sink and stop every
+# player attached to it.  Unused sections are transparent: a peaking or shelf
+# biquad at 0 dB is unity.
+PEAKING_SLOTS = 12
+DEFAULT_HIGHPASS_HZ = 55.0
+SECTION_LABELS = {
+    "hp": "bq_highpass",
+    "ls": "bq_lowshelf",
+    "p": "bq_peaking",
+    "hs": "bq_highshelf",
+}
+
+
+def graph_sections():
+    """Section names per channel, in signal order."""
+    return ["hp1", "hp2", "ls"] + [f"p{slot}" for slot in range(1, PEAKING_SLOTS + 1)] + ["hs"]
+
+
+def graph_controls(fit_payload):
+    """Every control of the fixed-shape graph, for both channels, in order."""
+    centers = list(fit_payload.get("centers_hz", []))
+    q_values = list(fit_payload.get("q", []))
+    gains = list(fit_payload.get("gains_db", []))
+    if not (len(centers) == len(q_values) == len(gains)):
+        raise ValueError("Parametric filter frequency, Q, and gain lists must match.")
+    if len(centers) > PEAKING_SLOTS:
+        raise ValueError(
+            f"The graph has {PEAKING_SLOTS} parametric slots; this fit needs {len(centers)}."
+        )
+    highpass = float(fit_payload.get("highpass_hz", DEFAULT_HIGHPASS_HZ))
+    low_shelf = fit_payload.get("low_shelf") or {}
+    high_shelf = fit_payload.get("high_shelf") or {}
+    controls = {}
+    for side in ("l", "r"):
+        for index in (1, 2):
+            controls[f"hp{index}_{side}:Freq"] = highpass
+            controls[f"hp{index}_{side}:Q"] = 0.707
+        controls[f"ls_{side}:Freq"] = float(low_shelf.get("frequency_hz", 100.0))
+        controls[f"ls_{side}:Q"] = float(low_shelf.get("q", 0.707))
+        controls[f"ls_{side}:Gain"] = float(low_shelf.get("gain_db", 0.0))
+        for slot in range(1, PEAKING_SLOTS + 1):
+            if slot <= len(centers):
+                frequency, q, gain = centers[slot - 1], q_values[slot - 1], gains[slot - 1]
+            else:
+                frequency, q, gain = 1000.0, 1.0, 0.0
+            controls[f"p{slot}_{side}:Freq"] = float(frequency)
+            controls[f"p{slot}_{side}:Q"] = float(q)
+            controls[f"p{slot}_{side}:Gain"] = float(gain)
+        controls[f"hs_{side}:Freq"] = float(high_shelf.get("frequency_hz", 8000.0))
+        controls[f"hs_{side}:Q"] = float(high_shelf.get("q", 0.707))
+        controls[f"hs_{side}:Gain"] = float(high_shelf.get("gain_db", 0.0))
+    controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
+    return controls
+
+
+def _number(value):
+    return f"{float(value):.4f}".rstrip("0").rstrip(".") or "0"
+
+
 def filter_config(sink, fit_payload):
-    centers = fit_payload["centers_hz"]
-    q_values = fit_payload["q"]
-    gains = fit_payload["gains_db"]
-    input_gain = float(fit_payload["input_gain_linear"])
+    controls = graph_controls(fit_payload)
     nodes, links, inputs, outputs = [], [], [], []
     for side, port in (("l", "l"), ("r", "r")):
         chain = []
-        for index in (1, 2):
-            name = f"hp{index}_{side}"
-            nodes.append(f'{{ type = builtin name = {name} label = bq_highpass control = {{ "Freq" = 55.0 "Q" = 0.707 }} }}')
-            chain.append(name)
-        for filter_index, (center, q, gain) in enumerate(
-            zip(centers, q_values, gains), 1
-        ):
-            name = f"p{filter_index}_{side}"
-            frequency_text = f"{float(center):.3f}".rstrip("0").rstrip(".")
-            q_text = f"{float(q):.4f}".rstrip("0").rstrip(".")
-            gain_text = f"{float(gain):.3f}".rstrip("0").rstrip(".")
+        for section in graph_sections():
+            name = f"{section}_{side}"
+            kind = section.rstrip("0123456789")
+            label = SECTION_LABELS[kind]
+            settings = f'"Freq" = {_number(controls[f"{name}:Freq"])} "Q" = {_number(controls[f"{name}:Q"])}'
+            if kind != "hp":
+                settings += f' "Gain" = {_number(controls[f"{name}:Gain"])}'
             nodes.append(
-                f'{{ type = builtin name = {name} label = bq_peaking control = '
-                f'{{ "Freq" = {frequency_text} "Q" = {q_text} "Gain" = {gain_text} }} }}'
+                f'{{ type = builtin name = {name} label = {label} control = {{ {settings} }} }}'
             )
             chain.append(name)
         inputs.append(f'"{chain[0]}:In"')
@@ -189,6 +242,7 @@ def filter_config(sink, fit_payload):
             links.append(f'{{ output = "{before}:Out" input = "{after}:In" }}')
         links.append(f'{{ output = "{chain[-1]}:Out" input = "limiter:in_{port}" }}')
         outputs.append(f'"limiter:out_{port}"')
+    input_gain = controls["limiter:g_in"]
     nodes.append(f'''{{ type = lv2 name = limiter
       plugin = "http://lsp-plug.in/plugins/lv2/limiter_stereo"
       control = {{ "alr" = 0 "boost" = 0 "g_in" = {input_gain:.6f} "th" = 0.891 }}
@@ -242,14 +296,6 @@ def move_apps(target):
             run(["pactl", "move-sink-input", str(stream["index"]), target], check=False)
 
 
-def swap_files(first, second):
-    """Exchange the contents of two files."""
-    first_text = first.read_text()
-    second_text = second.read_text()
-    first.write_text(second_text)
-    second.write_text(first_text)
-
-
 def compare_state():
     try:
         state = json.loads(COMPARE_STATE.read_text())
@@ -277,16 +323,93 @@ def profile_summary(path):
 
 
 def keep_previous_profile():
-    """Set the installed profile aside so the next one can be compared with it."""
-    if not (FRAGMENT.exists() and PROFILE.exists()):
-        return
-    if compare_state()["active"] == "previous":
-        # The previous graph is currently installed; put the current one back
-        # first so "previous" always means the profile being replaced now.
-        swap_files(FRAGMENT, PREVIOUS_GRAPH)
-    shutil.copy2(FRAGMENT, PREVIOUS_GRAPH)
-    shutil.copy2(PROFILE, PREVIOUS_PROFILE)
+    """Set aside the profile being listened to, for comparison with the next one."""
+    if PROFILE.exists() and compare_state()["active"] == "current":
+        shutil.copy2(PROFILE, PREVIOUS_PROFILE)
+    # When the previous profile was playing, it stays "previous": that is the
+    # sound the new install will be compared against.
     COMPARE_STATE.write_text(json.dumps({"active": "current"}) + "\n")
+
+
+def service_active():
+    return run(
+        ["systemctl", "--user", "is-active", SERVICE], check=False, capture=True
+    ).stdout.strip() == "active"
+
+
+def tuning_node_id():
+    """PipeWire id of the running tuning sink, or None."""
+    try:
+        nodes = json.loads(run(["pw-dump"], capture=True).stdout)
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return None
+    for node in nodes:
+        if node.get("type") != "PipeWire:Interface:Node":
+            continue
+        props = node.get("info", {}).get("props", {})
+        if props.get("node.name") == VIRTUAL_SINK and props.get("media.class") == "Audio/Sink":
+            return node.get("id")
+    return None
+
+
+def live_controls(node_id):
+    """The running filter graph's controls by name."""
+    try:
+        nodes = json.loads(run(["pw-dump", str(node_id)], capture=True).stdout)
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return {}
+    for node in nodes:
+        for entry in node.get("info", {}).get("params", {}).get("Props", []):
+            items = entry.get("params")
+            if items and "limiter:g_in" in items:
+                return dict(zip(items[0::2], items[1::2]))
+    return {}
+
+
+def apply_controls_live(controls):
+    """Update the running filter in place; False when it must be restarted."""
+    node_id = tuning_node_id()
+    if node_id is None:
+        return False
+    current = live_controls(node_id)
+    if any(name not in current for name in controls):
+        # The running graph has a different shape (an older profile); only a
+        # restart can load the new one.
+        return False
+    payload = " ".join(f'"{name}" {float(value):.6f}' for name, value in controls.items())
+    result = run(
+        ["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {payload} ] }}"],
+        check=False, capture=True,
+    )
+    if result.returncode != 0:
+        return False
+    after = live_controls(node_id)
+    for name, value in controls.items():
+        try:
+            readback = float(after[name])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if abs(readback - float(value)) > 1e-3 * max(1.0, abs(float(value))):
+            return False
+    return True
+
+
+def activate_profile(profile):
+    """Make the running tuning play this profile, live when possible.
+
+    The graph file is regenerated from the profile's filters either way, so
+    the on-disk graph always has the fixed shape and the next activation can
+    be live even if this one had to restart an older graph.
+    """
+    fit = profile.get("fit") or {}
+    controls = graph_controls(fit)
+    FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
+    FRAGMENT.write_text(filter_config(profile["speaker"]["name"], fit))
+    if service_active() and apply_controls_live(controls):
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        return "live"
+    restart_tuning()
+    return "restart"
 
 
 def restart_tuning():
@@ -313,13 +436,24 @@ def install_profile(profile, graph):
     FRAGMENT.write_text(graph)
     UNIT.write_text(UNIT_TEXT)
     PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
-    restart_tuning()
+    return activate_profile(profile)
+
+
+def load_profile(path):
+    try:
+        profile = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not profile.get("fit") or not profile.get("speaker", {}).get("name"):
+        return None
+    return profile
 
 
 def compare_payload():
     state = compare_state()
     return {
-        "available": PREVIOUS_GRAPH.exists() and FRAGMENT.exists(),
+        "available": load_profile(PREVIOUS_PROFILE) is not None
+        and load_profile(PROFILE) is not None,
         "active": state["active"],
         "current": profile_summary(PROFILE),
         "previous": profile_summary(PREVIOUS_PROFILE),
@@ -327,15 +461,16 @@ def compare_payload():
 
 
 def compare_toggle():
-    """Swap the installed graph with the previous one and restart the tuning."""
-    if not (PREVIOUS_GRAPH.exists() and FRAGMENT.exists()):
-        raise SystemExit("No previous profile to compare with; install a second profile first.")
+    """Play the other of the two most recent profiles, live when possible."""
     state = compare_state()
-    swap_files(FRAGMENT, PREVIOUS_GRAPH)
     state["active"] = "previous" if state["active"] == "current" else "current"
+    target = load_profile(PREVIOUS_PROFILE if state["active"] == "previous" else PROFILE)
+    if target is None:
+        raise SystemExit("No previous profile to compare with; install a second profile first.")
     COMPARE_STATE.write_text(json.dumps(state) + "\n")
-    restart_tuning()
-    return compare_payload()
+    payload = compare_payload()
+    payload["method"] = activate_profile(target)
+    return payload
 
 
 def analyze_recording(
@@ -619,7 +754,9 @@ def install_proposal():
     profile = json.loads(PROPOSAL.read_text())
     if not profile.get("quality", {}).get("accepted") or not profile.get("fit"):
         raise SystemExit("This measurement failed its quality checks and cannot be installed.")
-    install_profile(profile, filter_config(profile["speaker"]["name"], profile["fit"]))
+    profile["activation"] = install_profile(
+        profile, filter_config(profile["speaker"]["name"], profile["fit"])
+    )
     return profile
 
 
