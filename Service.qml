@@ -149,6 +149,8 @@ Item {
   function disable() { start("disable", ["disable"]) }
   function compare() { start("compare", ["compare-toggle"]) }
   function bypass() { start("bypass", ["bypass-toggle"]) }
+  // Put the sound back through the calibration after the output moved.
+  function useCalibratedOutput() { start("output", ["use-calibrated-output"]) }
   function verify() { start("verify", ["verify-json"]) }
   function refine() { start("refine", ["refine-json", "--install"]) }
   // One button: installs the add-on the first time, switches it after that.
@@ -246,6 +248,13 @@ Item {
           root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "output") {
+          var moved = JSON.parse(raw)
+          root.status = moved
+          root.message = moved.message || ""
+          root.phase = ""
           return
         }
         if (root.phase === "support") {

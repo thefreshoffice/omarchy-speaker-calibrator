@@ -156,6 +156,10 @@ Panel {
     if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
     return parts.join("  ·  ")
   }
+  function currentOutputName() {
+    return service.status.defaultSinkDescription
+      || service.status.defaultSink || "another output"
+  }
   // What the two microphones say, in words rather than decibels.
   function microphoneComparisonText() {
     var comparison = service.micComparison
@@ -277,8 +281,12 @@ Panel {
   }
   function heroMeta() {
     if (service.busy) return service.message
-    if (!service.status.enabled)
+    if (!service.status.enabled) {
+      // The commonest reason is the simplest: the sound went somewhere else.
+      if (service.status.profile && service.status.service === "active")
+        return "Playing to " + root.currentOutputName() + " — not through the calibration"
       return service.status.profile ? "Calibration stopped" : "Not calibrated yet"
+    }
     if (service.status.bypass) return "Calibration off — hearing the plain speakers"
     var summary = service.playingSummary()
     var label = summary && summary.bass !== undefined
@@ -989,6 +997,41 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
+              }
+            }
+
+            // Headphones or a speaker taking the default output is the
+            // usual reason the calibration is not in the path.  Nothing has
+            // failed, so say so plainly and offer the way back rather than
+            // letting the switch disappear without explanation.
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: !service.status.enabled
+                && !!service.status.profile
+                && service.status.service === "active"
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: "Sound is going to " + root.currentOutputName()
+                  + ", so the calibration is not in the path. It is still installed and "
+                  + "nothing has been lost; it only applies to the speakers it measured."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Button {
+                width: parent.width
+                bordered: true
+                iconText: "󰓃"
+                text: "Play through the calibrated speakers"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.useCalibratedOutput()
               }
             }
 

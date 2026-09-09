@@ -922,6 +922,35 @@ def backup(path):
         shutil.copy2(path, destination)
 
 
+def sink_description(name):
+    """A readable name for any output, including ones this never calibrates.
+
+    Bluetooth and HDMI outputs are not candidates for a calibration, so they
+    are absent from the device list, but the panel still has to be able to say
+    where the sound went.
+    """
+    if not name:
+        return None
+    for item in pactl_json("sinks"):
+        if item.get("name") == name:
+            return item.get("description") or name
+    return name
+
+
+def use_calibrated_output():
+    """Send the sound back through the calibration.
+
+    Plugging in headphones or connecting a speaker moves the default output,
+    which takes the filter out of the path.  Nothing is broken when that
+    happens and nothing is changed behind the user's back; this is the way
+    back, asked for.
+    """
+    if not any(item.get("name") == VIRTUAL_SINK for item in pactl_json("sinks")):
+        raise SystemExit("The calibrated output is not running; install a calibration first.")
+    move_apps(VIRTUAL_SINK)
+    return {**status_payload(), "message": "Sound is going through the calibration again."}
+
+
 def move_apps(target):
     run(["pactl", "set-default-sink", target])
     for stream in pactl_json("sink-inputs"):
@@ -2055,6 +2084,8 @@ def status_payload():
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
     compare = compare_payload()
     payload = {"service": active or "inactive", "defaultSink": default or "unknown",
+            "defaultSinkDescription": short_label(sink_description(default)) or default,
+            "calibratedSink": VIRTUAL_SINK,
             "profile": profile, "proposal": proposal,
             "enabled": active == "active" and default == VIRTUAL_SINK,
             "bypass": compare["bypass"],
@@ -2228,7 +2259,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     for name in ("wizard", "status", "status-json", "status-cache-json",
-                 "microphone-comparison-json",
+                 "microphone-comparison-json", "use-calibrated-output",
                  "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
@@ -2268,6 +2299,8 @@ def main():
         print(json.dumps(status_payload()))
     elif command == "status-cache-json":
         print(json.dumps(cached_status()))
+    elif command == "use-calibrated-output":
+        print(json.dumps(use_calibrated_output()))
     elif command == "microphone-comparison-json":
         print(json.dumps(microphone_comparison()))
     elif command == "calibrate-json":
