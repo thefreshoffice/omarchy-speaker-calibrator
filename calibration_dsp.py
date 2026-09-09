@@ -1144,6 +1144,12 @@ class LevelSearchPolicy:
     # Backing off after clipping is deliberately coarse: once samples have
     # been flattened the true peak is unknown.
     clip_step_db: float = 12.0
+    # A probe that clipped proves its own peak reached full scale, so any
+    # level within this much of it must overshoot the target as well.
+    clip_ceiling_margin_db: float = 6.0
+    # A probe that clipped proves its own peak reached full scale, so any
+    # level within this much of it must overshoot the target as well.
+    clip_ceiling_margin_db: float = 6.0
     # Stepping up when nothing was heard is equally coarse.
     blind_step_db: float = 12.0
     # Room sound recorded before the probe starts.  Music, a call, or typing
@@ -1168,15 +1174,21 @@ def analyse_level_probe(
 
     The recorder starts ``background_seconds`` or more before the probe plays,
     so the opening of the recording is room sound alone and is reported as
-    background.  Everything after it is the probe region.  Peak, noise, and
+    background.  Everything after it is the probe region.  Noise and
     prominence come from short RMS blocks, so a late recorder start or an
-    early stop cannot masquerade as a quiet speaker.  The sweep peak is taken
-    only from tonal blocks, where the peak sits within 12 dB of the block RMS
-    as it does for a sine, so a keyboard click or a pop cannot set it; such
-    transients are reported separately.  Peak and clipping span every supplied
-    channel, because one clipped microphone channel spoils the measurement,
-    while noise and prominence use the best channel, because one working
-    microphone is enough to plan the level.
+    early stop cannot masquerade as a quiet speaker.
+
+    The steering peak is the second-highest block peak of the probe region.
+    Using the highest sample would let one keyboard click drive the whole
+    measurement down; using only the tonal blocks, as an earlier version did,
+    ignored the sweep's own start and stop transients, which sit well above
+    the tone and are what actually clips.  The second-highest block keeps
+    anything that recurs, including those transients, and discards a lone
+    click.  The tonal and transient peaks are reported separately for
+    diagnosis.  Peak and clipping span every supplied channel, because one
+    clipped microphone channel spoils the measurement, while noise and
+    prominence use the best channel, because one working microphone is enough
+    to plan the level.
     """
     values = np.asarray(captures, dtype=np.float64)
     if values.ndim == 1:
@@ -1203,14 +1215,14 @@ def analyse_level_probe(
 
     crest_db = 20.0 * np.log10(region_peak / np.maximum(region_rms, 1e-12))
     tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
-    if np.any(tonal):
-        peak = float(np.max(region_peak[tonal]))
-    else:
-        peak = float(np.max(region_peak))
+    tonal_peak = float(np.max(region_peak[tonal])) if np.any(tonal) else 0.0
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
+    loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]
+    peak = float(loudest_blocks[1] if loudest_blocks.size >= 4 else loudest_blocks[0])
     region = values[background_blocks * block:usable]
     return {
         "peak_dbfs": round(dbfs(peak), 3),
+        "tonal_peak_dbfs": round(dbfs(tonal_peak), 3),
         "noise_dbfs": round(dbfs(float(noise[best])), 3),
         "prominence_db": round(float(prominences[best]), 3),
         "clipped_samples": int(np.count_nonzero(np.abs(region) >= 0.999)),
@@ -1294,12 +1306,13 @@ def search_measurement_level(
     the peak stops following the level, because no level can rescue either.
     """
     low, high = float(bounds[0]), float(bounds[1])
+    ceiling = high
     level = float(np.clip(start_level_dbfs, low, high))
     trace: list[dict] = []
     plan = {"level_dbfs": level, "done": False, "status": "not-run"}
     for _ in range(max(1, int(attempts))):
         probe = run_probe(level)
-        plan = plan_probe_level(level, probe, (low, high), policy)
+        plan = plan_probe_level(level, probe, (low, ceiling), policy)
         entry = {"level_dbfs": round(level, 2), **probe, "status": plan["status"]}
         if trace and not plan["done"] and not _peak_follows_level(trace[-1], entry, policy):
             plan = {
@@ -1309,13 +1322,34 @@ def search_measurement_level(
             }
             entry["status"] = plan["status"]
         trace.append(entry)
-        level = float(plan["level_dbfs"])
+        if probe["clipped_samples"] > 0:
+            # This level reached full scale, so the target cannot be met at it
+            # or anywhere near it.  Nothing later may climb back up here.
+            ceiling = max(low, min(ceiling, level - policy.clip_ceiling_margin_db))
+        level = float(np.clip(plan["level_dbfs"], low, ceiling))
         if plan["done"]:
             break
     status = plan["status"]
+    if not plan["done"]:
+        # The search ran out of probes.  Its last proposal was never played,
+        # and proposing is exactly what went wrong, so fall back to the best
+        # level that was actually measured.
+        clean = [
+            item for item in trace
+            if item["clipped_samples"] == 0
+            and item["prominence_db"] >= policy.minimum_prominence_db
+        ]
+        if clean:
+            best = min(clean, key=lambda item: abs(item["peak_dbfs"] - policy.target_peak_dbfs))
+            level = float(best["level_dbfs"])
+            status = "best-tested"
+        else:
+            level = low
+            status = "unsettled"
     return {
         "target_peak_dbfs": policy.target_peak_dbfs,
         "level_bounds_dbfs": [round(low, 2), round(high, 2)],
+        "level_ceiling_dbfs": round(ceiling, 2),
         "selected_level_dbfs": round(level, 2),
         "status": status,
         "confirmed": status == "converged" or status.startswith("limited-by"),
@@ -1326,6 +1360,22 @@ def search_measurement_level(
 # A search that ends in one of these states cannot produce a usable
 # measurement at any level, so the caller should stop and show the advice.
 LEVEL_SEARCH_ABORT_STATUSES = ("no-signal", "background-too-loud", "level-independent")
+
+
+def level_after_clipping(
+    level_dbfs: float,
+    peak_dbfs: float,
+    low_bound_dbfs: float,
+    policy: LevelSearchPolicy = LevelSearchPolicy(),
+) -> float:
+    """A level to retry a capture at after the microphone clipped.
+
+    A clipped capture only proves the peak reached full scale, never how far
+    past it went, so the retry drops by the shortfall to the target plus the
+    same margin a clipped probe imposes.
+    """
+    overshoot = max(0.0, float(peak_dbfs) - policy.target_peak_dbfs)
+    return float(max(low_bound_dbfs, level_dbfs - max(policy.clip_ceiling_margin_db, overshoot)))
 
 
 def level_search_advice(search: dict) -> tuple[list[str], list[str]]:
@@ -1358,13 +1408,24 @@ def level_search_advice(search: dict) -> tuple[list[str], list[str]]:
              "with a low microphone signal."],
             ["Raise the speaker hardware volume or the microphone input gain, then measure again."],
         )
+    if status == "retried-after-clipping":
+        return (
+            [f"The first capture clipped, so it was measured again at {level:+.1f} dBFS."],
+            [],
+        )
     if status in ("limited-by-minimum-level", "clipping-at-minimum-level"):
         return (
             [f"The level search stopped at the quietest allowed sweep level ({level:+.1f} dBFS) "
              "with a hot microphone signal."],
             ["Lower the microphone input gain or the speaker hardware volume, then measure again."],
         )
-    if status in ("adjusting", "clipped", "not-heard"):
+    if status == "best-tested":
+        return (
+            [f"The level search did not settle, so the best level it actually "
+             f"measured ({level:+.1f} dBFS) was used."],
+            ["Keep the room quiet during the level check for a closer level."],
+        )
+    if status in ("adjusting", "clipped", "not-heard", "unsettled"):
         return (
             [f"The level search did not settle; the sweeps used {level:+.1f} dBFS unconfirmed."],
             ["Disable microphone automatic gain control and keep the room quiet, then measure again."],

@@ -180,6 +180,16 @@ variants can be compared by ear.
 The built-in microphone is useful for a rough first profile. A measurement mic
 placed on-axis at normal listening distance is recommended for final tuning.
 
+### Always measured raw
+
+A calibration measures the bare speakers. The sweeps are played straight at the
+physical output, which bypasses the filter chain, and the running filter is
+flattened for the duration as well, so the measurement is of the raw speakers
+even if the stream were routed through the correction. The calibrated sink is
+never offered as a measurement target, and a saved capture records whether it
+was taken raw; one taken through the correction cannot be refitted. Only the
+check below deliberately measures through the correction.
+
 ### Checking the result
 
 **Check the calibration** in Advanced measures a second time, this time through

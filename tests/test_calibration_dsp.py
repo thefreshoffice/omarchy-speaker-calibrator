@@ -21,6 +21,7 @@ from calibration_dsp import (  # noqa: E402
     analyse_level_probe,
     build_measurement_signal,
     combine_microphone_measurements,
+    level_after_clipping,
     level_search_advice,
     parse_mic_calibration,
     plan_probe_level,
@@ -382,8 +383,28 @@ class LevelSearchTests(unittest.TestCase):
 
     def test_probe_ignores_an_isolated_click_for_the_sweep_peak(self):
         probe = analyse_level_probe(self.probe_capture(0.1, click=0.9), self.rate)
+        # The click owns the loudest block, so the second-loudest one, which
+        # is the sweep itself, sets the level.
         self.assertAlmostEqual(probe["peak_dbfs"], -20.0, delta=0.3)
+        self.assertAlmostEqual(probe["tonal_peak_dbfs"], -20.0, delta=0.3)
         self.assertGreater(probe["transient_peak_dbfs"], -2.0)
+
+    def test_probe_steers_on_a_peak_that_recurs(self):
+        """A real sweep's edges tower over its tone; those must set the level."""
+        rng = np.random.default_rng(3)
+        frames = int(1.2 * self.rate)
+        capture = rng.normal(0.0, 1e-4, (frames, 1))
+        t = np.arange(int(0.5 * self.rate)) / self.rate
+        start = int(0.4 * self.rate)
+        capture[start:start + t.size, 0] += 0.05 * np.sin(2.0 * np.pi * 440.0 * t)
+        # Two loud bursts in blocks of their own: a peak that recurs, unlike
+        # the single click in the test above.
+        for edge in (int(0.35 * self.rate), int(0.95 * self.rate)):
+            capture[edge:edge + 40, 0] += 0.4
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertAlmostEqual(probe["peak_dbfs"], 20 * np.log10(0.4), delta=0.5)
+        # Steering on the tone alone would have run the measurement 18 dB hot.
+        self.assertGreater(probe["peak_dbfs"], 20 * np.log10(0.05) + 10.0)
 
     def test_probe_measures_room_sound_before_the_probe(self):
         probe = analyse_level_probe(self.probe_capture(0.3, background=0.05), self.rate)
@@ -525,6 +546,59 @@ class LevelSearchTests(unittest.TestCase):
         warnings, guidance = level_search_advice(search)
         self.assertTrue(any("-22.0 dBFS" in item for item in warnings))
         self.assertTrue(any("Pause other audio" in item for item in guidance))
+
+    def clipping_microphone(self, clip_above_dbfs, *, gain_db=20.0):
+        """A path that clips hard above a level the probe cannot see coming."""
+        def run_probe(level_dbfs):
+            clipped = level_dbfs >= clip_above_dbfs
+            peak = 0.0 if clipped else min(0.0, level_dbfs + gain_db)
+            return {
+                "peak_dbfs": peak,
+                "noise_dbfs": -75.0,
+                "prominence_db": max(0.0, peak + 72.0),
+                "clipped_samples": 40 if clipped else 0,
+                "background_rms_dbfs": -70.0,
+                "background_peak_dbfs": -60.0,
+                "transient_peak_dbfs": peak,
+                "tonal_blocks": 16,
+            }
+        return run_probe
+
+    def test_a_level_that_clipped_becomes_a_ceiling(self):
+        search = search_measurement_level(
+            self.clipping_microphone(-20.0), start_level_dbfs=-18.0,
+            bounds=(-40.0, -6.0), attempts=4,
+        )
+        clipped = [item["level_dbfs"] for item in search["attempts"]
+                   if item["clipped_samples"] > 0]
+        self.assertTrue(clipped)
+        # Nothing tried after the first clip may return to that level.
+        first = clipped[0]
+        later = [item["level_dbfs"] for item in search["attempts"][1:]]
+        self.assertTrue(all(level <= first - 6.0 + 1e-9 for level in later), search["attempts"])
+        self.assertLessEqual(search["selected_level_dbfs"], first - 6.0 + 1e-9)
+        self.assertLessEqual(search["level_ceiling_dbfs"], first - 6.0 + 1e-9)
+
+    def test_an_unsettled_search_uses_a_level_it_actually_measured(self):
+        # Two probes is never enough to converge from this far away.
+        search = search_measurement_level(
+            self.fake_microphone(8.0), start_level_dbfs=-36.0,
+            bounds=(-36.0, -6.0), attempts=1,
+        )
+        self.assertEqual(search["status"], "best-tested")
+        self.assertFalse(search["confirmed"])
+        tested = [item["level_dbfs"] for item in search["attempts"]]
+        self.assertIn(search["selected_level_dbfs"], tested)
+        warnings, guidance = level_search_advice(search)
+        self.assertTrue(any("actually measured" in item for item in warnings))
+
+    def test_retry_level_drops_by_the_overshoot(self):
+        # A capture that peaked at full scale with a -6 dBFS target is 6 dB hot.
+        self.assertAlmostEqual(level_after_clipping(-18.0, 0.0, -40.0), -24.0)
+        # A worse overshoot backs off further.
+        self.assertAlmostEqual(level_after_clipping(-18.0, 4.0, -40.0), -28.0)
+        # Never below the bound the search was given.
+        self.assertAlmostEqual(level_after_clipping(-38.0, 0.0, -40.0), -40.0)
 
     def test_search_honours_a_custom_policy(self):
         policy = LevelSearchPolicy(target_peak_dbfs=-12.0)

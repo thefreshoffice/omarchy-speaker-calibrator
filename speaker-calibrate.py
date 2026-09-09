@@ -2,6 +2,7 @@
 """Guided, measurement-gated PipeWire speaker calibration for Omarchy."""
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -22,6 +23,7 @@ from calibration_dsp import (
     analyse_level_probe,
     build_measurement_signal,
     combine_microphone_measurements,
+    level_after_clipping,
     level_search_advice,
     parse_mic_calibration,
     read_pcm16_wave_channels,
@@ -45,7 +47,7 @@ LEVEL_PROBE_SPEC = dict(
 # pw-record's start-up time, so the opening of every recording is room sound.
 LEVEL_PROBE_LEAD_SECONDS = 0.8
 LEVEL_PROBE_TAIL_SECONDS = 0.25
-LEVEL_SEARCH_ATTEMPTS = 3
+LEVEL_SEARCH_ATTEMPTS = 4
 LEVEL_SEARCH_START_OFFSET_DB = -12.0
 LEVEL_SEARCH_BOUNDS_DB = (-24.0, 6.0)
 
@@ -119,9 +121,14 @@ def pactl_json(kind):
     return json.loads(proc.stdout)
 
 
+def is_physical_sink(name):
+    """True for a real output device, never the calibrated sink in front of one."""
+    return str(name).startswith("alsa_output.") and str(name) != VIRTUAL_SINK
+
+
 def physical_sinks():
-    return [item for item in pactl_json("sinks")
-            if item.get("name", "").startswith("alsa_output.")]
+    """Only real outputs are offered, so a calibration cannot measure itself."""
+    return [item for item in pactl_json("sinks") if is_physical_sink(item.get("name", ""))]
 
 
 def microphones():
@@ -496,6 +503,35 @@ def activate_profile(profile):
     return "restart"
 
 
+@contextlib.contextmanager
+def correction_silenced():
+    """Flatten the running filter while the raw speakers are measured.
+
+    Sweeps are played straight at the physical device, which already bypasses
+    the filter chain, but that relies on the stream landing where it was
+    aimed.  Flattening the filter as well makes a calibration measure the bare
+    speakers even if the stream is routed through the correction, so a profile
+    can never be fitted to a sound that was already corrected.  The previous
+    control values are restored afterwards, without restarting the tuning.
+    """
+    node_id = tuning_node_id() if service_active() else None
+    if node_id is None or compare_state()["bypass"]:
+        yield False
+        return
+    wanted = set(transparent_controls())
+    live = live_controls(node_id)
+    saved = {name: value for name, value in live.items() if name in wanted}
+    if len(saved) != len(wanted) or not apply_controls_live(transparent_controls()):
+        # The filter could not be flattened, so leave it alone and rely on the
+        # stream target; the measurement records that this happened.
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        apply_controls_live(saved)
+
+
 def playing_profile():
     """The profile that should be audible now, per the compare state."""
     state = compare_state()
@@ -737,21 +773,37 @@ def capture_measurement(
     )
     sweeps = sweeps or DATA / "calibration-sweeps.wav"
     recording = recording or DATA / "measurement.wav"
-    measurement_spec = SweepSpec(level_dbfs=level_search["selected_level_dbfs"])
-    program, schedule = build_measurement_signal(measurement_spec)
-    write_pcm16_wave(sweeps, program, RATE)
-    record_while_playing(
-        sink_name, mic_name, channels, sweeps, recording, RECORD_LEAD_SECONDS, 0.75
-    )
     calibration = parse_mic_calibration(mic_cal_file)
-    measurement = analyze_recording(
-        recording,
-        channel,
-        schedule,
-        measurement_spec,
-        internal_mic=mic_name.startswith("alsa_input.pci-"),
-        calibration=calibration,
-    )
+    level = level_search["selected_level_dbfs"]
+    # The probe is a fraction of the length of the real sweep, so a resonance
+    # has less time to ring up during it.  If the full capture clips anyway,
+    # one quieter retry costs less than a rejected measurement.
+    for attempt in range(2):
+        measurement_spec = SweepSpec(level_dbfs=level)
+        program, schedule = build_measurement_signal(measurement_spec)
+        write_pcm16_wave(sweeps, program, RATE)
+        record_while_playing(
+            sink_name, mic_name, channels, sweeps, recording, RECORD_LEAD_SECONDS, 0.75
+        )
+        measurement = analyze_recording(
+            recording,
+            channel,
+            schedule,
+            measurement_spec,
+            internal_mic=mic_name.startswith("alsa_input.pci-"),
+            calibration=calibration,
+        )
+        metrics = measurement["quality"]["metrics"]
+        if metrics["clipped_samples"] == 0 or attempt == 1:
+            break
+        retry = level_after_clipping(
+            level, metrics["maximum_accepted_peak_dbfs"], level_search["level_bounds_dbfs"][0]
+        )
+        if retry >= level:
+            break
+        level_search = dict(level_search, selected_level_dbfs=round(retry, 2),
+                            status="retried-after-clipping", confirmed=False)
+        level = retry
     attach_level_search(measurement, level_search)
     return measurement
 
@@ -828,9 +880,20 @@ def profile_from_measurement(
 def build_profile(
     sink, mic, channel, voicing, mic_cal_file=None, loudness="protected", bass="normal"
 ):
-    measurement = capture_measurement(
-        sink["name"], mic["name"], channel, mic_cal_file
-    )
+    if not is_physical_sink(sink["name"]):
+        raise SystemExit(
+            "A calibration must measure a real speaker output, never the calibrated "
+            "one, or the correction would be fitted on top of itself."
+        )
+    with correction_silenced() as silenced:
+        measurement = capture_measurement(
+            sink["name"], mic["name"], channel, mic_cal_file
+        )
+    measurement["measured_through"] = {
+        "sink": sink["name"],
+        "corrected": False,
+        "correction_silenced_during_measurement": bool(silenced),
+    }
     return profile_from_measurement(
         sink, mic, channel, voicing, measurement, loudness, bass
     )
@@ -850,6 +913,11 @@ def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, 
     # The saved capture was recorded at whatever level the search chose, so
     # the level must come from the saved measurement, not from the sink type.
     previous_measurement = previous.get("measurement", {})
+    if (previous_measurement.get("measured_through") or {}).get("corrected"):
+        raise SystemExit(
+            "The saved capture was recorded through the correction, so it cannot be "
+            "refitted. Calibrate again."
+        )
     saved_level = previous_measurement.get("sweep", {}).get("level_dbfs")
     measurement_spec = SweepSpec(
         level_dbfs=float(saved_level) if saved_level is not None
@@ -965,12 +1033,14 @@ def verify_calibration(channel_override=None):
         channel_override if channel_override is not None else mic.get("channel", 0)
     )
     calibration_file = mic.get("calibration_file")
+    # The one measurement that is deliberately made through the correction.
     measurement = capture_measurement(
         VIRTUAL_SINK, mic["name"], channel, calibration_file,
         # The level default belongs to the real speakers behind the filter.
         level_sink=profile["speaker"]["name"],
         sweeps=VERIFICATION_SWEEPS, recording=VERIFICATION_RECORDING,
     )
+    measurement["measured_through"] = {"sink": VIRTUAL_SINK, "corrected": True}
     quality = measurement["quality"]
     channels = measurement.get("channels", [])
     snr = (

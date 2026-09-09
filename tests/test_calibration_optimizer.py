@@ -617,5 +617,63 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(report["analysis_band_hz"][0], 400.0)
 
 
+class RawMeasurementTests(unittest.TestCase):
+    def test_only_real_outputs_may_be_calibrated(self):
+        self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
+        self.assertFalse(speaker_calibrate.is_physical_sink(speaker_calibrate.VIRTUAL_SINK))
+        self.assertFalse(speaker_calibrate.is_physical_sink("omarchy_speaker_tuning_output"))
+        self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.AA_BB"))
+
+    def test_calibrating_the_calibrated_sink_is_refused(self):
+        with self.assertRaises(SystemExit) as raised:
+            speaker_calibrate.build_profile(
+                {"name": speaker_calibrate.VIRTUAL_SINK}, {"name": "alsa_input.x"}, 0, "warm"
+            )
+        self.assertIn("never the calibrated one", str(raised.exception))
+
+    def test_the_filter_is_flattened_and_restored_around_a_measurement(self):
+        module = speaker_calibrate
+        saved = {name: getattr(module, name) for name in (
+            "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
+            "compare_state",
+        )}
+        installed = module.graph_controls({
+            "filters": [{"type": "peaking", "frequency_hz": 800.0, "q": 1.0, "gain_db": -6.0}],
+            "input_gain_linear": 0.9,
+        })
+        applied = []
+        try:
+            module.service_active = lambda: True
+            module.tuning_node_id = lambda: 42
+            module.compare_state = lambda: {"active": "current", "bypass": False}
+            module.live_controls = lambda node_id: dict(installed, **{"limiter:grgv_l": 1.0})
+            module.apply_controls_live = lambda controls: applied.append(dict(controls)) or True
+            with module.correction_silenced() as silenced:
+                self.assertTrue(silenced)
+                self.assertEqual(applied[-1]["p1_l:Gain"], 0.0)
+                self.assertEqual(applied[-1]["limiter:g_in"], 1.0)
+        finally:
+            for name, value in saved.items():
+                setattr(module, name, value)
+        self.assertEqual(len(applied), 2)
+        # Restored exactly, and never the read-only meter that was in the readback.
+        self.assertEqual(applied[-1], installed)
+        self.assertNotIn("limiter:grgv_l", applied[-1])
+
+    def test_nothing_is_touched_when_the_tuning_is_not_running(self):
+        module = speaker_calibrate
+        saved = {"service_active": module.service_active, "apply_controls_live": module.apply_controls_live}
+        touched = []
+        try:
+            module.service_active = lambda: False
+            module.apply_controls_live = lambda controls: touched.append(controls) or True
+            with module.correction_silenced() as silenced:
+                self.assertFalse(silenced)
+        finally:
+            for name, value in saved.items():
+                setattr(module, name, value)
+        self.assertEqual(touched, [])
+
+
 if __name__ == "__main__":
     unittest.main()
