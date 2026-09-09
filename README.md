@@ -483,6 +483,25 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 - Multi-microphone disagreement increases optimizer uncertainty and therefore
   suppresses risky boosts.
 
+### Comparing the two microphones
+
+**Advanced** keeps the last measurement from each kind of microphone and draws
+them on one set of axes: the built-in array in the dim line, a USB measuring
+microphone in the bright one. Both are levelled on the 250 Hz–1 kHz band first,
+so what you see is the difference in *shape* rather than in sensitivity, and
+the difference is also read out by band underneath.
+
+This is the honest answer to "is an external microphone worth it". A built-in
+array sits inside the case, inches from one driver and behind whatever the lid
+is made of; a measuring microphone sits where your head is. Where the two
+curves disagree, the built-in one is describing its own position rather than
+the sound that reaches you, and that gap is what the calibration would
+otherwise have corrected for.
+
+Only the curve is kept, a few kilobytes, never the recording. Measuring again
+with the same kind of microphone replaces that slot and leaves the other one
+alone, so the comparison survives recalibration.
+
 ## What leaves your machine
 
 Nothing. The plugin makes no network requests of any kind: there is no API, no

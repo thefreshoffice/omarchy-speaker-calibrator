@@ -140,6 +140,91 @@ Panel {
       + "Nobody has checked it for you. You can read it first at "
       + "aur.archlinux.org/packages/" + name + "."
   }
+  // What the two microphones say, in words rather than decibels.
+  function microphoneComparisonText() {
+    var comparison = service.micComparison
+    if (!comparison) return "Reading the stored measurements…"
+    var haveInternal = !!comparison.internal
+    var haveExternal = !!comparison.external
+    if (!haveInternal && !haveExternal)
+      return "Nothing measured yet. Calibrate once and the measurement is kept here."
+    if (!haveExternal)
+      return "Only the built-in microphone has measured so far. Measure again with a "
+        + "USB measuring microphone placed where you listen, and both curves appear "
+        + "here together."
+    if (!haveInternal)
+      return "Only the measuring microphone has measured so far. Measure again with "
+        + "the built-in microphones and both curves appear here together."
+    var worst = comparison.worst
+    if (!worst) return "Both measurements are stored."
+    var amount = Math.abs(Number(worst.difference_db)).toFixed(1)
+    var direction = Number(worst.difference_db) > 0 ? "more" : "less"
+    return "The built-in microphones read " + amount + " dB " + direction + " "
+      + worst.band + " than the measuring microphone, and differ by "
+      + Number(comparison.rms_difference_db).toFixed(1) + " dB overall. That gap is "
+      + "the microphone, not the speakers: the built-in ones sit inside the case, "
+      + "inches from one driver, while the measuring one sits where you listen."
+  }
+  // Draw both measured curves on one set of axes, shape only.
+  function paintMicrophones(canvas, comparison) {
+    var context = canvas.getContext("2d")
+    context.clearRect(0, 0, canvas.width, canvas.height)
+    if (!comparison) return
+    var padLeft = 34, padRight = 8, padTop = 8, padBottom = 20
+    var plotWidth = canvas.width - padLeft - padRight
+    var plotHeight = canvas.height - padTop - padBottom
+    var minFrequency = 80, maxFrequency = 16000, minDb = -18, maxDb = 12
+    function xFor(frequency) {
+      return padLeft + (Math.log(frequency / minFrequency)
+        / Math.log(maxFrequency / minFrequency)) * plotWidth
+    }
+    function yFor(value) {
+      return padTop + ((maxDb - Math.max(minDb, Math.min(maxDb, value)))
+        / (maxDb - minDb)) * plotHeight
+    }
+    context.lineWidth = 1
+    context.strokeStyle = root.dim
+    context.fillStyle = root.dim
+    context.font = "9px " + root.fontFamily
+    var decades = [100, 200, 500, 1000, 2000, 5000, 10000]
+    for (var d = 0; d < decades.length; d++) {
+      var gx = xFor(decades[d])
+      context.globalAlpha = 0.25
+      context.beginPath(); context.moveTo(gx, padTop)
+      context.lineTo(gx, padTop + plotHeight); context.stroke()
+      context.globalAlpha = 1
+      context.fillText(decades[d] >= 1000 ? (decades[d] / 1000) + "k" : String(decades[d]),
+                       gx - 8, canvas.height - 6)
+    }
+    for (var level = minDb; level <= maxDb; level += 6) {
+      var gy = yFor(level)
+      context.globalAlpha = level === 0 ? 0.5 : 0.2
+      context.beginPath(); context.moveTo(padLeft, gy)
+      context.lineTo(padLeft + plotWidth, gy); context.stroke()
+      context.globalAlpha = 1
+      context.fillText((level > 0 ? "+" : "") + level, 4, gy + 3)
+    }
+    function trace(record, colour, width) {
+      if (!record) return
+      var frequencies = record.frequency_hz || []
+      var response = record.response_db || []
+      var count = Math.min(frequencies.length, response.length)
+      if (count < 2) return
+      context.strokeStyle = colour
+      context.lineWidth = width
+      context.beginPath()
+      var started = false
+      for (var i = 0; i < count; i++) {
+        var frequency = Number(frequencies[i])
+        if (frequency < minFrequency || frequency > maxFrequency) continue
+        var px = xFor(frequency), py = yFor(Number(response[i]))
+        if (!started) { context.moveTo(px, py); started = true } else context.lineTo(px, py)
+      }
+      context.stroke()
+    }
+    trace(comparison.internal, root.dim, 1.5)
+    trace(comparison.external, bar && bar.accent ? bar.accent : Color.accent, 2)
+  }
   // Switching the correction off also drops the level to the one the
   // correction plays at, so the two can be judged on tone alone.
   function bypassMatchText() {
@@ -1067,7 +1152,10 @@ Panel {
             checked: root.advanced
             foreground: root.foreground
             fontFamily: root.fontFamily
-            onClicked: root.advanced = !root.advanced
+            onClicked: {
+              root.advanced = !root.advanced
+              if (root.advanced && !service.micComparison) service.loadMicrophones()
+            }
           }
 
           Column {
@@ -1179,6 +1267,77 @@ Panel {
             }
 
             // ---------------------------------------------------------- actions
+            PanelSeparator { foreground: root.foreground }
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader {
+              text: "MICROPHONES — WHAT EACH ONE MEASURED"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Canvas {
+                id: microphoneCanvas
+                width: parent.width
+                height: Style.space(150)
+                antialiasing: true
+                visible: !!(service.micComparison
+                  && (service.micComparison.internal || service.micComparison.external))
+                onPaint: root.paintMicrophones(microphoneCanvas, service.micComparison)
+                onVisibleChanged: if (visible) requestPaint()
+              }
+
+              // Which line is which, without a floating legend to misread.
+              Row {
+                width: parent.width
+                spacing: Style.space(12)
+                visible: microphoneCanvas.visible
+                Text {
+                  textFormat: Text.PlainText
+                  text: "—  built-in"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: "—  measuring microphone"
+                  color: bar && bar.accent ? bar.accent : Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: root.microphoneComparisonText()
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Column {
+                width: parent.width
+                spacing: Style.space(3)
+                visible: !!(service.micComparison && service.micComparison.available)
+                Repeater {
+                  model: service.micComparison ? (service.micComparison.bands || []) : []
+                  DetailRow {
+                    width: parent.width
+                    key: modelData.band
+                    value: (Number(modelData.difference_db) > 0 ? "+" : "")
+                      + Number(modelData.difference_db).toFixed(1)
+                      + " dB on the built-in microphones"
+                  }
+                }
+              }
+            }
+
             PanelSeparator { foreground: root.foreground }
             PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
 

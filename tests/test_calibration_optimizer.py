@@ -1340,6 +1340,60 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(controls["loudcomp:input"], 1.0)
 
 
+class MicrophoneComparisonTests(unittest.TestCase):
+    """Two microphones, put side by side by shape rather than by level."""
+
+    def _compare(self, directory):
+        """Run the comparison against this directory and nothing else.
+
+        The profiles are pinned away as well: the backfill reads them, and a
+        test that quietly depends on whatever the developer last measured is
+        not a test.
+        """
+        saved = (speaker_calibrate.MICROPHONE_ARCHIVE,
+                 speaker_calibrate.PROFILE, speaker_calibrate.PREVIOUS_PROFILE)
+        speaker_calibrate.MICROPHONE_ARCHIVE = directory
+        speaker_calibrate.PROFILE = directory / "no-such-profile.json"
+        speaker_calibrate.PREVIOUS_PROFILE = directory / "no-such-previous.json"
+        try:
+            return speaker_calibrate.microphone_comparison()
+        finally:
+            (speaker_calibrate.MICROPHONE_ARCHIVE,
+             speaker_calibrate.PROFILE,
+             speaker_calibrate.PREVIOUS_PROFILE) = saved
+
+    def _archive(self, directory, kind, response, frequencies):
+        record = {
+            "kind": kind, "created_at": "2026-01-01T00:00:00+00:00",
+            "microphone": kind, "calibration_file": None,
+            "frequency_hz": frequencies, "response_db": response,
+            "uncertainty_db": None, "verdict": "pass", "speaker": "test",
+        }
+        (directory / f"{kind}.json").write_text(json.dumps(record))
+
+    def test_it_reports_where_the_two_disagree(self):
+        directory = Path(tempfile.mkdtemp())
+        frequencies = [100.0, 150.0, 500.0, 1000.0, 3000.0, 8000.0]
+        # The built-in reads 5 dB more bass; everything else agrees.
+        self._archive(directory, "external", [0.0] * 6, frequencies)
+        self._archive(directory, "internal", [5.0, 5.0, 0.0, 0.0, 0.0, 0.0], frequencies)
+        result = self._compare(directory)
+        self.assertTrue(result["available"])
+        bands = {entry["band"]: entry["difference_db"] for entry in result["bands"]}
+        self.assertAlmostEqual(bands["bass"], 5.0, places=2)
+        self.assertAlmostEqual(bands["midrange"], 0.0, places=2)
+        self.assertEqual(result["worst"]["band"], "bass")
+
+    def test_one_microphone_alone_is_not_a_comparison(self):
+        directory = Path(tempfile.mkdtemp())
+        self._archive(directory, "internal", [0.0, 0.0], [100.0, 1000.0])
+        result = self._compare(directory)
+        self.assertFalse(result["available"])
+        self.assertIsNotNone(result["internal"])
+        self.assertIsNone(result["external"])
+        self.assertEqual(result["bands"], [])
+
+
 class BoostBudgetTests(unittest.TestCase):
     """A boost is priced by what it asks of the speaker that was measured."""
 

@@ -94,6 +94,11 @@ VERIFICATION = DATA / "verification.json"
 # the real query has finished.  Never read back by this program: it is written
 # here and read by the panel, which then refreshes over the top of it.
 STATUS_CACHE = DATA / "status-cache.json"
+# One measurement kept per kind of microphone, so the two can be compared.
+MICROPHONE_ARCHIVE = DATA / "microphone-archive"
+# Where two microphones are compared: shape only, so a difference in
+# sensitivity between them does not read as a difference in the speakers.
+MICROPHONE_ALIGN_BAND_HZ = (250.0, 1000.0)
 VERIFICATION_SWEEPS = DATA / "verification-sweeps.wav"
 VERIFICATION_RECORDING = DATA / "verification.wav"
 SERVICE = "omarchy-speaker-tuning.service"
@@ -1469,7 +1474,139 @@ def profile_from_measurement(
         "fit": fit_payload,
     }
     write_atomic(PROPOSAL, json.dumps(profile, indent=2) + "\n")
+    archive_measurement(profile)
     return profile
+
+
+def microphone_kind(profile):
+    """Which microphone made this: the built-in array, or a measuring one."""
+    return "internal" if (profile.get("microphone") or {}).get("internal") else "external"
+
+
+def archive_measurement(profile):
+    """Keep this measurement so the two microphones can be put side by side.
+
+    Only the curve is kept, not the recording: a few kilobytes rather than
+    megabytes, and the comparison is about shape.  Each kind of microphone has
+    one slot, so measuring again with the same kind replaces it.
+    """
+    import numpy as np
+
+    measurement = profile.get("measurement") or {}
+    frequencies = measurement.get("frequency_hz") or []
+    channels = measurement.get("channels") or []
+    if len(frequencies) < 2 or not channels:
+        return None
+    responses = np.asarray(
+        [channel["response_db"] for channel in channels], dtype=float
+    )
+    # The median across speakers, so one bad channel cannot define the curve.
+    combined = np.median(responses, axis=0)
+    grid = np.asarray(frequencies, dtype=float)
+    band = ((grid >= MICROPHONE_ALIGN_BAND_HZ[0])
+            & (grid <= MICROPHONE_ALIGN_BAND_HZ[1]))
+    if np.any(band):
+        combined = combined - float(np.median(combined[band]))
+    uncertainty = np.mean(
+        np.asarray([channel.get("uncertainty_db") or [] for channel in channels],
+                   dtype=float),
+        axis=0,
+    ) if all(channel.get("uncertainty_db") for channel in channels) else None
+
+    mic = profile.get("microphone") or {}
+    record = {
+        "kind": microphone_kind(profile),
+        "created_at": profile.get("created_at"),
+        "microphone": mic.get("description"),
+        "calibration_file": mic.get("calibration_file"),
+        "frequency_hz": [round(float(value), 2) for value in grid],
+        "response_db": [round(float(value), 3) for value in combined],
+        "uncertainty_db": ([round(float(value), 3) for value in uncertainty]
+                           if uncertainty is not None else None),
+        "verdict": (profile.get("quality") or {}).get("verdict"),
+        "speaker": (profile.get("speaker") or {}).get("description"),
+    }
+    try:
+        write_atomic(MICROPHONE_ARCHIVE / f"{record['kind']}.json",
+                     json.dumps(record) + "\n")
+    except OSError:
+        return None
+    return record
+
+
+def backfill_archive():
+    """Fill an empty slot from a profile that already exists.
+
+    The archive was added after the fact, so somebody who measured before it
+    existed would otherwise have nothing to compare until they measured twice
+    more.  Only slots that are missing are written, so a real measurement is
+    never replaced by an older profile.
+    """
+    for path in (PROFILE, PREVIOUS_PROFILE):
+        profile = load_profile(path)
+        if not profile:
+            continue
+        kind = microphone_kind(profile)
+        if (MICROPHONE_ARCHIVE / f"{kind}.json").exists():
+            continue
+        archive_measurement(profile)
+
+
+def microphone_comparison():
+    """Both archived measurements, and where they disagree.
+
+    A built-in microphone sits inside the case, inches from one driver and
+    behind whatever the lid is made of; a measuring microphone sits where the
+    listener does.  Where the two disagree, the built-in one is describing its
+    own position rather than the sound arriving at the ear.
+    """
+    backfill_archive()
+    records = {}
+    for kind in ("internal", "external"):
+        try:
+            raw = read_text_bounded(MICROPHONE_ARCHIVE / f"{kind}.json")
+        except OSError:
+            raw = None
+        if raw:
+            try:
+                records[kind] = json.loads(raw)
+            except ValueError:
+                pass
+    payload = {
+        "internal": records.get("internal"),
+        "external": records.get("external"),
+        "bands": [],
+        "available": len(records) == 2,
+    }
+    if not payload["available"]:
+        return payload
+
+    import numpy as np
+
+    grid = np.asarray(records["external"]["frequency_hz"], dtype=float)
+    external = np.asarray(records["external"]["response_db"], dtype=float)
+    internal = np.interp(
+        grid,
+        np.asarray(records["internal"]["frequency_hz"], dtype=float),
+        np.asarray(records["internal"]["response_db"], dtype=float),
+    )
+    difference = internal - external
+    for label, low, high in (("bass", 80.0, 250.0), ("midrange", 250.0, 2000.0),
+                             ("presence", 2000.0, 6000.0), ("treble", 6000.0, 16000.0)):
+        window = (grid >= low) & (grid < high)
+        if not np.any(window):
+            continue
+        payload["bands"].append({
+            "band": label,
+            "low_hz": low,
+            "high_hz": high,
+            "difference_db": round(float(np.mean(difference[window])), 2),
+        })
+    worst = max(payload["bands"], key=lambda entry: abs(entry["difference_db"]),
+                default=None)
+    payload["worst"] = worst
+    payload["rms_difference_db"] = round(float(np.sqrt(np.mean(difference ** 2))), 2)
+    return payload
 
 
 def build_profile(
@@ -1766,6 +1903,33 @@ def verify_calibration(channel_override=None):
     return report
 
 
+def archived_microphones():
+    """Which kinds of microphone have a measurement kept, without the curves.
+
+    The status is read on every panel refresh, so this stays a couple of names
+    and dates; the curves themselves are asked for only when they are drawn.
+    """
+    found = {}
+    for kind in ("internal", "external"):
+        try:
+            raw = read_text_bounded(MICROPHONE_ARCHIVE / f"{kind}.json")
+        except OSError:
+            continue
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            continue
+        found[kind] = {
+            "microphone": record.get("microphone"),
+            "created_at": record.get("created_at"),
+            "verdict": record.get("verdict"),
+            "calibrated": bool(record.get("calibration_file")),
+        }
+    return found
+
+
 def cached_status():
     """The last status this plugin wrote, for drawing the panel immediately.
 
@@ -1797,7 +1961,8 @@ def status_payload():
             "bassEnhancer": bass_enhancer_state(),
             "deepBass": (profile or {}).get("deep_bass", "off"),
             "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
-            "loudnessTracker": "running" if loudness_running() else "stopped"}
+            "loudnessTracker": "running" if loudness_running() else "stopped",
+            "microphones": archived_microphones()}
     try:
         write_atomic(STATUS_CACHE, json.dumps(payload) + "\n")
     except OSError:
@@ -1960,6 +2125,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     for name in ("wizard", "status", "status-json", "status-cache-json",
+                 "microphone-comparison-json",
                  "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
@@ -1998,6 +2164,8 @@ def main():
         print(json.dumps(status_payload()))
     elif command == "status-cache-json":
         print(json.dumps(cached_status()))
+    elif command == "microphone-comparison-json":
+        print(json.dumps(microphone_comparison()))
     elif command == "calibrate-json":
         profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,

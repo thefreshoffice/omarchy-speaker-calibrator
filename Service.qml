@@ -8,6 +8,9 @@ Item {
   property var microphones: []
   property var status: ({ service: "unknown", enabled: false, profile: null, bypass: false })
   property var proposal: null
+  // Asked for only when the comparison is on screen: it carries two full
+  // curves, which have no business in every status refresh.
+  property var micComparison: null
   property bool busy: process.running
   property string phase: ""
   property string error: ""
@@ -111,6 +114,10 @@ Item {
   // process running as this user could replace with a symlink or a pipe, and
   // this is the shell.
   function loadCache() { if (!busy) start("cache", ["status-cache-json"]) }
+  // The two microphones, side by side.
+  function loadMicrophones() {
+    if (!busy) start("mics", ["microphone-comparison-json"])
+  }
   function refreshStatus() { start("status", ["status-json"]) }
   // Measure; with install=true the result is installed and played as soon as
   // it passes, so one press does the whole job.
@@ -218,6 +225,12 @@ Item {
           root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "mics") {
+          root.micComparison = JSON.parse(raw)
+          root.message = ""
+          root.phase = ""
           return
         }
         if (root.phase === "cache") {
