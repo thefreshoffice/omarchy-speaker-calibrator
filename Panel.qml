@@ -106,13 +106,7 @@ Panel {
     root.loudnessMode = profile.loudness || "protected"
     root.channelTrimMode = profile.channel_trim === "auto" ? "auto" : "off"
   }
-  // A few words beside each switch; the longer telling is below the group.
-  function deepBassHint() {
-    var addon = service.status.bassEnhancer || {}
-    if (addon.installed === true && addon.usable !== true) return "add-on not usable"
-    if (addon.usable !== true) return "needs a small add-on"
-    return "low notes from their harmonics"
-  }
+
   // One line under the Deep bass switch: what it is, or what pressing it does.
   function deepBassDescription() {
     var addon = service.status.bassEnhancer || {}
@@ -372,66 +366,7 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
-  // A switch on one line: a short name, a hint beside it, and the control at
-  // the end.  The full explanations live under the group, and only while they
-  // are still needed, so four switches cost a third of the height that four
-  // labelled blocks did.
-  component SwitchRow: BorderSurface {
-    id: switchRow
-    property string label: ""
-    property string hint: ""
-    property bool checked: false
-    signal toggled()
-    readonly property bool _hot: switchMouse.containsMouse
-    radius: Style.cornerRadius
-    implicitHeight: Math.max(Style.space(40), switchContent.implicitHeight + Style.space(12))
-    color: Style.controlFill(false, _hot && enabled, root.foreground, Color.accent)
-    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal",
-                                   root.foreground, Color.accent)
-    opacity: enabled ? 1.0 : 0.55
-    Behavior on color { ColorAnimation { duration: 100 } }
 
-    RowLayout {
-      id: switchContent
-      anchors.fill: parent
-      anchors.leftMargin: switchRow.borderLeft + Style.spacing.rowPaddingX
-      anchors.rightMargin: switchRow.borderRight + Style.spacing.rowPaddingX
-      spacing: Style.space(10)
-
-      Text {
-        textFormat: Text.PlainText
-        text: switchRow.label
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.subtitle
-        font.bold: true
-      }
-      Text {
-        Layout.fillWidth: true
-        textFormat: Text.PlainText
-        text: switchRow.hint
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-      }
-      ToggleSwitch {
-        checked: switchRow.checked
-        interactive: false
-        foreground: root.foreground
-        trackHeight: Style.space(18)
-        Layout.alignment: Qt.AlignVCenter
-      }
-    }
-
-    MouseArea {
-      id: switchMouse
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onClicked: switchRow.toggled()
-    }
-  }
 
   // A clickable row in the shell's control style: glyph, short title, and a
   // dim description.  Long option lists belong in the description, never in
@@ -851,62 +786,62 @@ Panel {
             width: parent.width
             spacing: Style.space(12)
 
-            Column {
+            Toggle {
               width: parent.width
-              spacing: Style.space(6)
-
-              SwitchRow {
-                width: parent.width
-                label: "Loudness"
-                hint: "fuller sound, more bass"
-                checked: root.bassMode === "full"
-                enabled: !service.busy
-                onToggled: {
-                  root.bassMode = root.bassMode === "full" ? "normal" : "full"
-                  root.applyOptions()
-                }
-              }
-              SwitchRow {
-                width: parent.width
-                label: "Make it louder"
-                hint: "gives back the volume the correction takes"
-                checked: root.loudnessMode !== "protected"
-                enabled: !service.busy
-                onToggled: {
-                  root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
-                  root.applyOptions()
-                }
-              }
-              SwitchRow {
-                width: parent.width
-                label: "Deep bass"
-                hint: root.deepBassHint()
-                checked: service.status.deepBass === "on"
-                  && ((service.status.bassEnhancer || {}).usable === true)
-                enabled: !service.busy
-                onToggled: service.deepBass()
-              }
-              SwitchRow {
-                visible: service.status.enabled
-                width: parent.width
-                label: "Calibration"
-                hint: service.status.bypass ? "off, you are hearing the plain speakers"
-                                            : "on, switch off to hear them as they were"
-                checked: !service.status.bypass
-                enabled: !service.busy
-                onToggled: service.bypass()
+              label: "Loudness"
+              description: "Fuller sound with more bass, like the loudness button on a stereo."
+              checked: root.bassMode === "full"
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.bassMode = root.bassMode === "full" ? "normal" : "full"
+                root.applyOptions()
               }
             }
 
-            Text {
-              visible: ((service.status.bassEnhancer || {}).usable !== true)
+            Toggle {
               width: parent.width
-              text: root.deepBassDescription()
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
+              label: "Make it louder"
+              description: "Gives back the volume the correction takes away. At full volume the limiter works harder."
+              checked: root.loudnessMode !== "protected"
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
+                root.applyOptions()
+              }
             }
+
+            Toggle {
+              width: parent.width
+              label: "Deep bass"
+              description: root.deepBassDescription()
+              checked: service.status.deepBass === "on"
+                && ((service.status.bassEnhancer || {}).usable === true)
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.deepBass()
+            }
+
+            Toggle {
+              visible: service.status.enabled
+              width: parent.width
+              label: "Calibration"
+              description: service.status.bypass
+                ? "Off — you are hearing the plain speakers"
+                : "On — switch off to hear the speakers as they were"
+              checked: !service.status.bypass
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.bypass()
+            }
+
+
+
 
             RowLayout {
               visible: root.bassWarningText() !== ""
