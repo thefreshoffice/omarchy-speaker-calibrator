@@ -25,6 +25,16 @@ from calibration_dsp import (  # noqa: E402
     snr_uncertainty_db,
 )
 
+# Re-exported so callers have one place to ask for a level, and so the panel
+# can import the arithmetic alone without loading numpy behind it.
+from calibration_levels import (  # noqa: E402,F401
+    BYPASS_MATCH_FLOOR_DB,
+    LOUDNESS_MODES,
+    MAKEUP_CAP_DB,
+    bypass_level_match_db,
+    loudness_makeup_db,
+)
+
 
 DIAGNOSTIC_CENTERS = np.asarray(
     [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
@@ -67,13 +77,6 @@ BASS_RISE = {
     "neutral": (250.0, 2.0, 3.5),
     "warm": (250.0, 2.0, 3.5),
 }
-
-# How much of the loudness lost to the cuts is added back as input gain.
-LOUDNESS_MODES = {"protected": 0.0, "balanced": 0.5, "matched": 1.0}
-# Beyond this the limiter would be working on most peaks of loud music.  With
-# the 1 dB limiter margin this also bounds the electrical drive in any band
-# to 5 dB above the uncorrected speaker, whatever else is selected.
-MAKEUP_CAP_DB = 6.0
 
 # Channel balance.  A broadband level difference between the two speakers
 # pulls the stereo image to one side, and trimming it is the one per-channel
@@ -159,36 +162,6 @@ def pink_loudness_db(
     band = (frequencies >= low_hz) & (frequencies <= high_hz)
     weighted = np.asarray(response_db, dtype=float)[band] + a_weighting_db(frequencies[band])
     return 10.0 * math.log10(float(np.mean(10.0 ** (weighted / 10.0))))
-
-
-# Comparing a correction against no correction is only meaningful when both
-# play at the same loudness; louder almost always wins otherwise.  Anything
-# past this is a sign the numbers are wrong rather than the speaker.
-BYPASS_MATCH_FLOOR_DB = -20.0
-
-
-def bypass_level_match_db(fit: dict) -> float:
-    """How far to turn the plain speakers down so a comparison is about tone.
-
-    The corrected speaker is quieter than the raw one by the loudness the cuts
-    removed, less whatever make-up was added back at the input.  Turning the
-    bypassed path down by the same amount leaves only the tone to judge.  It
-    never turns the plain speakers up: that would ask for headroom the raw
-    signal has not got.
-    """
-    loss = float(fit.get("loudness_loss_db", 0.0))
-    net = float(fit.get("net_input_gain_db", -float(fit.get("headroom_db", 1.0))))
-    return round(max(BYPASS_MATCH_FLOOR_DB, min(0.0, net - loss)), 2)
-
-
-def loudness_makeup_db(loudness_loss_db: float, loudness: str) -> float:
-    """Input gain that pays back part of the loudness the cuts removed.
-
-    The share applies to the capped loss, so "balanced" is always a real
-    step between "protected" and "matched", even when the loss is large.
-    """
-    fraction = LOUDNESS_MODES.get(loudness, 0.0)
-    return round(min(MAKEUP_CAP_DB, max(0.0, loudness_loss_db)) * fraction, 2)
 
 
 def _weighted_quantile(values: np.ndarray, weights: np.ndarray, quantile: float) -> float:

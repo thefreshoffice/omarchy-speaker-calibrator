@@ -234,22 +234,30 @@ def loudness_running():
 
 
 def ensure_loudness_unit():
-    """Write the tracker's unit only when it is missing or out of date.
+    """Register the tracker with systemd, doing nothing if it already is.
 
-    Reloading systemd costs more than everything else this does put together,
-    and the unit only changes when the plugin moves.
+    Writing the unit, reloading, and enabling it together cost more than
+    everything else a toggle does, so all three are skipped once they have
+    been done: the unit only changes when the plugin moves, and the
+    registration outlives any number of switches.
     """
     unit = loudness_unit_path()
     wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
+    fresh = True
     try:
-        if unit.read_text() == wanted:
-            return False
+        fresh = unit.read_text() != wanted
     except OSError:
         pass
-    unit.parent.mkdir(parents=True, exist_ok=True)
-    unit.write_text(wanted)
-    run(["systemctl", "--user", "daemon-reload"], check=False)
-    return True
+    if fresh:
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(wanted)
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+    enabled = run(
+        ["systemctl", "--user", "is-enabled", LOUDNESS_SERVICE], check=False, capture=True
+    ).stdout.strip()
+    if fresh or enabled != "enabled":
+        run(["systemctl", "--user", "enable", LOUDNESS_SERVICE], check=False)
+    return fresh
 
 
 def start_loudness_tracker():
@@ -259,13 +267,22 @@ def start_loudness_tracker():
     time this is called, so nothing audible is waiting on systemd.
     """
     ensure_loudness_unit()
-    run(["systemctl", "--user", "enable", LOUDNESS_SERVICE], check=False)
     run(["systemctl", "--user", "start", "--no-block", LOUDNESS_SERVICE], check=False)
 
 
 def stop_loudness_tracker():
+    """Stop the tracker but leave it registered.
+
+    The unit stays enabled between switches: unregistering costs about as long
+    as the rest of a toggle, and an enabled tracker that starts while the
+    compensation is off reads the profile and stops again on its own.
+    """
     run(["systemctl", "--user", "stop", "--no-block", LOUDNESS_SERVICE], check=False)
-    run(["systemctl", "--user", "disable", LOUDNESS_SERVICE], check=False)
+
+
+def forget_loudness_tracker():
+    """Stop the tracker and unregister it, for when the plugin is switched off."""
+    run(["systemctl", "--user", "disable", "--now", LOUDNESS_SERVICE], check=False)
 
 
 def loudness_toggle():
@@ -1019,7 +1036,9 @@ def bypass_level_match(profile):
     if "loudness_loss_db" not in fit:
         # A profile from before the loudness of a correction was measured.
         return 0.0
-    from calibration_optimizer import bypass_level_match_db
+    # From the light module rather than the optimizer: the panel asks for this
+    # on every status read, and the optimizer would load numpy to answer it.
+    from calibration_levels import bypass_level_match_db
     return bypass_level_match_db(fit)
 
 
@@ -1841,7 +1860,7 @@ def disable():
     target = profile["speaker"]["name"] if profile else None
     if target:
         move_apps(target)
-    stop_loudness_tracker()
+    forget_loudness_tracker()
     run(["systemctl", "--user", "disable", "--now", SERVICE], check=False)
     print("Speaker calibration disabled." + (f" Output restored to {target}." if target else ""))
 

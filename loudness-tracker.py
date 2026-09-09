@@ -106,6 +106,12 @@ class Tracker:
         return self.apply(volume)
 
     def run(self):
+        if not self.wanted():
+            # Started with the compensation switched off: the unit stays
+            # registered between switches, so this happens at every login that
+            # is not using it.  There is nothing to follow, so do not hold a
+            # subscription open for it.
+            return
         while self.running:
             if not self.follow_volume():
                 time.sleep(RETRY_SECONDS)

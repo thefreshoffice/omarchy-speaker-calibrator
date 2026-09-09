@@ -165,6 +165,12 @@ writes nothing but the compensator's own controls, and switches the
 compensation off when it stops, because a quiet-level curve left applied at
 high volume would be heard as far too much bass.
 
+The service stays registered with systemd between switches rather than being
+installed and removed each time, because registering it costs longer than
+switching the sound does and the toggle should be quick enough to hear the
+difference. It is only ever running while the compensation is on: started with
+the compensation off, it reads that and stops again.
+
 Two honest caveats. The compensator's volume control attenuates as well as
 selecting the curve, so the input gain cancels that and leaves the curve alone;
 the output device keeps doing the actual attenuating, which means this never
