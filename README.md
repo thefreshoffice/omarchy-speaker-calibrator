@@ -230,6 +230,11 @@ repository carries it, including Omarchy's own; otherwise it falls back to
 `omarchy pkg aur add bankstown`, which builds it from the Arch User Repository.
 Nothing needs changing here if the package later appears in a repository.
 
+While no repository carries it, the panel warns before installing that the
+package is not one of Omarchy's curated ones, that anyone can publish to the
+AUR, that it is built from source on the machine, and where to read it first.
+The warning disappears once a repository carries it or once it is installed.
+
 The two frequency limits follow the measurement rather than being fixed: the
 harmonics are made from what lies below the measured knee and kept above it,
 which is the only place the speaker can reproduce them. The generated graph

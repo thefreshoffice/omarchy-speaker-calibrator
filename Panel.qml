@@ -118,6 +118,18 @@ Panel {
       ? "On. Low notes are suggested by their harmonics, which these speakers can play."
       : "Off. Press to hear low notes suggested by their harmonics."
   }
+  // Shown before anything is installed, and only when the package would come
+  // from the AUR rather than a curated repository.
+  function bassWarningText() {
+    var addon = service.status.bassEnhancer || {}
+    if (addon.usable === true) return ""
+    if (addon.source && addon.source !== "AUR") return ""
+    var name = addon.package || "bankstown"
+    return "This add-on is not one of Omarchy's own packages. It comes from the AUR, "
+      + "where anyone can publish, and it is built from source on your machine. "
+      + "Nobody has checked it for you. You can read it first at "
+      + "aur.archlinux.org/packages/" + name + "."
+  }
   function heroMeta() {
     if (service.busy) return service.message
     if (!service.status.enabled)
@@ -834,6 +846,27 @@ Panel {
             onClicked: service.deepBass()
           }
 
+          RowLayout {
+            visible: root.bassWarningText() !== ""
+            width: parent.width
+            spacing: Style.space(8)
+            Text {
+              Layout.alignment: Qt.AlignTop
+              text: "󰀪"
+              color: bar ? bar.urgent : Color.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.icon
+            }
+            Text {
+              Layout.fillWidth: true
+              text: root.bassWarningText()
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
           Toggle {
             visible: service.status.enabled
             width: parent.width
@@ -1472,7 +1505,9 @@ Panel {
                 value: ((service.status.bassEnhancer || {}).usable === true)
                   ? "bankstown add-on installed at " + String((service.status.bassEnhancer || {}).path)
                     + "; makes harmonics from below the high-pass corner and keeps them above it"
-                  : "optional bankstown add-on, not installed; nothing in the chain depends on it"
+                  : "optional bankstown add-on, not installed; would come from "
+                    + String((service.status.bassEnhancer || {}).source || "AUR")
+                    + "; nothing in the chain depends on it"
               }
             }
           }

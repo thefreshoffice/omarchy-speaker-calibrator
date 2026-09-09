@@ -212,8 +212,12 @@ def install_bass_enhancer():
         "command": command,
         "source": repository or "AUR",
         "message": (
-            f"Installing from {repository or 'the AUR'} in a terminal window. "
+            f"Installing from the {repository} repository in a terminal window. "
             "When it finishes, switch Deep bass on again."
+            if repository else
+            "Installing from the AUR, which is not curated by Omarchy and builds from "
+            "source, in a terminal window. Read what it does before agreeing. When it "
+            "finishes, switch Deep bass on again."
         ),
     }
 
