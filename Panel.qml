@@ -146,12 +146,15 @@ Panel {
   function microphoneNote(entry) {
     var archive = (service.status.microphones || {})
     var record = entry.internal ? archive.internal : archive.external
-    if (!record) return "never measured"
-    var when = String(record.created_at || "").slice(0, 10)
+    if (!record) return "Never measured"
+    // One short line that fits: a date, whether this is the calibration
+    // playing, and a word about its quality only when there is one to say.
+    var when = Qt.formatDate(new Date(record.created_at), "d MMM yyyy")
     var active = ((service.status.profile || {}).microphone || {})
-    var inUse = active.internal === entry.internal
-    return (inUse ? "in use, measured " : "measured ") + when
-      + (record.verdict && record.verdict !== "pass" ? " (" + record.verdict + ")" : "")
+    var parts = ["Measured " + when]
+    if (active.internal === entry.internal) parts.push("the calibration in use")
+    if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
+    return parts.join("  ·  ")
   }
   // What the two microphones say, in words rather than decibels.
   function microphoneComparisonText() {
@@ -1107,21 +1110,42 @@ Panel {
             PanelSectionHeader { text: "MICROPHONE"; foreground: root.foreground; fontFamily: root.fontFamily }
             Repeater {
               model: service.microphones
-              Button {
+              // A button carries one line of text.  What this microphone has
+              // measured belongs under it, the way every other labelled
+              // control in this panel is built, not crammed into the label.
+              Column {
                 width: parent.width
-                leftAlign: true
-                bordered: true
-                selected: index === root.micIndex
-                iconText: "󰍬"
-                text: modelData.description
-                  + (modelData.internal
-                      ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
-                      : "  ·  external")
-                  + "  ·  " + root.microphoneNote(modelData)
-                foreground: root.foreground
-                fontFamily: root.fontFamily
-                enabled: !service.busy
-                onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                spacing: Style.space(2)
+
+                Button {
+                  width: parent.width
+                  leftAlign: true
+                  bordered: true
+                  selected: index === root.micIndex
+                  iconText: "󰍬"
+                  text: modelData.description
+                    + (modelData.internal
+                        ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
+                        : "  ·  external")
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  enabled: !service.busy
+                  onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  // A Column owns its children's x, so the indent that lines
+                  // this up under the button's label has to be padding.
+                  leftPadding: Style.space(11)
+                  bottomPadding: Style.space(3)
+                  text: root.microphoneNote(modelData)
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
               }
             }
             Text {
