@@ -1230,6 +1230,24 @@ Panel {
                 }
               }
             }
+            // A device that is connected but missing from the list is the
+            // kind of thing that reads as a bug, so it says why instead.
+            Text {
+              textFormat: Text.PlainText
+              visible: (service.status.unusableMicrophones || []).length > 0
+              width: parent.width
+              text: (service.status.unusableMicrophones || []).join(", ")
+                + ((service.status.unusableMicrophones || []).length > 1
+                    ? " are connected but cannot measure. A Bluetooth headset microphone is mono, "
+                    : " is connected but cannot measure. A Bluetooth headset microphone is mono, ")
+                + "narrowband, and processed inside the headset, so it describes the headset "
+                + "rather than your speakers."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
             Text {
               textFormat: Text.PlainText
               visible: service.microphones.length === 0

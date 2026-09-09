@@ -521,9 +521,30 @@ def physical_sinks():
     return [item for item in pactl_json("sinks") if is_physical_sink(item.get("name", ""))]
 
 
+def is_measurement_microphone(name):
+    """True for a capture device that can describe a speaker.
+
+    The speaker side already refuses anything that is not a real output; this
+    is the same rule for the other end.  A Bluetooth headset offers a source,
+    but its microphone runs over HFP or HSP: mono, eight to sixteen kilohertz,
+    with automatic gain and noise suppression applied inside the headset. It
+    cannot measure a loudspeaker, and a measurement taken through one would be
+    fitted to the headset's processing rather than to the speakers.
+    """
+    return str(name).startswith("alsa_input.")
+
+
 def microphones():
     return [item for item in pactl_json("sources")
-            if not item.get("name", "").endswith(".monitor")]
+            if not item.get("name", "").endswith(".monitor")
+            and is_measurement_microphone(item.get("name", ""))]
+
+
+def unusable_microphones():
+    """Capture devices deliberately left out, so the panel can say why."""
+    return [label(item) for item in pactl_json("sources")
+            if not item.get("name", "").endswith(".monitor")
+            and not is_measurement_microphone(item.get("name", ""))]
 
 
 def channel_count(item):
@@ -2096,6 +2117,7 @@ def status_payload():
             "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
             "loudnessTracker": "running" if loudness_running() else "stopped",
             "microphones": archived_microphones(),
+            "unusableMicrophones": [short_label(name) for name in unusable_microphones()],
             "measurementSupport": measurement_support()}
     try:
         write_atomic(STATUS_CACHE, json.dumps(payload) + "\n")

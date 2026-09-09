@@ -1340,6 +1340,32 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(controls["loudcomp:input"], 1.0)
 
 
+class MicrophoneCandidateTests(unittest.TestCase):
+    """Only a real capture device can describe a loudspeaker."""
+
+    def test_it_accepts_the_machine_s_own_inputs(self):
+        for name in ("alsa_input.pci-0000_00_1f.3.analog-stereo",
+                     "alsa_input.usb-Usb_Microphone_Usb_Microphone-00.mono-fallback"):
+            self.assertTrue(speaker_calibrate.is_measurement_microphone(name), name)
+
+    def test_it_refuses_a_bluetooth_headset(self):
+        # HFP and HSP are mono and narrowband with gain control and noise
+        # suppression inside the headset: a measurement through one describes
+        # the headset, and the fit would correct the speakers to it.
+        for name in ("bluez_input.80:C3:BA:81:E7:90",
+                     "bluez_input.AA:BB:CC:DD:EE:FF.1"):
+            self.assertFalse(speaker_calibrate.is_measurement_microphone(name), name)
+
+    def test_it_refuses_anything_that_is_not_a_capture_device(self):
+        for name in ("omarchy_speaker_tuning.monitor", "some.remote.source", "", None):
+            self.assertFalse(speaker_calibrate.is_measurement_microphone(name), name)
+
+    def test_the_speaker_side_already_had_this_rule(self):
+        # The asymmetry was the bug: outputs were filtered, inputs were not.
+        self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.80_C3_BA_81_E7_90.1"))
+        self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
+
+
 class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""
 

@@ -491,6 +491,17 @@ omarchy pkg add python-numpy python-scipy
 - Multi-microphone disagreement increases optimizer uncertainty and therefore
   suppresses risky boosts.
 
+### Which microphones can measure
+
+A measurement is only as good as the microphone taking it, so the list offers
+real capture devices and nothing else. A Bluetooth headset appears on the
+system as a microphone, but its input runs over HFP or HSP: mono, eight to
+sixteen kilohertz, with automatic gain and noise suppression applied inside the
+headset. It cannot describe a loudspeaker, and a calibration fitted to one
+would be correcting for the headset. Those are named in the panel as connected
+but unusable rather than quietly dropped. The same rule already applied to the
+speaker side, which only ever offers real outputs.
+
 ### Comparing the two microphones
 
 **Advanced** keeps the last measurement from each kind of microphone and draws
