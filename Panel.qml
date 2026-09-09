@@ -715,7 +715,11 @@ Panel {
 
         Column {
           id: content
-          width: parent.width
+          // Held a hair inside the scrolling viewport.  A row whose border
+          // lands exactly on the clip boundary loses that edge, which reads
+          // as an unfinished box on one side.
+          x: Style.space(2)
+          width: parent.width - Style.space(4)
           spacing: Style.space(12)
 
           PanelHero {
@@ -898,12 +902,32 @@ Panel {
           }
 
 
+
+          PanelSeparator { foreground: root.foreground }
+
+          Button {
+            width: parent.width
+            text: service.busy && service.phase === "measure" ? "Measuring… keep quiet"
+              : (service.status.profile ? "Calibrate again" : "Calibrate speakers")
+            iconText: service.busy && service.phase === "measure" ? "󰑓" : "󰋋"
+            iconSpinning: service.busy && service.phase === "measure"
+            bordered: true
+            selected: true
+            focusable: true
+            enabled: !service.busy && root.sinkIndex >= 0 && root.micIndex >= 0
+            onClicked: {
+              var sink = service.sinks[root.sinkIndex]
+              var mic = service.microphones[root.micIndex]
+              service.measure(sink.name, mic.name, root.selectedChannelValue(), root.options(), true)
+            }
+          }
+
           Text {
             width: parent.width
-            text: "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the calibration installs itself when the measurement passes."
+            text: "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
             color: root.dim
             font.family: root.fontFamily
-            font.pixelSize: Style.font.body
+            font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
           }
 
@@ -993,22 +1017,6 @@ Panel {
             }
           }
 
-          Button {
-            width: parent.width
-            text: service.busy && service.phase === "measure" ? "Measuring… keep quiet"
-              : (service.status.profile ? "Calibrate again" : "Calibrate speakers")
-            iconText: service.busy && service.phase === "measure" ? "󰑓" : "󰋋"
-            iconSpinning: service.busy && service.phase === "measure"
-            bordered: true
-            selected: true
-            focusable: true
-            enabled: !service.busy && root.sinkIndex >= 0 && root.micIndex >= 0
-            onClicked: {
-              var sink = service.sinks[root.sinkIndex]
-              var mic = service.microphones[root.micIndex]
-              service.measure(sink.name, mic.name, root.selectedChannelValue(), root.options(), true)
-            }
-          }
 
 
 
@@ -1019,6 +1027,9 @@ Panel {
 
 
 
+
+
+          PanelSeparator { foreground: root.foreground }
 
           Toggle {
             width: parent.width
