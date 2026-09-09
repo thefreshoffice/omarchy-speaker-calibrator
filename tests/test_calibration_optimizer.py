@@ -1227,13 +1227,24 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertAlmostEqual(speaker_calibrate.parse_sink_volume_db(lopsided), -2.0)
         self.assertEqual(speaker_calibrate.parse_sink_volume_db("no volume here"), 0.0)
 
-    def test_it_never_changes_the_level(self):
-        # Its volume control attenuates as well as choosing the contour, and
-        # the attenuating belongs to the output device, so the two must cancel.
+    def test_the_make_up_pays_back_most_of_the_attenuation_not_all(self):
+        # The contour attenuates the midband and lifts the bass.  Paying the
+        # midband back in full made music two to three decibels louder with
+        # the compensation on, because the lift is real energy, and drove bass
+        # transients into the limiter.  The make-up is a fixed share of the
+        # attenuation, so the loudness stays about where it was and the
+        # limiter keeps the headroom the lift needs.
+        share = speaker_calibrate.LOUDNESS_MAKEUP_SHARE
+        self.assertLess(share, 1.0)
+        self.assertGreater(share, 0.5)
         for volume in (0.0, -6.0, -9.4, -12.0, -35.0):
             for base in (1.0, 1.663413):
                 controls = speaker_calibrate.loudness_controls(volume, True, base)
-                self.assertAlmostEqual(self.net_gain_db(controls, base), 0.0, places=4)
+                contour = controls["loudcomp:volume"]
+                expected_net = contour * (1.0 - share)
+                self.assertAlmostEqual(self.net_gain_db(controls, base), expected_net, places=3)
+                # And never louder than the attenuation would justify.
+                self.assertLessEqual(self.net_gain_db(controls, base), 1e-6)
 
     def test_the_make_up_never_goes_in_front_of_the_compensator(self):
         # The plugin decides how much to compensate from the level reaching
@@ -1257,8 +1268,12 @@ class LoudnessCompensationTests(unittest.TestCase):
 
     def test_the_contour_stops_at_the_floor(self):
         controls = speaker_calibrate.loudness_controls(-90.0, True)
-        self.assertEqual(controls["loudcomp:volume"], speaker_calibrate.LOUDNESS_FLOOR_DB)
-        self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
+        floor = speaker_calibrate.LOUDNESS_FLOOR_DB
+        self.assertEqual(controls["loudcomp:volume"], floor)
+        # The make-up stops growing where the contour does, at its share.
+        self.assertAlmostEqual(
+            self.net_gain_db(controls),
+            floor * (1.0 - speaker_calibrate.LOUDNESS_MAKEUP_SHARE), places=3)
 
     def test_the_contour_is_never_asked_for_more_than_the_volume_freed(self):
         # The volume reading understates how quiet it is, so the contour is

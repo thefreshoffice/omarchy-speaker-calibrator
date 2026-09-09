@@ -701,6 +701,13 @@ LOUDNESS_FLOOR_DB = -18.0
 # lift in the band this speaker can play grows at about a seventh of the
 # contour's depth, so it stays comfortably under the room the volume made.
 LOUDNESS_EXTRA_DEPTH_DB = 12.0
+# How much of the contour's attenuation the make-up pays back.  Not all of it:
+# the contour also lifts the bass, and on music that is real energy, so paying
+# the midband back in full made songs two to three decibels louder with the
+# compensation on and pushed their bass transients into the limiter.  Paying
+# back this share keeps the loudness roughly where it was and leaves the
+# limiter the headroom the lift needs.
+LOUDNESS_MAKEUP_SHARE = 0.85
 LOUDNESS_SERVICE = "omarchy-speaker-loudness.service"
 LOUDNESS_TRACKER = "loudness-tracker.py"
 
@@ -800,7 +807,7 @@ def loudness_controls(sink_volume_db, enabled, input_gain_linear=1.0):
     limiter instead, which the signal reaches after the compensator.
     """
     level = loudness_level_db(sink_volume_db) if enabled else 0.0
-    makeup = 10.0 ** (-level / 20.0)
+    makeup = 10.0 ** (-level * LOUDNESS_MAKEUP_SHARE / 20.0)
     return {
         "loudcomp:enabled": 1.0 if enabled else 0.0,
         "loudcomp:volume": level,
