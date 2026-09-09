@@ -209,6 +209,27 @@ output was measured, the microphone moved, or something else was playing.
 The check writes its own capture files, never the calibration capture, so a
 later refit can never fit an already-corrected recording.
 
+### Deep bass, an optional add-on
+
+Small speakers cannot move enough air to make a low note at all. Rather than
+asking them to try, the **Deep bass** switch plays the harmonics of those notes,
+which the speakers can produce, and the ear supplies the fundamental it never
+heard. This is what laptop and phone makers do to get bass out of hardware that
+has none.
+
+It needs one free package, `bankstown`, from the Arch User Repository. Nothing
+else here depends on it: without it the filter chain is built exactly as before
+and the switch offers to install it. Pressing the switch the first time opens a
+terminal running `omarchy pkg aur add bankstown`, so the installation is visible
+and asks for the password itself. Pressing it afterwards switches the effect on
+and off live, with no new measurement and no refit.
+
+The two frequency limits follow the measurement rather than being fixed: the
+harmonics are made from what lies below the measured knee and kept above it,
+which is the only place the speaker can reproduce them. The generated graph
+includes the add-on only when an installed copy has every port this expects, so
+a partial or different build can never stop the filter chain from loading.
+
 ### Improving from the check
 
 Because the check measures the speaker through a correction whose response is

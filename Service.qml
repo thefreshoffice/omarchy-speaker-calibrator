@@ -25,6 +25,7 @@ Item {
       : operation === "bypass" ? "Switching…"
       : operation === "verify" ? "Checking — playing the sweeps through the calibration…"
       : operation === "refine" ? "Improving from the last check…"
+      : operation === "deepbass" ? "Switching deep bass…"
       : operation === "refit" ? "Applying…" : "Working…"
     _stdout = ""
     _stderr = ""
@@ -105,6 +106,8 @@ Item {
   function bypass() { start("bypass", ["bypass-toggle"]) }
   function verify() { start("verify", ["verify-json"]) }
   function refine() { start("refine", ["refine-json", "--install"]) }
+  // One button: installs the add-on the first time, switches it after that.
+  function deepBass() { start("deepbass", ["deep-bass-toggle"]) }
 
   // One plain sentence about the last check.
   function verificationSummary(check) {
@@ -193,6 +196,14 @@ Item {
           var check = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { verification: check })
           root.message = root.verificationSummary(check)
+        } else if (root.phase === "deepbass") {
+          var bass = JSON.parse(raw)
+          root.status = Object.assign({}, root.status, {
+            bassEnhancer: bass,
+            deepBass: bass.deep_bass !== undefined ? bass.deep_bass : root.status.deepBass
+          })
+          root.message = bass.message || ""
+          if (!bass.started) Qt.callLater(root.refreshStatus)
         } else if (root.phase === "bypass") {
           var bypassPayload = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { compare: bypassPayload, bypass: bypassPayload.bypass })

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "local.speaker-calibrator",
   "name": "Speaker Calibrator",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "author": "Slimbook user and Codex",
   "license": "MIT",
   "description": "Measure with one or many microphones and generate adaptive, repeat-validated, protected parametric speaker tuning.",

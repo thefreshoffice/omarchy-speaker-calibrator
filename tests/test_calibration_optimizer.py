@@ -775,5 +775,128 @@ class RefinementTests(unittest.TestCase):
         self.assertLess(cut_at(second, 1500.0), cut_at(first, 1500.0) - 2.0)
 
 
+class BassEnhancerTests(unittest.TestCase):
+    fit = {
+        "filters": [{"type": "peaking", "frequency_hz": 900.0, "q": 1.2, "gain_db": -5.0}],
+        "highpass": {"frequency_hz": 185.0, "q": 0.707, "stages": 1},
+        "input_gain_linear": 0.9,
+    }
+
+    def bundle(self, folder, *, ports=None, uri=None):
+        """A pretend LV2 bundle, complete or deliberately broken."""
+        module = speaker_calibrate
+        ports = module.BASS_ENHANCER_PORTS if ports is None else ports
+        directory = Path(folder) / "bankstown.lv2"
+        directory.mkdir(parents=True)
+        body = f"<{uri or module.BASS_ENHANCER_URI}> a lv2:Plugin ;\n"
+        body += "".join(f'    lv2:port [ lv2:symbol "{port}" ] ;\n' for port in ports)
+        (directory / "bankstown.ttl").write_text(body)
+        return directory
+
+    def with_paths(self, folder):
+        module = speaker_calibrate
+        original = module.BASS_ENHANCER_SEARCH_PATHS
+        module.BASS_ENHANCER_SEARCH_PATHS = (str(folder),)
+        return original
+
+    def test_a_complete_bundle_is_detected(self):
+        module = speaker_calibrate
+        with tempfile.TemporaryDirectory() as folder:
+            directory = self.bundle(folder)
+            original = self.with_paths(folder)
+            try:
+                status = module.bass_enhancer_status()
+            finally:
+                module.BASS_ENHANCER_SEARCH_PATHS = original
+        self.assertTrue(status["usable"])
+        self.assertTrue(status["installed"])
+        self.assertEqual(status["path"], str(directory))
+        self.assertEqual(status["missing_ports"], [])
+
+    def test_a_build_missing_ports_is_refused(self):
+        module = speaker_calibrate
+        with tempfile.TemporaryDirectory() as folder:
+            self.bundle(folder, ports=("in_l", "in_r", "out_l", "out_r", "bypass"))
+            original = self.with_paths(folder)
+            try:
+                status = module.bass_enhancer_status()
+            finally:
+                module.BASS_ENHANCER_SEARCH_PATHS = original
+        self.assertTrue(status["installed"])
+        self.assertFalse(status["usable"])
+        self.assertIn("amt", status["missing_ports"])
+
+    def test_nothing_installed_reports_nothing(self):
+        module = speaker_calibrate
+        with tempfile.TemporaryDirectory() as folder:
+            original = self.with_paths(folder)
+            try:
+                status = module.bass_enhancer_status()
+            finally:
+                module.BASS_ENHANCER_SEARCH_PATHS = original
+        self.assertFalse(status["installed"])
+        self.assertFalse(status["usable"])
+
+    def test_the_graph_never_mentions_an_absent_add_on(self):
+        graph = speaker_calibrate.filter_config(
+            "alsa_output.x", self.fit, bass_enhancer=False, deep_bass=False
+        )
+        self.assertNotIn("bankstown", graph)
+        self.assertNotIn("bass:", graph)
+        self.assertIn('inputs  = [ "hp1_l:In" "hp1_r:In" ]'.replace("  ", " "),
+                      graph.replace("  ", " "))
+        controls = speaker_calibrate.graph_controls(self.fit, bass_enhancer=False)
+        self.assertFalse([name for name in controls if name.startswith("bass:")])
+
+    def test_the_add_on_is_wired_in_front_of_the_high_pass(self):
+        graph = speaker_calibrate.filter_config(
+            "alsa_output.x", self.fit, bass_enhancer=True, deep_bass=True
+        )
+        self.assertIn(speaker_calibrate.BASS_ENHANCER_URI, graph)
+        self.assertIn('{ output = "bass:out_l" input = "hp1_l:In" }', graph)
+        self.assertIn('{ output = "bass:out_r" input = "hp1_r:In" }', graph)
+        self.assertIn('"bass:in_l"', graph)
+        self.assertIn('"bass:in_r"', graph)
+        # It must be the first node, so it sees the bass before it is removed.
+        self.assertLess(graph.index("name = bass"), graph.index("name = hp1_l"))
+
+    def test_its_band_follows_the_measured_knee(self):
+        controls = speaker_calibrate.graph_controls(
+            self.fit, bass_enhancer=True, deep_bass=True
+        )
+        self.assertEqual(controls["bass:ceil"], 185.0)
+        self.assertEqual(controls["bass:final_hp"], 185.0)
+        self.assertEqual(controls["bass:floor"], speaker_calibrate.BASS_ENHANCER_FLOOR_HZ)
+        self.assertEqual(controls["bass:bypass"], 0.0)
+        self.assertEqual(controls["bass:amt"], speaker_calibrate.BASS_ENHANCER_AMOUNT)
+
+    def test_switching_it_off_only_changes_controls(self):
+        on = speaker_calibrate.graph_controls(self.fit, bass_enhancer=True, deep_bass=True)
+        off = speaker_calibrate.graph_controls(self.fit, bass_enhancer=True, deep_bass=False)
+        self.assertEqual(set(on), set(off))
+        self.assertEqual(off["bass:bypass"], 1.0)
+        self.assertEqual(off["bass:amt"], 0.0)
+        # Everything that is not the add-on is untouched, so it applies live.
+        self.assertEqual(
+            {k: v for k, v in on.items() if not k.startswith("bass:")},
+            {k: v for k, v in off.items() if not k.startswith("bass:")},
+        )
+
+    def test_a_corner_above_the_plugin_limit_is_clamped(self):
+        fit = dict(self.fit, highpass={"frequency_hz": 400.0, "q": 0.707, "stages": 1})
+        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=True, deep_bass=True)
+        self.assertEqual(controls["bass:ceil"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
+        self.assertEqual(controls["bass:final_hp"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
+
+    def test_bypassing_the_calibration_matches_the_running_shape(self):
+        with_addon = speaker_calibrate.transparent_controls(bass_enhancer=True)
+        without = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        self.assertEqual(with_addon["bass:bypass"], 1.0)
+        self.assertEqual(
+            set(with_addon) - set(without),
+            {name for name in with_addon if name.startswith("bass:")},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

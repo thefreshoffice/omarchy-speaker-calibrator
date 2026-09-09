@@ -126,6 +126,69 @@ def pactl_json(kind):
     return json.loads(proc.stdout)
 
 
+def bass_enhancer_status():
+    """Whether the psychoacoustic bass add-on is installed and usable."""
+    for base in BASS_ENHANCER_SEARCH_PATHS:
+        directory = Path(base)
+        if not directory.is_dir():
+            continue
+        for bundle in sorted(directory.iterdir()):
+            if not bundle.is_dir():
+                continue
+            text = ""
+            for turtle in sorted(bundle.glob("*.ttl")):
+                try:
+                    text += turtle.read_text(errors="ignore")
+                except OSError:
+                    continue
+            if BASS_ENHANCER_URI not in text:
+                continue
+            missing = [
+                port for port in BASS_ENHANCER_PORTS
+                if f'lv2:symbol "{port}"' not in text
+            ]
+            return {
+                "available": not missing,
+                "installed": True,
+                "usable": not missing,
+                "package": BASS_ENHANCER_PACKAGE,
+                "path": str(bundle),
+                "missing_ports": missing,
+            }
+    return {
+        "available": False,
+        "installed": False,
+        "usable": False,
+        "package": BASS_ENHANCER_PACKAGE,
+        "path": None,
+        "missing_ports": [],
+    }
+
+
+def install_bass_enhancer():
+    """Start the add-on's installation in a terminal the user can watch."""
+    status = bass_enhancer_status()
+    if status["installed"]:
+        return {**status, "started": False,
+                "message": "The bass add-on is already installed."}
+    command = f"omarchy pkg aur add {BASS_ENHANCER_PACKAGE}"
+    started = run(
+        ["omarchy", "launch", "floating", "terminal", "with", "presentation", command],
+        check=False,
+    ).returncode == 0
+    if not started:
+        raise SystemExit(
+            "Could not open a terminal for the installation. Run this yourself:\n"
+            f"  {command}"
+        )
+    return {
+        **status,
+        "started": True,
+        "command": command,
+        "message": "Installing in a terminal window. When it finishes, switch Deep bass on again.",
+    }
+
+
 def is_physical_sink(name):
     """True for a real output device, never the calibrated sink in front of one."""
     return str(name).startswith("alsa_output.") and str(name) != VIRTUAL_SINK
@@ -185,6 +248,33 @@ def select(items, title, predicate=None):
 # of restarting the PipeWire client, which would drop the sink and stop every
 # player attached to it.  Unused sections are transparent: a peaking or shelf
 # biquad at 0 dB is unity.
+# The optional psychoacoustic bass add-on.  A small speaker cannot move enough
+# air to make a low note at all; this plays that note's harmonics instead and
+# the ear supplies the fundamental it never heard.  It is a separate package,
+# so the plugin works without it and only ever asks.
+BASS_ENHANCER_URI = "https://chadmed.au/bankstown"
+BASS_ENHANCER_PACKAGE = "bankstown"
+BASS_ENHANCER_SEARCH_PATHS = (
+    "/usr/lib/lv2", "/usr/local/lib/lv2", str(Path.home() / ".lv2"),
+)
+# Every port the generated graph refers to.  If the installed build does not
+# have all of them it is not the plugin this was written against, and it is
+# left out rather than risking a filter chain that will not load.
+BASS_ENHANCER_PORTS = (
+    "in_l", "in_r", "out_l", "out_r",
+    "bypass", "amt", "floor", "ceil", "final_hp", "sat_second", "sat_third", "blend",
+)
+# Settings from the Asahi Linux MacBook tunings, which use the same plugin on
+# speakers of much the same size.  The two frequency limits are not fixed:
+# they follow the measured knee, so the harmonics land where this speaker can
+# actually play them.  The plugin clamps them to 250 Hz.
+BASS_ENHANCER_AMOUNT = 1.45
+BASS_ENHANCER_SECOND = 1.3
+BASS_ENHANCER_THIRD = 1.75
+BASS_ENHANCER_BLEND = 1.0
+BASS_ENHANCER_FLOOR_HZ = 20.0
+BASS_ENHANCER_MAX_HZ = 250.0
+
 PEAKING_SLOTS = 12
 DEFAULT_HIGHPASS_HZ = 55.0
 # A high-pass section is switched off by moving it below the audible band
@@ -255,8 +345,27 @@ def highpass_settings(fit_payload):
     return corner, q, max(1, min(2, stages))
 
 
-def graph_controls(fit_payload):
+def bass_enhancer_controls(corner_hz, deep_bass):
+    """Controls for the bass add-on, tuned to where this speaker gives up."""
+    limit = float(min(BASS_ENHANCER_MAX_HZ, max(10.0, corner_hz)))
+    return {
+        "bass:bypass": 0.0 if deep_bass else 1.0,
+        "bass:amt": BASS_ENHANCER_AMOUNT if deep_bass else 0.0,
+        "bass:floor": BASS_ENHANCER_FLOOR_HZ,
+        # Harmonics are made from what lies below the knee and kept above it,
+        # which is the only place the speaker can reproduce them.
+        "bass:ceil": limit,
+        "bass:final_hp": limit,
+        "bass:sat_second": BASS_ENHANCER_SECOND,
+        "bass:sat_third": BASS_ENHANCER_THIRD,
+        "bass:blend": BASS_ENHANCER_BLEND,
+    }
+
+
+def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False):
     """Every control of the fixed-shape graph, for both channels, in order."""
+    if bass_enhancer is None:
+        bass_enhancer = bass_enhancer_status()["usable"]
     peaking, low_shelf, high_shelf, bass = fit_sections(fit_payload)
     if len(peaking) > PEAKING_SLOTS:
         raise ValueError(
@@ -281,6 +390,8 @@ def graph_controls(fit_payload):
             controls[f"p{slot}_{side}:Q"] = float(q)
             controls[f"p{slot}_{side}:Gain"] = float(gain)
         _shelf_controls(controls, f"hs_{side}", high_shelf, 8000.0)
+    if bass_enhancer:
+        controls.update(bass_enhancer_controls(corner, deep_bass))
     controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
     return controls
 
@@ -289,8 +400,12 @@ def _number(value):
     return f"{float(value):.4f}".rstrip("0").rstrip(".") or "0"
 
 
-def filter_config(sink, fit_payload):
-    controls = graph_controls(fit_payload)
+def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False):
+    if bass_enhancer is None:
+        bass_enhancer = bass_enhancer_status()["usable"]
+    controls = graph_controls(
+        fit_payload, bass_enhancer=bass_enhancer, deep_bass=deep_bass
+    )
     nodes, links, inputs, outputs = [], [], [], []
     for side, port in (("l", "l"), ("r", "r")):
         chain = []
@@ -305,11 +420,28 @@ def filter_config(sink, fit_payload):
                 f'{{ type = builtin name = {name} label = {label} control = {{ {settings} }} }}'
             )
             chain.append(name)
-        inputs.append(f'"{chain[0]}:In"')
+        if bass_enhancer:
+            # The add-on has to see the low notes before the high-pass takes
+            # them away, so it comes first and feeds each channel's chain.
+            links.append(f'{{ output = "bass:out_{port}" input = "{chain[0]}:In" }}')
+            inputs.append(f'"bass:in_{port}"')
+        else:
+            inputs.append(f'"{chain[0]}:In"')
         for before, after in zip(chain, chain[1:]):
             links.append(f'{{ output = "{before}:Out" input = "{after}:In" }}')
         links.append(f'{{ output = "{chain[-1]}:Out" input = "limiter:in_{port}" }}')
         outputs.append(f'"limiter:out_{port}"')
+    if bass_enhancer:
+        settings = " ".join(
+            f'"{name.split(":", 1)[1]}" = {_number(value)}'
+            for name, value in bass_enhancer_controls(
+                controls["bass:ceil"], controls["bass:bypass"] < 0.5
+            ).items()
+        )
+        nodes.insert(0, f'''{{ type = lv2 name = bass
+      plugin = "{BASS_ENHANCER_URI}"
+      control = {{ {settings} }}
+    }}''')
     input_gain = controls["limiter:g_in"]
     nodes.append(f'''{{ type = lv2 name = limiter
       plugin = "http://lsp-plug.in/plugins/lv2/limiter_stereo"
@@ -380,13 +512,17 @@ def write_compare_state(state):
     COMPARE_STATE.write_text(json.dumps(state) + "\n")
 
 
-def transparent_controls():
+def transparent_controls(bass_enhancer=None):
     """Controls that make the running graph pass audio through unchanged.
 
-    The high-pass sections drop to 10 Hz, every gain goes to 0 dB, and the
-    limiter input gain returns to unity; only the -1 dBFS ceiling remains.
+    The high-pass sections drop to 10 Hz, every gain goes to 0 dB, the bass
+    add-on is bypassed, and the limiter input gain returns to unity; only the
+    -1 dBFS ceiling remains.
     """
-    controls = graph_controls({"filters": [], "input_gain_linear": 1.0})
+    controls = graph_controls(
+        {"filters": [], "input_gain_linear": 1.0},
+        bass_enhancer=bass_enhancer, deep_bass=False,
+    )
     for name in list(controls):
         if name.startswith("hp") and name.endswith(":Freq"):
             controls[name] = 10.0
@@ -494,9 +630,13 @@ def activate_profile(profile):
     be live even if this one had to restart an older graph.
     """
     fit = profile.get("fit") or {}
-    controls = graph_controls(fit)
+    enhancer = bass_enhancer_status()["usable"]
+    deep_bass = profile.get("deep_bass") == "on" and enhancer
+    controls = graph_controls(fit, bass_enhancer=enhancer, deep_bass=deep_bass)
     FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
-    FRAGMENT.write_text(filter_config(profile["speaker"]["name"], fit))
+    FRAGMENT.write_text(filter_config(
+        profile["speaker"]["name"], fit, bass_enhancer=enhancer, deep_bass=deep_bass
+    ))
     state = compare_state()
     if state["bypass"]:
         state["bypass"] = False
@@ -861,6 +1001,8 @@ def profile_from_measurement(
         "voicing": voicing,
         "loudness": loudness,
         "bass": bass,
+        # Carried across refits so switching voicing does not lose the add-on.
+        "deep_bass": (load_profile(PROFILE) or {}).get("deep_bass", "off"),
         "safety": {
             "eq_max_db": fit_payload["maximum_allowed_boost_db"] if fit_payload else 0,
             "eq_min_db": fit_payload["cut_limit_db"] if fit_payload else 0,
@@ -1000,8 +1142,13 @@ def install_proposal():
 def install_now(profile):
     if not profile.get("quality", {}).get("accepted") or not profile.get("fit"):
         raise SystemExit("This measurement failed its quality checks and cannot be installed.")
+    enhancer = bass_enhancer_status()["usable"]
     profile["activation"] = install_profile(
-        profile, filter_config(profile["speaker"]["name"], profile["fit"])
+        profile,
+        filter_config(
+            profile["speaker"]["name"], profile["fit"], bass_enhancer=enhancer,
+            deep_bass=profile.get("deep_bass") == "on" and enhancer,
+        ),
     )
     profile["installed"] = True
     return profile
@@ -1025,6 +1172,27 @@ def load_verification():
     created = profile.get("created_at") if profile else None
     report["stale"] = report.get("profile_created_at") != created
     return report
+
+
+def deep_bass_toggle():
+    """Switch the bass add-on on or off, live, without refitting."""
+    status = bass_enhancer_status()
+    if not status["usable"]:
+        if status["installed"]:
+            raise SystemExit(
+                "The installed bass add-on is missing controls this expects "
+                f"({', '.join(status['missing_ports'])}), so it was left out."
+            )
+        return install_bass_enhancer()
+    profile = load_profile(PROFILE)
+    if profile is None:
+        raise SystemExit("Calibrate the speakers first; there is nothing to add bass to.")
+    wanted = "off" if profile.get("deep_bass") == "on" else "on"
+    profile["deep_bass"] = wanted
+    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+    method = activate_profile(profile)
+    return {**status, "started": False, "deep_bass": wanted, "method": method,
+            "message": ("Deep bass on" if wanted == "on" else "Deep bass off")}
 
 
 def refine_from_check():
@@ -1145,7 +1313,9 @@ def status_payload():
             "enabled": active == "active" and default == VIRTUAL_SINK,
             "bypass": compare["bypass"],
             "compare": compare,
-            "verification": load_verification()}
+            "verification": load_verification(),
+            "bassEnhancer": bass_enhancer_status(),
+            "deepBass": (profile or {}).get("deep_bass", "off")}
 
 
 def choose_mic():
@@ -1304,6 +1474,8 @@ def main():
     for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
+    for name in ("deep-bass-toggle", "install-bass-enhancer"):
+        sub.add_parser(name)
     verify = sub.add_parser("verify-json")
     verify.add_argument("--channel")
     refine = sub.add_parser("refine-json")
@@ -1352,6 +1524,10 @@ def main():
         print(json.dumps(bypass_toggle()))
     elif command == "verify-json":
         print(json.dumps(verify_calibration(args.channel)))
+    elif command == "deep-bass-toggle":
+        print(json.dumps(deep_bass_toggle()))
+    elif command == "install-bass-enhancer":
+        print(json.dumps(install_bass_enhancer()))
     elif command == "refine-json":
         profile = refine_from_check()
         print(json.dumps(install_if_accepted(profile) if args.install else profile))

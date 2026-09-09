@@ -103,6 +103,19 @@ Panel {
     root.bassMode = profile.bass === "full" ? "full" : "normal"
     root.loudnessMode = profile.loudness || "protected"
   }
+  // One line under the Deep bass switch: what it is, or what pressing it does.
+  function deepBassDescription() {
+    var addon = service.status.bassEnhancer || {}
+    if (addon.installed === true && addon.usable !== true)
+      return "The installed add-on is not the one this expects, so it is left out."
+    if (addon.usable !== true)
+      return "Your speakers are too small to make low notes at all. This plays their "
+        + "harmonics instead, and your ear fills in the note that is missing. "
+        + "It needs a small free add-on; press to install it."
+    return service.status.deepBass === "on"
+      ? "On. Low notes are suggested by their harmonics, which these speakers can play."
+      : "Off. Press to hear low notes suggested by their harmonics."
+  }
   function heroMeta() {
     if (service.busy) return service.message
     if (!service.status.enabled)
@@ -808,6 +821,18 @@ Panel {
           }
 
           Toggle {
+            width: parent.width
+            label: "Deep bass"
+            description: root.deepBassDescription()
+            checked: service.status.deepBass === "on"
+              && ((service.status.bassEnhancer || {}).usable === true)
+            enabled: !service.busy
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: service.deepBass()
+          }
+
+          Toggle {
             visible: service.status.enabled
             width: parent.width
             label: "Calibration"
@@ -1439,6 +1464,14 @@ Panel {
               DetailRow { width: parent.width; key: "Fit"; value: "sections are added one at a time and kept only when a held-out repeat also improves" }
               DetailRow { width: parent.width; key: "Limits"; value: "cuts preferred; whole correction never below -15 dB, boosts capped, shelves cut-only" }
               DetailRow { width: parent.width; key: "Protect"; value: "high-pass at the frequency where the speaker gives up; input trim pays for every boost; -1 dBFS limiter; make-up only when chosen" }
+              DetailRow {
+                width: parent.width
+                key: "Deep bass"
+                value: ((service.status.bassEnhancer || {}).usable === true)
+                  ? "bankstown add-on installed at " + String((service.status.bassEnhancer || {}).path)
+                    + "; makes harmonics from below the high-pass corner and keeps them above it"
+                  : "optional bankstown add-on, not installed; nothing in the chain depends on it"
+              }
             }
           }
         }
