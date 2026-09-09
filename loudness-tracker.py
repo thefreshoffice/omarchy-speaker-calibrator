@@ -6,6 +6,11 @@ compensator in the filter graph can undo that, but only if it is told the
 listening level, and only the output device knows it.  This watches the
 volume and passes it on.
 
+It holds one subscription open for the life of the service rather than
+resubscribing after every change: restarting it each time leaves a window in
+which a volume move is missed, and a missed move leaves the wrong contour
+applied until the next one.
+
 It writes nothing but the compensator's own controls, so a failure here can
 change the loudness balance but never the calibration.  On the way out it
 switches the compensation off, which is the safe state: leaving a low-volume
@@ -36,41 +41,59 @@ def load_helper():
 class Tracker:
     def __init__(self, helper):
         self.helper = helper
+        self.node = None
         self.applied_db = None
         self.running = True
 
     def stop(self, *_):
         self.running = False
 
+    def find_node(self):
+        """The running filter, or None.  Looked up once and kept."""
+        if self.node is None:
+            node = self.helper.tuning_node_id()
+            if node is None:
+                return None
+            if "loudcomp:volume" not in self.helper.live_controls(node):
+                # A graph from before the compensator existed: nothing to drive.
+                return None
+            self.node = node
+        return self.node
+
     def apply(self, volume_db, enabled=True):
-        """Push one volume to the compensator; True when it was accepted."""
-        node = self.helper.tuning_node_id()
+        """Push one volume to the compensator; True when it was accepted.
+
+        The write is not read back.  It happens on every volume change, and a
+        verification round trip would cost more than the write itself; a
+        failed write is caught by the return code and re-resolves the node.
+        """
+        node = self.find_node()
         if node is None:
             return False
-        live = self.helper.live_controls(node)
-        if "loudcomp:volume" not in live:
-            # A graph from before the compensator existed.  Nothing to drive,
-            # and nothing worth failing over.
-            return False
         controls = self.helper.loudness_controls(volume_db, enabled)
-        if not self.helper.apply_controls_live(controls):
+        if not self.helper.write_controls(node, controls):
+            self.node = None
             return False
         self.applied_db = volume_db if enabled else None
         return True
 
-    def follow(self):
-        """Apply the volume now and again whenever the output changes."""
+    def follow_volume(self):
+        """Apply the current volume if it has moved enough to matter."""
+        volume = self.helper.sink_volume_db(self.helper.VIRTUAL_SINK)
+        if self.applied_db is not None and abs(volume - self.applied_db) < VOLUME_EPSILON_DB:
+            return True
+        return self.apply(volume)
+
+    def run(self):
         while self.running:
-            volume = self.helper.sink_volume_db(self.helper.VIRTUAL_SINK)
-            if self.applied_db is None or abs(volume - self.applied_db) >= VOLUME_EPSILON_DB:
-                if not self.apply(volume):
-                    time.sleep(RETRY_SECONDS)
-                    continue
-            if not self.wait_for_change():
+            if not self.follow_volume():
+                time.sleep(RETRY_SECONDS)
+                continue
+            if not self.watch():
                 time.sleep(RETRY_SECONDS)
 
-    def wait_for_change(self):
-        """Block until PipeWire reports a sink change; False if that failed."""
+    def watch(self):
+        """Follow every sink change for as long as the subscription lives."""
         try:
             events = subprocess.Popen(
                 ["pactl", "subscribe"], stdout=subprocess.PIPE, text=True
@@ -81,8 +104,8 @@ class Tracker:
             for line in events.stdout:
                 if not self.running:
                     return True
-                if "on sink" in line:
-                    return True
+                if "on sink" in line and not self.follow_volume():
+                    return False
             return False
         finally:
             events.terminate()
@@ -98,7 +121,7 @@ def main():
     signal.signal(signal.SIGTERM, tracker.stop)
     signal.signal(signal.SIGINT, tracker.stop)
     try:
-        tracker.follow()
+        tracker.run()
     finally:
         # Whatever went wrong, do not leave a quiet-level contour running.
         tracker.apply(0.0, enabled=False)

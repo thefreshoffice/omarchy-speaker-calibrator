@@ -825,6 +825,20 @@ def live_controls(node_id):
     return {}
 
 
+def write_controls(node_id, controls):
+    """Set controls on a running filter without reading them back.
+
+    The verification below is worth its cost when a profile is installed and
+    wrong values would be heard for as long as it plays.  It is not worth it
+    on every turn of the volume knob, so the tracker uses this directly.
+    """
+    payload = " ".join(f'"{name}" {float(value):.6f}' for name, value in controls.items())
+    return run(
+        ["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {payload} ] }}"],
+        check=False, capture=True,
+    ).returncode == 0
+
+
 def apply_controls_live(controls):
     """Update the running filter in place; False when it must be restarted."""
     node_id = tuning_node_id()
@@ -835,12 +849,7 @@ def apply_controls_live(controls):
         # The running graph has a different shape (an older profile); only a
         # restart can load the new one.
         return False
-    payload = " ".join(f'"{name}" {float(value):.6f}' for name, value in controls.items())
-    result = run(
-        ["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {payload} ] }}"],
-        check=False, capture=True,
-    )
-    if result.returncode != 0:
+    if not write_controls(node_id, controls):
         return False
     after = live_controls(node_id)
     for name, value in controls.items():
