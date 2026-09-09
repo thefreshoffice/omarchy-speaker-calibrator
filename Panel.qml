@@ -714,6 +714,167 @@ Panel {
               }
             }
           }
+          Text {
+            visible: service.error !== ""
+            width: parent.width
+            text: service.error
+            color: bar ? bar.urgent : Color.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: service.message !== "" && !service.busy
+            width: parent.width
+            text: service.message
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: !service.busy && service.proposal !== null && service.proposal !== undefined
+              && service.proposal.quality !== undefined && service.proposal.quality.accepted === false
+            width: parent.width
+            text: root.qualityIssuesText() + (root.qualityGuidanceText() !== "" ? "\n" + root.qualityGuidanceText() : "")
+            color: bar ? bar.urgent : Color.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: !service.busy && service.status.verification !== undefined
+              && service.status.verification !== null
+            width: parent.width
+            text: service.status.verification && service.status.verification.stale
+              ? "The calibration has changed since it was last checked."
+              : service.verificationSummary(service.status.verification)
+            color: service.status.verification && !service.status.verification.stale
+              && service.status.verification.verdict === "fail"
+              ? (bar ? bar.urgent : Color.urgent) : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Column {
+            // The display and the day-to-day switches, kept above the
+            // setup below so neither has to be scrolled to.
+            visible: service.status.profile !== null && service.status.profile !== undefined
+            width: parent.width
+            spacing: Style.space(12)
+
+            Column {
+              visible: service.status.profile !== null && service.status.profile !== undefined
+                && service.status.profile.fit !== null && service.status.profile.fit !== undefined
+              width: parent.width
+              spacing: Style.space(7)
+
+              PanelSectionHeader {
+                text: "EQUALIZER — WHAT THE CALIBRATION DOES"
+                  + (service.status.bypass ? " (SWITCHED OFF)" : "")
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+              Canvas {
+                id: eqCanvas
+                width: parent.width
+                height: Style.space(160)
+                antialiasing: true
+                opacity: service.status.bypass ? 0.35 : 1.0
+                onPaint: root.paintEqualizer(eqCanvas, service.status.profile ? service.status.profile.fit : null)
+                onVisibleChanged: if (visible) requestPaint()
+                onWidthChanged: requestPaint()
+              }
+              Text {
+                width: parent.width
+                text: "Each coloured band is one filter, its node at the frequency and gain; the bright line is everything added together. The dashed line is the gain applied before the limiter."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Loudness"
+              description: "Fuller sound with more bass, like the loudness button on a stereo."
+              checked: root.bassMode === "full"
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.bassMode = root.bassMode === "full" ? "normal" : "full"
+                root.applyOptions()
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Make it louder"
+              description: "Gives back the volume the correction takes away. At full volume the limiter works harder."
+              checked: root.loudnessMode !== "protected"
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
+                root.applyOptions()
+              }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Deep bass"
+              description: root.deepBassDescription()
+              checked: service.status.deepBass === "on"
+                && ((service.status.bassEnhancer || {}).usable === true)
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.deepBass()
+            }
+
+            RowLayout {
+              visible: root.bassWarningText() !== ""
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                Layout.alignment: Qt.AlignTop
+                text: "󰀪"
+                color: bar ? bar.urgent : Color.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+              Text {
+                Layout.fillWidth: true
+                text: root.bassWarningText()
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
+            Toggle {
+              visible: service.status.enabled
+              width: parent.width
+              label: "Calibration"
+              description: service.status.bypass
+                ? "Off — you are hearing the plain speakers"
+                : "On — switch off to hear the speakers as they were"
+              checked: !service.status.bypass
+              enabled: !service.busy
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.bypass()
+            }
+          }
+
 
           Text {
             width: parent.width
@@ -827,158 +988,15 @@ Panel {
             }
           }
 
-          Toggle {
-            width: parent.width
-            label: "Loudness"
-            description: "Fuller sound with more bass, like the loudness button on a stereo."
-            checked: root.bassMode === "full"
-            enabled: !service.busy
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: {
-              root.bassMode = root.bassMode === "full" ? "normal" : "full"
-              root.applyOptions()
-            }
-          }
 
-          Toggle {
-            width: parent.width
-            label: "Make it louder"
-            description: "Gives back the volume the correction takes away. At full volume the limiter works harder."
-            checked: root.loudnessMode !== "protected"
-            enabled: !service.busy
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: {
-              root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
-              root.applyOptions()
-            }
-          }
 
-          Toggle {
-            width: parent.width
-            label: "Deep bass"
-            description: root.deepBassDescription()
-            checked: service.status.deepBass === "on"
-              && ((service.status.bassEnhancer || {}).usable === true)
-            enabled: !service.busy
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: service.deepBass()
-          }
 
-          RowLayout {
-            visible: root.bassWarningText() !== ""
-            width: parent.width
-            spacing: Style.space(8)
-            Text {
-              Layout.alignment: Qt.AlignTop
-              text: "󰀪"
-              color: bar ? bar.urgent : Color.urgent
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.icon
-            }
-            Text {
-              Layout.fillWidth: true
-              text: root.bassWarningText()
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
 
-          Toggle {
-            visible: service.status.enabled
-            width: parent.width
-            label: "Calibration"
-            description: service.status.bypass
-              ? "Off — you are hearing the plain speakers"
-              : "On — switch off to hear the speakers as they were"
-            checked: !service.status.bypass
-            enabled: !service.busy
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            onClicked: service.bypass()
-          }
 
-          Text {
-            visible: service.error !== ""
-            width: parent.width
-            text: service.error
-            color: bar ? bar.urgent : Color.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            wrapMode: Text.WordWrap
-          }
 
-          Text {
-            visible: service.message !== "" && !service.busy
-            width: parent.width
-            text: service.message
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
-          }
 
-          Text {
-            visible: !service.busy && service.proposal !== null && service.proposal !== undefined
-              && service.proposal.quality !== undefined && service.proposal.quality.accepted === false
-            width: parent.width
-            text: root.qualityIssuesText() + (root.qualityGuidanceText() !== "" ? "\n" + root.qualityGuidanceText() : "")
-            color: bar ? bar.urgent : Color.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
 
-          Text {
-            visible: !service.busy && service.status.verification !== undefined
-              && service.status.verification !== null
-            width: parent.width
-            text: service.status.verification && service.status.verification.stale
-              ? "The calibration has changed since it was last checked."
-              : service.verificationSummary(service.status.verification)
-            color: service.status.verification && !service.status.verification.stale
-              && service.status.verification.verdict === "fail"
-              ? (bar ? bar.urgent : Color.urgent) : root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
 
-          Column {
-            visible: service.status.profile !== null && service.status.profile !== undefined
-              && service.status.profile.fit !== null && service.status.profile.fit !== undefined
-            width: parent.width
-            spacing: Style.space(7)
-
-            PanelSectionHeader {
-              text: "EQUALIZER — WHAT THE CALIBRATION DOES"
-                + (service.status.bypass ? " (SWITCHED OFF)" : "")
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-            Canvas {
-              id: eqCanvas
-              width: parent.width
-              height: Style.space(160)
-              antialiasing: true
-              opacity: service.status.bypass ? 0.35 : 1.0
-              onPaint: root.paintEqualizer(eqCanvas, service.status.profile ? service.status.profile.fit : null)
-              onVisibleChanged: if (visible) requestPaint()
-              onWidthChanged: requestPaint()
-            }
-            Text {
-              width: parent.width
-              text: "Each coloured band is one filter, its node at the frequency and gain; the bright line is everything added together. The dashed line is the gain applied before the limiter."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-          }
 
           Toggle {
             width: parent.width
