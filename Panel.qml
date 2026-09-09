@@ -1087,7 +1087,9 @@ Panel {
             width: parent.width
             text: service.busy && service.phase === "measure" ? "Measuring… keep quiet"
               : (service.status.profile ? "Calibrate again" : "Calibrate speakers")
-            iconText: service.busy && service.phase === "measure" ? "󰑓" : "󰋋"
+            // A gauge, not headphones: this measures the speakers, and headphones
+                // are the one thing that must not be in the path while it does.
+                iconText: service.busy && service.phase === "measure" ? "󰑓" : "󰊚"
             iconSpinning: service.busy && service.phase === "measure"
             bordered: true
             selected: true

@@ -33,7 +33,7 @@ Omarchy already ships.
 4. **That is it.** If the measurement passes its quality checks it installs
    itself and you are listening to the result.
 
-![The panel, over a running player](screenshot.png)
+![The panel: four switches, the equalizer, and the calibrate button](screenshot.png)
 
 Middle-click the bar icon to re-scan for devices. If a measurement fails a
 quality gate it is kept for diagnosis but never installed, so a bad
