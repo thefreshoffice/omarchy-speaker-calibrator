@@ -24,6 +24,7 @@ Item {
       : operation === "compare" ? "Switching profiles…"
       : operation === "bypass" ? "Switching…"
       : operation === "verify" ? "Checking — playing the sweeps through the calibration…"
+      : operation === "refine" ? "Improving from the last check…"
       : operation === "refit" ? "Applying…" : "Working…"
     _stdout = ""
     _stderr = ""
@@ -103,6 +104,7 @@ Item {
   function compare() { start("compare", ["compare-toggle"]) }
   function bypass() { start("bypass", ["bypass-toggle"]) }
   function verify() { start("verify", ["verify-json"]) }
+  function refine() { start("refine", ["refine-json", "--install"]) }
 
   // One plain sentence about the last check.
   function verificationSummary(check) {
@@ -152,15 +154,20 @@ Item {
           // screen makes an idle panel look busy.
           if (root.message === "Working…") root.message = ""
         }
-        else if (root.phase === "measure" || root.phase === "refit") {
+        else if (root.phase === "measure" || root.phase === "refit" || root.phase === "refine") {
           var result = JSON.parse(raw)
           root.proposal = result
           var accepted = result.quality && result.quality.accepted
           if (accepted && result.installed) {
             root.status = Object.assign({}, root.status, { enabled: true, profile: result, bypass: false })
-            root.message = (root.phase === "measure" ? "Calibrated and playing: " : "Applied: ")
-              + root.simpleLabel(result)
-              + (result.activation === "restart" ? " · tuning restarted once" : "")
+            var refinement = ((result.measurement || {}).refinement) || {}
+            root.message = root.phase === "measure" ? "Calibrated and playing: " + root.simpleLabel(result)
+              : root.phase === "refine"
+                ? "Improved from the check, round " + refinement.iterations
+                  + " · biggest change " + Number(refinement.largest_step_db || 0).toFixed(1)
+                  + " dB · check it again to see if it helped"
+                : "Applied: " + root.simpleLabel(result)
+            if (result.activation === "restart") root.message += " · tuning restarted once"
             Qt.callLater(root.refreshStatus)
           } else if (accepted) {
             var count = result.fit ? Number(result.fit.filter_count || 0) : 0

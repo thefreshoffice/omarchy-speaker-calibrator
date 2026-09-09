@@ -12,7 +12,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    CHECK_REPEATABILITY_DB,
     HIGHPASS_BOUNDS_HZ,
+    REFINEMENT_LIMIT_DB,
+    apply_refinement,
+    refinement_residual,
     verification_report,
     MAKEUP_CAP_DB,
     estimate_highpass,
@@ -673,6 +677,102 @@ class RawMeasurementTests(unittest.TestCase):
             for name, value in saved.items():
                 setattr(module, name, value)
         self.assertEqual(touched, [])
+
+
+class RefinementTests(unittest.TestCase):
+    def setUp(self):
+        self.frequencies = np.geomspace(80.0, 16_000.0, 240)
+        self.error = 6.0 * np.exp(-0.5 * (np.log2(self.frequencies / 1500.0) / 0.4) ** 2)
+
+    def check(self, difference, *, uncertainty=None, usable=None):
+        size = self.frequencies.size
+        return {
+            "frequency_hz": self.frequencies.tolist(),
+            "verified_db": difference.tolist(),
+            "predicted_db": np.zeros(size).tolist(),
+            "uncertainty_db": (np.full(size, CHECK_REPEATABILITY_DB)
+                               if uncertainty is None else uncertainty).tolist(),
+            "usable": (np.ones(size, dtype=bool) if usable is None else usable).tolist(),
+        }
+
+    def test_the_residual_follows_what_the_check_saw(self):
+        residual = refinement_residual(self.check(self.error), self.frequencies)
+        peak = float(residual[np.argmin(np.abs(self.frequencies - 1500.0))])
+        self.assertAlmostEqual(peak, 6.0, delta=0.6)
+        # Far from the error nothing moves.
+        self.assertLess(abs(residual[np.argmin(np.abs(self.frequencies - 200.0))]), 0.3)
+
+    def test_a_difference_the_check_cannot_resolve_is_mostly_ignored(self):
+        noise = np.full(self.frequencies.size, 0.8)
+        residual = refinement_residual(self.check(noise), self.frequencies)
+        self.assertLess(float(np.max(np.abs(residual))), 0.45)
+
+    def test_one_round_can_only_move_so_far(self):
+        huge = np.full(self.frequencies.size, 40.0)
+        residual = refinement_residual(self.check(huge), self.frequencies)
+        self.assertLessEqual(float(np.max(np.abs(residual))), REFINEMENT_LIMIT_DB + 1e-6)
+
+    def test_bands_the_check_could_not_judge_are_left_alone(self):
+        usable = self.frequencies >= 500.0
+        residual = refinement_residual(
+            self.check(np.full(self.frequencies.size, 5.0), usable=usable), self.frequencies
+        )
+        self.assertAlmostEqual(float(residual[self.frequencies < 400.0].max()), 0.0, places=6)
+        self.assertGreater(float(residual[self.frequencies > 2000.0].mean()), 3.0)
+
+    def test_applying_a_residual_moves_every_curve_together(self):
+        size = self.frequencies.size
+        measurement = {
+            "frequency_hz": self.frequencies.tolist(),
+            "level_dbfs": np.full(size, -30.0).tolist(),
+            "channels": [
+                {"output_channel": "left", "response_db": np.full(size, -30.0).tolist(),
+                 "uncertainty_db": np.full(size, 0.4).tolist()},
+                {"output_channel": "right", "response_db": np.full(size, -29.0).tolist(),
+                 "uncertainty_db": np.full(size, 0.4).tolist()},
+            ],
+            "validation_curves": [
+                {"repeat": 0, "output_channel": "left", "response_db": np.full(size, -30.5).tolist()},
+            ],
+        }
+        residual = np.full(size, 2.0)
+        refined = apply_refinement(measurement, residual)
+        self.assertAlmostEqual(refined["level_dbfs"][10], -28.0)
+        self.assertAlmostEqual(refined["channels"][0]["response_db"][10], -28.0)
+        self.assertAlmostEqual(refined["channels"][1]["response_db"][10], -27.0)
+        self.assertAlmostEqual(refined["validation_curves"][0]["response_db"][10], -28.5)
+        # The check's own spread joins the uncertainty the optimizer weighs by.
+        self.assertGreater(refined["channels"][0]["uncertainty_db"][10], 0.4)
+        # The original is untouched.
+        self.assertAlmostEqual(measurement["level_dbfs"][10], -30.0)
+
+    def test_refining_moves_the_fit_toward_what_the_check_measured(self):
+        """A resonance the first measurement understated gets cut deeper."""
+        frequencies = self.frequencies
+        truth = np.full(frequencies.size, -30.0) + 12.0 * np.exp(
+            -0.5 * (np.log2(frequencies / 1500.0) / 0.4) ** 2
+        )
+        understated = truth - self.error   # what the first measurement saw
+        measurement = {
+            "frequency_hz": frequencies.tolist(),
+            "level_dbfs": understated.tolist(),
+            "rate_hz": 48_000,
+            "microphone_calibration": None,
+            "channels": [
+                {"output_channel": side, "response_db": understated.tolist(),
+                 "uncertainty_db": np.full(frequencies.size, 0.2).tolist()}
+                for side in ("left", "right")
+            ],
+        }
+        first = optimize_peq(measurement, "neutral", internal_mic=True)
+        refined = apply_refinement(measurement, refinement_residual(self.check(self.error), frequencies))
+        second = optimize_peq(refined, "neutral", internal_mic=True)
+
+        def cut_at(result, hz):
+            return float(np.interp(
+                np.log(hz), np.log(frequencies), np.asarray(result["correction_response_db"])
+            ))
+        self.assertLess(cut_at(second, 1500.0), cut_at(first, 1500.0) - 2.0)
 
 
 if __name__ == "__main__":

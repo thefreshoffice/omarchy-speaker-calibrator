@@ -209,6 +209,26 @@ output was measured, the microphone moved, or something else was playing.
 The check writes its own capture files, never the calibration capture, so a
 later refit can never fit an already-corrected recording.
 
+### Improving from the check
+
+Because the check measures the speaker through a correction whose response is
+known exactly, whatever the result differs from the prediction by is what the
+original measurement got wrong. **Improve from the check** adds that difference
+back into the raw estimate and fits again from scratch, so the filter count and
+the depth limits stay where they were rather than accumulating a second
+correction on top of the first.
+
+The difference is shrunk toward zero where it is comparable with what the check
+itself could resolve, which two consecutive checks on a built-in microphone
+array put at about 1 dB, so repeating the check cannot inject its own noise
+into the next fit. One round may move the estimate by at most 8 dB at any
+frequency, and only inside the band the check could judge. The adjustment is
+level-neutral, so iterating never drifts the overall loudness.
+
+Check again after improving to see whether it helped: the distance between plan
+and measurement should shrink each round. What is learned is stored with the
+profile, so changing the voicing or the toggles afterwards keeps it.
+
 ## Runtime dependencies
 
 The panel intentionally uses Arch's system Python so its DSP environment is

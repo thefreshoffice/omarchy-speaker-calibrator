@@ -15,6 +15,11 @@ except ImportError as error:  # pragma: no cover
         "python-numpy and python-scipy packages."
     ) from error
 
+# The one thing the optimizer borrows from the measurement side: how much a
+# given signal-to-noise ratio can move a magnitude reading.  Shared rather
+# than restated so the two cannot drift apart.
+from calibration_dsp import snr_uncertainty_db  # noqa: E402
+
 
 DIAGNOSTIC_CENTERS = np.asarray(
     [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
@@ -249,6 +254,13 @@ VERIFICATION_FAIL_DB = 4.0
 VERIFICATION_WARN_DB = 2.0
 # Below this the verification microphone is hearing room noise, not the sweep.
 VERIFICATION_MIN_SNR_DB = 6.0
+# Two checks of the same profile, taken minutes apart on a built-in
+# microphone array, agreed to about this much.  Nothing smaller than it can be
+# told apart from the check repeating itself.
+CHECK_REPEATABILITY_DB = 1.0
+# The most the raw estimate may be moved by one round of refinement.
+REFINEMENT_LIMIT_DB = 8.0
+
 # The two curves are measured and smoothed differently, so "no worse than the
 # raw speaker" needs a margin; without one, a correction that changed nothing
 # could be reported as a regression on rounding alone.
@@ -357,10 +369,19 @@ def verification_report(
             f"The correction improved less than expected ({expected:.1f} dB planned, "
             f"{after:.1f} dB measured)."
         )
+    # What the check itself could not resolve, used to decide how much of the
+    # difference is worth believing when it is fed back in.
+    uncertainty = np.hypot(
+        snr_uncertainty_db(snr_db) if snr_db is not None
+        else np.zeros(frequencies.size),
+        CHECK_REPEATABILITY_DB,
+    )
     return {
         "verdict": verdict,
         "notes": notes,
         "analysis_band_hz": [round(floor_hz, 1), 10_000.0],
+        "usable": usable.tolist(),
+        "uncertainty_db": np.round(uncertainty, 3).tolist(),
         "analysed_points": int(np.count_nonzero(usable)),
         "model_error_db": {
             "rms": round(model_rms, 2),
@@ -375,6 +396,79 @@ def verification_report(
         "target_db": np.round(target_aligned, 3).tolist(),
         "original_db": np.round(original_aligned, 3).tolist(),
     }
+
+
+def refinement_residual(verification: dict, frequencies: np.ndarray) -> np.ndarray:
+    """How wrong the raw measurement was, according to the check.
+
+    If the speaker was measured through a correction whose response is known,
+    then whatever the result differs from the prediction by is what the raw
+    measurement got wrong, so adding it back gives a better estimate of the
+    bare speaker.  The difference is shrunk toward zero where it is comparable
+    with what the check itself could resolve, so that repeating the check
+    cannot inject its own noise into the next fit.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    check_grid = np.asarray(verification["frequency_hz"], dtype=float)
+    difference = (
+        np.asarray(verification["verified_db"], dtype=float)
+        - np.asarray(verification["predicted_db"], dtype=float)
+    )
+    uncertainty = np.asarray(
+        verification.get("uncertainty_db") or np.full(check_grid.size, CHECK_REPEATABILITY_DB),
+        dtype=float,
+    )
+    usable = np.asarray(
+        verification.get("usable") or np.ones(check_grid.size, dtype=bool), dtype=bool
+    )
+    shrink = difference ** 2 / (difference ** 2 + np.maximum(uncertainty, 1e-6) ** 2)
+    applied = np.clip(difference * shrink, -REFINEMENT_LIMIT_DB, REFINEMENT_LIMIT_DB)
+    applied = np.where(usable, applied, 0.0)
+    applied = gaussian_filter1d(applied, sigma=4.0, mode="nearest")
+    # Outside the band the check could judge, the earlier measurement stands.
+    edges = np.flatnonzero(usable)
+    if edges.size:
+        applied[check_grid < check_grid[edges[0]]] = 0.0
+        applied[check_grid > check_grid[edges[-1]]] = 0.0
+    else:
+        applied[:] = 0.0
+    return np.interp(np.log(frequencies), np.log(check_grid), applied)
+
+
+def apply_refinement(measurement: dict, residual: np.ndarray) -> dict:
+    """A measurement moved by ``residual``, as if the speaker had measured so.
+
+    Every curve the optimizer reads moves together, including the per-repeat
+    curves it cross-validates on, so the held-out test stays consistent.  The
+    residual is level-neutral by construction, so refining never drifts the
+    overall level.
+    """
+    residual = np.asarray(residual, dtype=float)
+    refined = dict(measurement)
+    refined["level_dbfs"] = np.round(
+        np.asarray(measurement["level_dbfs"], dtype=float) + residual, 3
+    ).tolist()
+    channels = []
+    for channel in measurement.get("channels", []):
+        moved = dict(channel)
+        moved["response_db"] = np.round(
+            np.asarray(channel["response_db"], dtype=float) + residual, 3
+        ).tolist()
+        if "uncertainty_db" in channel:
+            # The check's own spread is now part of this estimate.
+            moved["uncertainty_db"] = np.round(np.hypot(
+                np.asarray(channel["uncertainty_db"], dtype=float),
+                CHECK_REPEATABILITY_DB,
+            ), 3).tolist()
+        channels.append(moved)
+    refined["channels"] = channels
+    refined["validation_curves"] = [
+        dict(curve, response_db=np.round(
+            np.asarray(curve["response_db"], dtype=float) + residual, 3
+        ).tolist())
+        for curve in measurement.get("validation_curves", [])
+    ]
+    return refined
 
 
 def estimate_highpass(

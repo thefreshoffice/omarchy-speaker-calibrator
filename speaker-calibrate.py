@@ -30,7 +30,12 @@ from calibration_dsp import (
     search_measurement_level,
     write_pcm16_wave,
 )
-from calibration_optimizer import optimize_peq, verification_report
+from calibration_optimizer import (
+    apply_refinement,
+    optimize_peq,
+    refinement_residual,
+    verification_report,
+)
 
 SWEEP_SPEC = SweepSpec()
 RATE = SWEEP_SPEC.rate
@@ -935,6 +940,19 @@ def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, 
         calibration=calibration,
     )
     attach_level_search(measurement, previous_measurement.get("level_search"))
+    # A refit re-reads the raw capture, so anything learned from a check has to
+    # be put back or changing the voicing would silently undo it.
+    refinement = previous_measurement.get("refinement")
+    if refinement and refinement.get("residual_db"):
+        measurement = apply_refinement(
+            measurement,
+            np.interp(
+                np.log(np.asarray(measurement["frequency_hz"], dtype=float)),
+                np.log(np.asarray(previous_measurement["frequency_hz"], dtype=float)),
+                np.asarray(refinement["residual_db"], dtype=float),
+            ),
+        )
+        measurement["refinement"] = refinement
     return profile_from_measurement(
         sink, mic, channel, voicing or previous.get("voicing", "warm"), measurement,
         loudness or previous.get("loudness", "protected"),
@@ -1007,6 +1025,46 @@ def load_verification():
     created = profile.get("created_at") if profile else None
     report["stale"] = report.get("profile_created_at") != created
     return report
+
+
+def refine_from_check():
+    """Fold what the check measured back into the raw estimate and fit again."""
+    profile = load_profile(PROFILE)
+    if profile is None:
+        raise SystemExit("No calibration is installed to improve.")
+    check = load_verification()
+    if check is None:
+        raise SystemExit("Check the calibration first; there is nothing to learn from yet.")
+    if check.get("stale"):
+        raise SystemExit(
+            "The last check was of a different profile. Check this one first."
+        )
+    if not check.get("measurement_quality", {}).get("accepted"):
+        raise SystemExit(
+            "The last check did not measure cleanly, so it cannot be used to improve "
+            "anything. Run it again in a quiet room."
+        )
+    measurement = profile["measurement"]
+    frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
+    residual = refinement_residual(check, frequencies)
+    refined = apply_refinement(measurement, residual)
+
+    previous = measurement.get("refinement") or {}
+    total = np.asarray(
+        previous.get("residual_db") or np.zeros(frequencies.size), dtype=float
+    ) + residual
+    refined["refinement"] = {
+        "iterations": int(previous.get("iterations", 0)) + 1,
+        "residual_db": np.round(total, 3).tolist(),
+        "last_step_db": np.round(residual, 3).tolist(),
+        "largest_step_db": round(float(np.max(np.abs(residual))), 2),
+        "from_check_at": check.get("checked_at"),
+    }
+    mic = profile["microphone"]
+    return profile_from_measurement(
+        profile["speaker"], mic, mic.get("channel", 0), profile.get("voicing", "warm"),
+        refined, profile.get("loudness", "protected"), profile.get("bass", "normal"),
+    )
 
 
 def verify_calibration(channel_override=None):
@@ -1248,6 +1306,9 @@ def main():
         sub.add_parser(name)
     verify = sub.add_parser("verify-json")
     verify.add_argument("--channel")
+    refine = sub.add_parser("refine-json")
+    refine.add_argument("--install", action="store_true",
+                        help="install and play the improved profile")
     calibrate = sub.add_parser("calibrate-json")
     calibrate.add_argument("--sink", required=True)
     calibrate.add_argument("--mic", required=True)
@@ -1291,6 +1352,9 @@ def main():
         print(json.dumps(bypass_toggle()))
     elif command == "verify-json":
         print(json.dumps(verify_calibration(args.channel)))
+    elif command == "refine-json":
+        profile = refine_from_check()
+        print(json.dumps(install_if_accepted(profile) if args.install else profile))
     else:
         {"wizard": wizard, "status": status, "disable": disable}[command]()
 

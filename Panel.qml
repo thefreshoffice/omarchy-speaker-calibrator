@@ -306,6 +306,11 @@ Panel {
       rows.push({ key: "Make-up", value: "+" + root.fmt(fit.makeup_db, 1) + " dB  ·  " + String(fit.loudness_mode || "protected") })
       rows.push({ key: "Net input gain", value: (Number(fit.net_input_gain_db) > 0 ? "+" : "") + root.fmt(fit.net_input_gain_db, 1) + " dB before the limiter" })
     }
+    var refinement = ((service.proposal || {}).measurement || {}).refinement
+    if (refinement)
+      rows.push({ key: "Refined", value: "round " + refinement.iterations
+        + "  ·  biggest change " + root.fmt(refinement.largest_step_db, 1) + " dB"
+        + "  ·  from the check at " + String(refinement.from_check_at || "").slice(0, 16).replace("T", " ") })
     rows.push({ key: "Optimizer", value: (fit.optimizer_success ? "converged" : "did not converge") + "  ·  " + String(fit.algorithm || "") })
     return rows
   }
@@ -1035,6 +1040,18 @@ Panel {
                 description: "Measure again through the corrected output and compare it with the plan"
                 enabled: !service.busy
                 onClicked: service.verify()
+              }
+              ActionRow {
+                visible: service.status.verification !== undefined
+                  && service.status.verification !== null
+                  && service.status.verification.stale === false
+                  && service.status.enabled && !service.status.bypass
+                width: parent.width
+                icon: "󰁨"
+                label: service.busy && service.phase === "refine" ? "Improving…" : "Improve from the check"
+                description: "Feed what the check measured back in, fit again, and play the result"
+                enabled: !service.busy
+                onClicked: service.refine()
               }
               ActionRow {
                 visible: service.status.enabled && service.status.compare !== undefined
