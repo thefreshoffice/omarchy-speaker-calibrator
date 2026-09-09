@@ -888,6 +888,39 @@ class BassEnhancerTests(unittest.TestCase):
         self.assertEqual(controls["bass:ceil"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
         self.assertEqual(controls["bass:final_hp"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
 
+    def install_command_with(self, stdout, returncode=0):
+        module = speaker_calibrate
+        original = module.run
+        class Result:
+            pass
+        result = Result()
+        result.returncode = returncode
+        result.stdout = stdout
+        try:
+            module.run = lambda *args, **kwargs: result
+            return module.bass_enhancer_install_command()
+        finally:
+            module.run = original
+
+    def test_a_repository_copy_is_preferred_over_a_source_build(self):
+        command, repository = self.install_command_with(
+            "Repository      : omarchy\nName            : bankstown\n"
+        )
+        self.assertEqual(command, "omarchy pkg add bankstown")
+        self.assertEqual(repository, "omarchy")
+
+    def test_any_repository_counts_not_just_omarchy(self):
+        command, repository = self.install_command_with(
+            "Repository      : extra\nName            : bankstown\n"
+        )
+        self.assertEqual(command, "omarchy pkg add bankstown")
+        self.assertEqual(repository, "extra")
+
+    def test_it_falls_back_to_the_aur_when_no_repository_has_it(self):
+        command, repository = self.install_command_with("", returncode=1)
+        self.assertEqual(command, "omarchy pkg aur add bankstown")
+        self.assertIsNone(repository)
+
     def test_bypassing_the_calibration_matches_the_running_shape(self):
         with_addon = speaker_calibrate.transparent_controls(bass_enhancer=True)
         without = speaker_calibrate.transparent_controls(bass_enhancer=False)

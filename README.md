@@ -217,12 +217,18 @@ which the speakers can produce, and the ear supplies the fundamental it never
 heard. This is what laptop and phone makers do to get bass out of hardware that
 has none.
 
-It needs one free package, `bankstown`, from the Arch User Repository. Nothing
-else here depends on it: without it the filter chain is built exactly as before
-and the switch offers to install it. Pressing the switch the first time opens a
-terminal running `omarchy pkg aur add bankstown`, so the installation is visible
-and asks for the password itself. Pressing it afterwards switches the effect on
-and off live, with no new measurement and no refit.
+It needs one free package, `bankstown`. Nothing else here depends on it:
+without it the filter chain is built exactly as before and the switch offers to
+install it. Pressing the switch the first time opens a terminal running the
+install, so it is visible and asks for the password itself; pressing it
+afterwards switches the effect on and off live, with no new measurement and no
+refit.
+
+Which command is used is decided when the switch is pressed. A configured
+repository is preferred, so `omarchy pkg add bankstown` is used if any
+repository carries it, including Omarchy's own; otherwise it falls back to
+`omarchy pkg aur add bankstown`, which builds it from the Arch User Repository.
+Nothing needs changing here if the package later appears in a repository.
 
 The two frequency limits follow the measurement rather than being fixed: the
 harmonics are made from what lies below the measured knee and kept above it,

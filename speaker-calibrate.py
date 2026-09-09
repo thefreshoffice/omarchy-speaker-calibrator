@@ -165,13 +165,38 @@ def bass_enhancer_status():
     }
 
 
+def package_repository(package):
+    """The configured repository holding this package, or None for AUR-only."""
+    result = run(["pacman", "-Si", package], check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.lower().startswith("repository"):
+            return line.split(":", 1)[1].strip()
+    return "unknown"
+
+
+def bass_enhancer_install_command():
+    """How to install the add-on: a plain package when a repository has it.
+
+    Omarchy's own repository may carry it one day, and a signed repository
+    package is preferable to a source build, so the repository is asked first
+    and the answer decides the command.  Nothing here needs changing if it
+    later appears there.
+    """
+    repository = package_repository(BASS_ENHANCER_PACKAGE)
+    if repository:
+        return f"omarchy pkg add {BASS_ENHANCER_PACKAGE}", repository
+    return f"omarchy pkg aur add {BASS_ENHANCER_PACKAGE}", None
+
+
 def install_bass_enhancer():
     """Start the add-on's installation in a terminal the user can watch."""
     status = bass_enhancer_status()
     if status["installed"]:
         return {**status, "started": False,
                 "message": "The bass add-on is already installed."}
-    command = f"omarchy pkg aur add {BASS_ENHANCER_PACKAGE}"
+    command, repository = bass_enhancer_install_command()
     started = run(
         ["omarchy", "launch", "floating", "terminal", "with", "presentation", command],
         check=False,
@@ -185,7 +210,11 @@ def install_bass_enhancer():
         **status,
         "started": True,
         "command": command,
-        "message": "Installing in a terminal window. When it finishes, switch Deep bass on again.",
+        "source": repository or "AUR",
+        "message": (
+            f"Installing from {repository or 'the AUR'} in a terminal window. "
+            "When it finishes, switch Deep bass on again."
+        ),
     }
 
 
@@ -1314,7 +1343,8 @@ def status_payload():
             "bypass": compare["bypass"],
             "compare": compare,
             "verification": load_verification(),
-            "bassEnhancer": bass_enhancer_status(),
+            "bassEnhancer": {**bass_enhancer_status(),
+                             "source": package_repository(BASS_ENHANCER_PACKAGE) or "AUR"},
             "deepBass": (profile or {}).get("deep_bass", "off")}
 
 

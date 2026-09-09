@@ -111,7 +111,9 @@ Panel {
     if (addon.usable !== true)
       return "Your speakers are too small to make low notes at all. This plays their "
         + "harmonics instead, and your ear fills in the note that is missing. "
-        + "It needs a small free add-on; press to install it."
+        + "It needs a small free add-on"
+        + (addon.source && addon.source !== "AUR" ? " from the " + addon.source + " repository" : "")
+        + "; press to install it."
     return service.status.deepBass === "on"
       ? "On. Low notes are suggested by their harmonics, which these speakers can play."
       : "Off. Press to hear low notes suggested by their harmonics."
