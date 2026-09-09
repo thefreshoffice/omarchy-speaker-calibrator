@@ -75,6 +75,19 @@ LOUDNESS_MODES = {"protected": 0.0, "balanced": 0.5, "matched": 1.0}
 # to 5 dB above the uncorrected speaker, whatever else is selected.
 MAKEUP_CAP_DB = 6.0
 
+# Channel balance.  A broadband level difference between the two speakers
+# pulls the stereo image to one side, and trimming it is the one per-channel
+# correction worth making: a difference in *shape* between the channels would
+# need a second set of filters and is far too easy to get wrong on an
+# uncertain measurement.
+CHANNEL_TRIM_LIMIT_DB = 3.0
+# Below this nothing is audible enough to bother with.
+CHANNEL_TRIM_MINIMUM_DB = 0.3
+# The difference has to stand this far clear of the measurement's own spread
+# before it counts as a property of the speakers rather than of the moment.
+CHANNEL_TRIM_MARGIN = 2.0
+CHANNEL_TRIM_BAND_HZ = (250.0, 4000.0)
+
 # Protective high-pass.  Below the point where a speaker stops keeping up, the
 # cone still travels as far as ever while producing almost nothing, so that
 # content costs excursion, distortion, and headroom for no sound.  The corner
@@ -480,6 +493,94 @@ def apply_refinement(measurement: dict, residual: np.ndarray) -> dict:
         for curve in measurement.get("validation_curves", [])
     ]
     return refined
+
+
+def estimate_channel_trim(
+    measurement: dict, *, internal_mic: bool, mode: str = "off"
+) -> dict:
+    """A level trim that centres the stereo image, when it can be trusted.
+
+    Built-in microphones are refused outright.  They sit centimetres from the
+    speakers and closer to one than the other, so each one mostly hears its
+    own side; what they measure is where they are, not what reaches a
+    listener.  Measured on this laptop, the two built-in microphones disagreed
+    about which speaker was louder, while their combination put the real
+    difference near a tenth of a decibel.
+
+    With an external microphone at the listening position the difference is
+    real and is what you hear, so it is trimmed, but only when it stands clear
+    of the measurement's own spread, only by attenuating the louder side so no
+    headroom is spent, and never by more than a few decibels: a larger
+    difference is a wiring or placement fault that software should report
+    rather than hide.
+    """
+    channels = measurement.get("channels", [])
+    result = {
+        "mode": mode,
+        "applied": False,
+        "limit_db": CHANNEL_TRIM_LIMIT_DB,
+        "left_db": 0.0,
+        "right_db": 0.0,
+        "difference_db": 0.0,
+        "spread_db": 0.0,
+        "reason": "",
+    }
+    if len(channels) < 2:
+        result["reason"] = "only one channel was measured"
+        return result
+
+    frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
+    band = (
+        (frequencies >= CHANNEL_TRIM_BAND_HZ[0]) & (frequencies <= CHANNEL_TRIM_BAND_HZ[1])
+    )
+    if not np.any(band):
+        result["reason"] = "the measurement does not cover the band this is judged on"
+        return result
+
+    def level(channel):
+        return perceptual_smooth(
+            frequencies, channel["response_db"], peak_weighted=False
+        )
+
+    difference = float(np.median((level(channels[0]) - level(channels[1]))[band]))
+    spreads = [
+        np.asarray(channel.get("uncertainty_db", np.zeros(frequencies.size)), dtype=float)
+        for channel in channels[:2]
+    ]
+    spread = float(np.median(np.hypot(spreads[0], spreads[1])[band]))
+    needed = max(CHANNEL_TRIM_MINIMUM_DB, CHANNEL_TRIM_MARGIN * spread)
+    result["difference_db"] = round(difference, 2)
+    result["spread_db"] = round(spread, 2)
+    result["needed_db"] = round(needed, 2)
+
+    if internal_mic:
+        result["reason"] = (
+            "built-in microphones sit closer to one speaker than the other, so what "
+            "they measure is where they are rather than what reaches you"
+        )
+        return result
+    if mode != "auto":
+        result["reason"] = "switched off"
+        return result
+    if abs(difference) < needed:
+        result["reason"] = (
+            f"the {abs(difference):.1f} dB difference does not stand clear of the "
+            f"{spread:.1f} dB this measurement varies by"
+        )
+        return result
+
+    amount = float(np.clip(difference, -CHANNEL_TRIM_LIMIT_DB, CHANNEL_TRIM_LIMIT_DB))
+    # Only the louder side is turned down, so the trim costs no headroom.
+    result.update({
+        "applied": True,
+        "left_db": round(-max(0.0, amount), 2),
+        "right_db": round(-max(0.0, -amount), 2),
+        "reason": (
+            f"{'left' if amount > 0 else 'right'} measured {abs(amount):.1f} dB louder"
+            + (" (capped)" if abs(difference) > CHANNEL_TRIM_LIMIT_DB else "")
+        ),
+    })
+    return result
 
 
 def estimate_highpass(
@@ -957,6 +1058,7 @@ def optimize_peq(
     internal_mic: bool,
     loudness: str = "protected",
     bass: str = "normal",
+    channel_trim: str = "off",
 ) -> dict:
     frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
     measured = np.asarray(measurement["level_dbfs"], dtype=float)
@@ -1295,6 +1397,9 @@ def optimize_peq(
         "highpass_stages": highpass["stages"],
         "bass_mode": bass,
         "bass_shelf": shelf,
+        "channel_trim": estimate_channel_trim(
+            measurement, internal_mic=internal_mic, mode=channel_trim
+        ),
         "loudness_mode": loudness,
         "loudness_loss_db": round(loudness_loss_db, 2),
         "makeup_db": makeup_db,

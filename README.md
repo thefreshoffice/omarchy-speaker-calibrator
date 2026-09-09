@@ -151,6 +151,31 @@ serial-number calibration text file can be supplied. Keep the room quiet and do
 not move the computer or microphone during the roughly 30-second level check and
 sweep sequence.
 
+### Channel balance
+
+A broadband level difference between the two speakers pulls the stereo image
+off centre, and trimming it is the one per-channel correction worth making. A
+difference in *shape* between the channels would need a second set of filters
+and is far too easy to get wrong on an uncertain measurement, so it is not
+attempted.
+
+The trim is off by default and refuses to act on a built-in microphone array at
+all. Those microphones sit centimetres from the speakers and closer to one than
+the other, so each mostly hears its own side. Measured here, the two built-in
+microphones disagreed about which speaker was louder, by more than the
+difference they were trying to report, while their combination put the real
+difference near a tenth of a decibel. There is nothing to correct and the
+measurement cannot see it anyway.
+
+With an external microphone at the listening position the difference is real
+and is what you hear. Set **Channel balance** to automatic and it is trimmed,
+but only when the difference stands at least twice clear of the spread the
+measurement itself shows, only by turning the louder side down so no headroom
+is spent, and never by more than 3 dB. A larger difference is a wiring or
+placement fault that the panel reports rather than hides. Even when it is
+switched off, the advanced view shows the difference it measured, so it is
+visible without acting.
+
 ### Flat or Warm?
 
 - **Flat** is the default. It keeps the sound balanced, preserves the most

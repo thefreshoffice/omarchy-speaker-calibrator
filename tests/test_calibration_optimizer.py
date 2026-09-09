@@ -12,10 +12,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    CHANNEL_TRIM_LIMIT_DB,
     CHECK_REPEATABILITY_DB,
     HIGHPASS_BOUNDS_HZ,
     REFINEMENT_LIMIT_DB,
     apply_refinement,
+    estimate_channel_trim,
     refinement_residual,
     verification_report,
     MAKEUP_CAP_DB,
@@ -331,7 +333,9 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertIn('name = p12_l label = bq_peaking', graph)
         self.assertIn('name = ls_r label = bq_lowshelf', graph)
         self.assertIn('name = hs_r label = bq_highshelf', graph)
-        self.assertIn('{ output = "hs_r:Out" input = "limiter:in_r" }', graph)
+        self.assertIn('{ output = "hs_r:Out" input = "bal_r:In" }', graph)
+        self.assertIn('{ output = "bal_r:Out" input = "limiter:in_r" }', graph)
+        self.assertIn('name = bal_l label = linear control = { "Mult" = 1 "Add" = 0 }', graph)
 
     def test_graph_controls_fill_every_fixed_slot(self):
         fit = {
@@ -342,8 +346,12 @@ class CalibrationOptimizerTests(unittest.TestCase):
         }
         controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
         slots = speaker_calibrate.PEAKING_SLOTS
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3) + 1)
+        # Per channel: two high-passes, three shelves, the parametric slots,
+        # and the balance trim's two controls; plus the limiter's input gain.
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
+        self.assertEqual(controls["bal_l:Mult"], 1.0)
+        self.assertEqual(controls["bal_r:Add"], 0.0)
         self.assertEqual(controls["p1_l:Freq"], 1000.0)
         self.assertEqual(controls["p2_r:Gain"], 0.75)
         self.assertEqual(controls["p3_l:Gain"], 0.0)
@@ -988,6 +996,100 @@ class BassEnhancerTests(unittest.TestCase):
             set(with_addon) - set(without),
             {name for name in with_addon if name.startswith("bass:")},
         )
+
+
+class ChannelTrimTests(unittest.TestCase):
+    def setUp(self):
+        self.frequencies = np.geomspace(80.0, 16_000.0, 240)
+
+    def measurement(self, difference_db, *, spread=0.2):
+        size = self.frequencies.size
+        left = np.full(size, -30.0) + difference_db
+        right = np.full(size, -30.0)
+        return {
+            "frequency_hz": self.frequencies.tolist(),
+            "level_dbfs": ((left + right) / 2).tolist(),
+            "channels": [
+                {"output_channel": "left", "response_db": left.tolist(),
+                 "uncertainty_db": np.full(size, spread).tolist()},
+                {"output_channel": "right", "response_db": right.tolist(),
+                 "uncertainty_db": np.full(size, spread).tolist()},
+            ],
+        }
+
+    def test_a_built_in_array_is_refused_outright(self):
+        trim = estimate_channel_trim(
+            self.measurement(2.5), internal_mic=True, mode="auto"
+        )
+        self.assertFalse(trim["applied"])
+        self.assertIn("closer to one speaker", trim["reason"])
+        # It still reports what it saw, so the difference is visible.
+        self.assertAlmostEqual(trim["difference_db"], 2.5, delta=0.1)
+
+    def test_switched_off_it_measures_but_does_not_act(self):
+        trim = estimate_channel_trim(
+            self.measurement(2.5), internal_mic=False, mode="off"
+        )
+        self.assertFalse(trim["applied"])
+        self.assertEqual(trim["reason"], "switched off")
+        self.assertAlmostEqual(trim["difference_db"], 2.5, delta=0.1)
+        self.assertEqual(trim["left_db"], 0.0)
+        self.assertEqual(trim["right_db"], 0.0)
+
+    def test_a_clear_difference_turns_the_louder_side_down(self):
+        trim = estimate_channel_trim(
+            self.measurement(2.0), internal_mic=False, mode="auto"
+        )
+        self.assertTrue(trim["applied"])
+        self.assertAlmostEqual(trim["left_db"], -2.0, delta=0.1)
+        self.assertEqual(trim["right_db"], 0.0)
+        self.assertIn("left measured", trim["reason"])
+
+    def test_the_quieter_side_is_never_boosted(self):
+        trim = estimate_channel_trim(
+            self.measurement(-2.0), internal_mic=False, mode="auto"
+        )
+        self.assertTrue(trim["applied"])
+        self.assertEqual(trim["left_db"], 0.0)
+        self.assertAlmostEqual(trim["right_db"], -2.0, delta=0.1)
+        self.assertLessEqual(max(trim["left_db"], trim["right_db"]), 0.0)
+
+    def test_a_difference_inside_the_noise_is_left_alone(self):
+        trim = estimate_channel_trim(
+            self.measurement(0.9, spread=1.0), internal_mic=False, mode="auto"
+        )
+        self.assertFalse(trim["applied"])
+        self.assertIn("does not stand clear", trim["reason"])
+
+    def test_a_wiring_fault_is_capped_and_reported(self):
+        trim = estimate_channel_trim(
+            self.measurement(9.0), internal_mic=False, mode="auto"
+        )
+        self.assertTrue(trim["applied"])
+        self.assertEqual(trim["left_db"], -CHANNEL_TRIM_LIMIT_DB)
+        self.assertIn("capped", trim["reason"])
+        self.assertAlmostEqual(trim["difference_db"], 9.0, delta=0.1)
+
+    def test_the_trim_reaches_the_graph_as_a_gain(self):
+        fit = {
+            "filters": [{"type": "peaking", "frequency_hz": 900.0, "q": 1.0, "gain_db": -3.0}],
+            "input_gain_linear": 0.9,
+            "channel_trim": {"applied": True, "left_db": -2.0, "right_db": 0.0},
+        }
+        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        self.assertAlmostEqual(controls["bal_l:Mult"], 10 ** (-2.0 / 20.0), places=5)
+        self.assertEqual(controls["bal_r:Mult"], 1.0)
+        graph = speaker_calibrate.filter_config(
+            "alsa_output.x", fit, bass_enhancer=False
+        )
+        self.assertIn('name = bal_l label = linear control = { "Mult" = 0.7943', graph)
+
+    def test_a_profile_without_a_trim_is_unity(self):
+        controls = speaker_calibrate.graph_controls(
+            {"filters": [], "input_gain_linear": 1.0}, bass_enhancer=False
+        )
+        self.assertEqual(controls["bal_l:Mult"], 1.0)
+        self.assertEqual(controls["bal_r:Mult"], 1.0)
 
 
 if __name__ == "__main__":

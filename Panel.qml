@@ -25,6 +25,7 @@ Panel {
   property string voicingMode: "neutral"
   property string bassMode: "normal"
   property string loudnessMode: "protected"
+  property string channelTrimMode: "off"
   property bool advanced: false
   property bool _optionsAdopted: false
   // Selected device rows; -1 until the device list arrives.
@@ -86,7 +87,7 @@ Panel {
   // ---- options -------------------------------------------------------------
   function options() {
     return { voicing: root.voicingMode, bass: root.bassMode, loudness: root.loudnessMode,
-             micCalibrationFile: micCalPath.text.trim() }
+             channelTrim: root.channelTrimMode, micCalibrationFile: micCalPath.text.trim() }
   }
   function hasMeasurement() {
     return service.proposal !== null && service.proposal !== undefined
@@ -102,6 +103,7 @@ Panel {
     root.voicingMode = profile.voicing === "warm" ? "warm" : "neutral"
     root.bassMode = profile.bass === "full" ? "full" : "normal"
     root.loudnessMode = profile.loudness || "protected"
+    root.channelTrimMode = profile.channel_trim === "auto" ? "auto" : "off"
   }
   // One line under the Deep bass switch: what it is, or what pressing it does.
   function deepBassDescription() {
@@ -279,6 +281,10 @@ Panel {
                  root.fmt(fit.bass_shelf.q, 2), "+" + root.fmt(fit.bass_shelf.gain_db, 2) + " dB"])
     var highpass = fit.highpass || {}
     var stages = Number(highpass.stages || fit.highpass_stages || 2)
+    var trim = fit.channel_trim
+    if (trim && trim.applied)
+      rows.push(["BAL", "channel trim", "wideband",
+                 "–", root.fmt(trim.left_db, 1) + " / " + root.fmt(trim.right_db, 1) + " dB"])
     rows.push(["HP", "high-pass" + (stages > 1 ? " ×" + stages : ""),
                root.fmt(highpass.frequency_hz || fit.highpass_hz || 55, 0) + " Hz",
                root.fmt(highpass.q || 0.707, 2), "–"])
@@ -340,6 +346,14 @@ Panel {
       rows.push({ key: "Refined", value: "round " + refinement.iterations
         + "  ·  biggest change " + root.fmt(refinement.largest_step_db, 1) + " dB"
         + "  ·  from the check at " + String(refinement.from_check_at || "").slice(0, 16).replace("T", " ") })
+    var trim = fit.channel_trim
+    if (trim)
+      rows.push({ key: "Channel balance", value: trim.applied
+        ? "left " + root.fmt(trim.left_db, 1) + " dB  ·  right " + root.fmt(trim.right_db, 1)
+          + " dB  ·  " + String(trim.reason)
+        : String(trim.mode === "auto" ? "not applied" : "off")
+          + "  ·  measured difference " + root.fmt(trim.difference_db, 1) + " dB"
+          + "  ·  " + String(trim.reason) })
     if (fit.smoothing)
       rows.push({ key: "Smoothing", value: String(fit.smoothing.method)
         + "  ·  " + root.fmt((fit.smoothing.octaves || [])[0], 2) + " octaves at the bottom, "
@@ -1024,6 +1038,17 @@ Panel {
                 onActivated: function(index) { root.bassMode = index === 1 ? "full" : "normal" }
               }
 
+              Text { text: "CHANNEL BALANCE"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              QQC.ComboBox {
+                id: channelTrimBox
+                Layout.fillWidth: true
+                model: ["Off — both channels get the same correction",
+                        "Automatic — level-match them, external mic only"]
+                enabled: !service.busy
+                currentIndex: root.channelTrimMode === "auto" ? 1 : 0
+                onActivated: function(index) { root.channelTrimMode = index === 1 ? "auto" : "off" }
+              }
+
               Text {
                 visible: root.multiMicAvailable() || !root.selectedMicIsInternal()
                 text: "MIC CHANNEL"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
@@ -1052,7 +1077,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Loudness toggle = Bass full. Make it louder = Louder matched. Refit applies these to the last measurement without new sweeps."
+              text: "Loudness toggle = Bass full. Make it louder = Louder matched. Refit applies these to the last measurement without new sweeps. CHANNEL BALANCE only ever acts on a measurement made with an external microphone placed where you listen, and only when the difference stands clear of what the measurement itself varies by; built-in microphones sit closer to one speaker than the other, so what they measure is where they are rather than what reaches you."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

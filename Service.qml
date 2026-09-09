@@ -77,7 +77,8 @@ Item {
   function optionArguments(options) {
     return ["--voicing", options.voicing || "neutral",
             "--loudness", options.loudness || "protected",
-            "--bass", options.bass || "normal"]
+            "--bass", options.bass || "normal",
+            "--channel-trim", options.channelTrim || "off"]
   }
 
   function refresh() { if (!busy) start("devices", ["devices-json"]) }

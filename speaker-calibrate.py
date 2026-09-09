@@ -320,6 +320,8 @@ SECTION_LABELS = {
     "bs": "bq_lowshelf",
     "p": "bq_peaking",
     "hs": "bq_highshelf",
+    # A plain gain, used to centre the stereo image when that is measurable.
+    "bal": "linear",
 }
 
 
@@ -332,7 +334,7 @@ def graph_sections():
     return (
         ["hp1", "hp2", "ls", "bs"]
         + [f"p{slot}" for slot in range(1, PEAKING_SLOTS + 1)]
-        + ["hs"]
+        + ["hs", "bal"]
     )
 
 
@@ -423,6 +425,9 @@ def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False):
             controls[f"p{slot}_{side}:Q"] = float(q)
             controls[f"p{slot}_{side}:Gain"] = float(gain)
         _shelf_controls(controls, f"hs_{side}", high_shelf, 8000.0)
+        gain_db = float((fit_payload.get("channel_trim") or {}).get(f"{'left' if side == 'l' else 'right'}_db", 0.0))
+        controls[f"bal_{side}:Mult"] = round(10.0 ** (gain_db / 20.0), 6)
+        controls[f"bal_{side}:Add"] = 0.0
     if bass_enhancer:
         controls.update(bass_enhancer_controls(corner, deep_bass))
     controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
@@ -446,9 +451,15 @@ def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False):
             name = f"{section}_{side}"
             kind = section.rstrip("0123456789")
             label = SECTION_LABELS[kind]
-            settings = f'"Freq" = {_number(controls[f"{name}:Freq"])} "Q" = {_number(controls[f"{name}:Q"])}'
-            if kind != "hp":
-                settings += f' "Gain" = {_number(controls[f"{name}:Gain"])}'
+            if kind == "bal":
+                settings = (
+                    f'"Mult" = {_number(controls[f"{name}:Mult"])} '
+                    f'"Add" = {_number(controls[f"{name}:Add"])}'
+                )
+            else:
+                settings = f'"Freq" = {_number(controls[f"{name}:Freq"])} "Q" = {_number(controls[f"{name}:Q"])}'
+                if kind != "hp":
+                    settings += f' "Gain" = {_number(controls[f"{name}:Gain"])}'
             nodes.append(
                 f'{{ type = builtin name = {name} label = {label} control = {{ {settings} }} }}'
             )
@@ -1034,7 +1045,8 @@ BASS_LABELS = {"normal": "normal bass", "full": "full bass"}
 
 
 def profile_from_measurement(
-    sink, mic, channel, voicing, measurement, loudness="protected", bass="normal"
+    sink, mic, channel, voicing, measurement, loudness="protected", bass="normal",
+    channel_trim="off",
 ):
     quality = measurement["quality"]
     internal_mic = mic["name"].startswith("alsa_input.pci-")
@@ -1046,6 +1058,7 @@ def profile_from_measurement(
             internal_mic=internal_mic,
             loudness=loudness,
             bass=bass,
+            channel_trim=channel_trim,
         )
     profile = {
         "schema_version": 5,
@@ -1063,6 +1076,7 @@ def profile_from_measurement(
         "voicing": voicing,
         "loudness": loudness,
         "bass": bass,
+        "channel_trim": channel_trim,
         # Carried across refits so switching voicing does not lose the add-on.
         "deep_bass": (load_profile(PROFILE) or {}).get("deep_bass", "off"),
         "safety": {
@@ -1087,7 +1101,8 @@ def profile_from_measurement(
 
 
 def build_profile(
-    sink, mic, channel, voicing, mic_cal_file=None, loudness="protected", bass="normal"
+    sink, mic, channel, voicing, mic_cal_file=None, loudness="protected", bass="normal",
+    channel_trim="off",
 ):
     if not is_physical_sink(sink["name"]):
         raise SystemExit(
@@ -1104,11 +1119,13 @@ def build_profile(
         "correction_silenced_during_measurement": bool(silenced),
     }
     return profile_from_measurement(
-        sink, mic, channel, voicing, measurement, loudness, bass
+        sink, mic, channel, voicing, measurement, loudness, bass, channel_trim
     )
 
 
-def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, bass=None):
+def reanalyze_saved_capture(
+    voicing=None, channel_override=None, loudness=None, bass=None, channel_trim=None
+):
     """Re-run current analysis and optimization on the last capture, without sound."""
     recording = DATA / "measurement.wav"
     if not PROPOSAL.exists() or not recording.exists():
@@ -1161,6 +1178,7 @@ def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, 
         sink, mic, channel, voicing or previous.get("voicing", "neutral"), measurement,
         loudness or previous.get("loudness", "protected"),
         bass or previous.get("bass", "normal"),
+        channel_trim or previous.get("channel_trim", "off"),
     )
 
 
@@ -1175,7 +1193,7 @@ def parse_channel_selection(value):
 
 def calibrate_noninteractive(
     sink_name, mic_name, channel, voicing, mic_cal_file=None, loudness="protected",
-    bass="normal",
+    bass="normal", channel_trim="off",
 ):
     sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
     mic = next((item for item in microphones() if item["name"] == mic_name), None)
@@ -1189,7 +1207,9 @@ def calibrate_noninteractive(
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
     try:
-        return build_profile(sink, mic, channel, voicing, mic_cal_file, loudness, bass)
+        return build_profile(
+            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
+        )
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
@@ -1294,6 +1314,7 @@ def refine_from_check():
     return profile_from_measurement(
         profile["speaker"], mic, mic.get("channel", 0), profile.get("voicing", "neutral"),
         refined, profile.get("loudness", "protected"), profile.get("bass", "normal"),
+        profile.get("channel_trim", "off"),
     )
 
 
@@ -1557,6 +1578,7 @@ def main():
     calibrate.add_argument("--loudness", choices=("protected", "balanced", "matched"),
                            default="protected")
     calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")
+    calibrate.add_argument("--channel-trim", choices=("off", "auto"), default="off")
     calibrate.add_argument("--mic-cal-file")
     calibrate.add_argument("--install", action="store_true",
                            help="install and play the result when it passes")
@@ -1564,6 +1586,7 @@ def main():
     reanalyze.add_argument("--voicing", choices=("warm", "neutral"))
     reanalyze.add_argument("--loudness", choices=("protected", "balanced", "matched"))
     reanalyze.add_argument("--bass", choices=("normal", "full"))
+    reanalyze.add_argument("--channel-trim", choices=("off", "auto"))
     reanalyze.add_argument("--channel")
     reanalyze.add_argument("--install", action="store_true",
                            help="install and play the result when it passes")
@@ -1576,12 +1599,12 @@ def main():
     elif command == "calibrate-json":
         profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,
-            args.loudness, args.bass,
+            args.loudness, args.bass, args.channel_trim,
         )
         print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "reanalyze-saved-json":
         profile = reanalyze_saved_capture(
-            args.voicing, args.channel, args.loudness, args.bass
+            args.voicing, args.channel, args.loudness, args.bass, args.channel_trim
         )
         print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "install-proposal":
