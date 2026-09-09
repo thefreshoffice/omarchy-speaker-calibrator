@@ -4,8 +4,30 @@ An Omarchy bar-panel plugin that measures speakers through PipeWire using either
 an internal microphone or an external/USB calibration microphone. Its native
 panel handles device selection, measurement quality, filter review, install,
 status, and disabling without opening a terminal. It generates a subtractive-first
-EQ, a protective 55 Hz high-pass, automatic headroom, and a -1 dBFS
-look-ahead limiter.
+EQ, a protective high-pass fitted to where the measurement says the speaker
+gives up (between 50 and 200 Hz), automatic headroom, and a -1 dBFS look-ahead
+limiter.
+
+## It works out of the box, and one optional package makes it better
+
+Everything here runs with what Omarchy already ships. Measure, install, and the
+speakers are calibrated: no downloads, no accounts, nothing to configure. That
+is the whole plugin, and it is the part most people will ever need.
+
+One thing is left out on purpose. **Deep bass** — the switch that makes small
+speakers sound like they reach lower than they physically can — needs a free
+package called **`bankstown`**, and it is *not* installed unless you ask for it.
+The reason is that `bankstown` is not in Omarchy's curated packages. It comes
+from the Arch User Repository, where anyone can publish, and it is built from
+source on your machine rather than installed as a reviewed binary.
+
+That is a judgement call about software you install, so the plugin does not make
+it for you. Nothing is downloaded until you press the button in **Advanced**,
+which tells you where the package comes from before it does anything. Leave it
+alone and the calibration is complete and unaffected; the switch simply stays
+off. Read [the upstream source](https://github.com/chadmed/bankstown) first if
+you want to, and see [Deep bass, an optional add-on](#deep-bass-an-optional-add-on)
+for what it actually does to the sound.
 
 Phase 1 uses three repeated exponential sine sweeps per speaker. Left and right
 are measured independently. The analyzer deconvolves the response with the
@@ -108,10 +130,10 @@ Install the required system packages, then add the plugin from its Git repositor
 
 ```bash
 omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
-omarchy plugin add https://github.com/michaeldeby/omarchy-speaker-calibrator.git --enable
+omarchy plugin add https://github.com/thefreshoffice/omarchy-speaker-calibrator.git --enable
 ```
 
-Omarchy clones the repository into `~/.config/omarchy/plugins/local.speaker-calibrator/`,
+Omarchy clones the repository into `~/.config/omarchy/plugins/thefreshoffice.speaker-calibrator/`,
 validates `manifest.json`, and asks where to place the bar widget. Review third-party
 plugin code before enabling it because shell plugins run unsandboxed inside the
 long-lived Omarchy shell process.
@@ -448,6 +470,63 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
   probe clips.
 - Multi-microphone disagreement increases optimizer uncertainty and therefore
   suppresses risky boosts.
+
+## What leaves your machine
+
+Nothing. The plugin makes no network requests of any kind: there is no API, no
+telemetry, no update check, and no account. Everything it needs is measured on
+the machine and written to the files listed below.
+
+The one exception is the optional `bankstown` package, and only if you press
+the button that installs it. That hands the work to Omarchy's own package
+tooling, which fetches from the Arch User Repository; the plugin itself still
+does not open a socket.
+
+The microphone is opened only while a measurement is running, which happens
+only when you start one. The recordings stay on disk under
+`~/.local/share/omarchy-speaker-calibrator/` and are never uploaded.
+
+## Removing it
+
+```
+omarchy plugin remove thefreshoffice.speaker-calibrator
+```
+
+Before removing, press **Disable** in the panel. That restores the default
+output, stops both services and takes the filter out of the audio path. If the
+plugin is removed while a calibration is still active, the PipeWire filter keeps
+running from the files below until they are deleted or the machine restarts, and
+the panel is no longer there to switch it off.
+
+Removing the plugin deletes the plugin's own directory and nothing else. These
+are created outside it and **stay behind**:
+
+| Path | What it is |
+| --- | --- |
+| `~/.config/systemd/user/omarchy-speaker-tuning.service` | runs the filter graph |
+| `~/.config/systemd/user/omarchy-speaker-loudness.service` | follows the volume for loudness compensation |
+| `~/.config/pipewire/omarchy-speaker-tuning.conf` | the filter sink |
+| `~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf` | the measured filters themselves |
+| `~/.local/share/omarchy-speaker-calibrator/` | profiles, the check, comparison state, and the recorded sweeps |
+
+The recordings in that last directory are audio captured in your room by your
+microphone. Nothing is ever sent anywhere, but they are still recordings of a
+room, and they survive removal until deleted.
+
+To remove all of it after disabling:
+
+```
+systemctl --user disable --now omarchy-speaker-tuning.service omarchy-speaker-loudness.service
+rm -f ~/.config/systemd/user/omarchy-speaker-tuning.service \
+      ~/.config/systemd/user/omarchy-speaker-loudness.service \
+      ~/.config/pipewire/omarchy-speaker-tuning.conf \
+      ~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf
+systemctl --user daemon-reload
+rm -rf ~/.local/share/omarchy-speaker-calibrator
+```
+
+If you installed the optional `bankstown` package it is a normal system package
+and is left alone; remove it with `pacman -R bankstown` if you want it gone.
 
 ## Research basis
 

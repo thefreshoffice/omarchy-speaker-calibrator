@@ -14,6 +14,15 @@ import sys
 import time
 from pathlib import Path
 
+# Reading and writing anything another process could have replaced first.
+from calibration_io import (  # noqa: E402
+    MAX_DESCRIPTION_BYTES,
+    UnsafeFile,
+    read_text_bounded,
+    secure_directory,
+    write_atomic,
+)
+
 # The measurement and fitting code pulls in NumPy and SciPy, a fifth of a
 # second every time the process starts.  Reading the status, listing devices
 # and flipping any switch need none of it, and those are the calls the panel
@@ -123,7 +132,9 @@ WantedBy=graphical-session.target
 
 def plugin_version():
     try:
-        manifest = json.loads((Path(__file__).resolve().parent / "manifest.json").read_text())
+        manifest = json.loads(
+            read_text_bounded(Path(__file__).resolve().parent / "manifest.json",
+                              missing_ok=False))
         return str(manifest.get("version", "unknown"))
     except (OSError, ValueError):
         return "unknown"
@@ -151,8 +162,10 @@ def bass_enhancer_status():
             text = ""
             for turtle in sorted(bundle.glob("*.ttl")):
                 try:
-                    text += turtle.read_text(errors="ignore")
-                except OSError:
+                    chunk = read_text_bounded(
+                        turtle, MAX_DESCRIPTION_BYTES, errors="ignore")
+                    text += chunk or ""
+                except (OSError, UnsafeFile):
                     continue
             if BASS_ENHANCER_URI not in text:
                 continue
@@ -245,12 +258,11 @@ def ensure_loudness_unit():
     wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
     fresh = True
     try:
-        fresh = unit.read_text() != wanted
+        fresh = read_text_bounded(unit) != wanted
     except OSError:
         pass
     if fresh:
-        unit.parent.mkdir(parents=True, exist_ok=True)
-        unit.write_text(wanted)
+        write_atomic(unit, wanted)
         run(["systemctl", "--user", "daemon-reload"], check=False)
     enabled = run(
         ["systemctl", "--user", "is-enabled", LOUDNESS_SERVICE], check=False, capture=True
@@ -292,7 +304,7 @@ def loudness_toggle():
         raise SystemExit("Calibrate the speakers first; there is nothing to compensate.")
     wanted = "off" if profile.get("loudness_compensation") == "on" else "on"
     profile["loudness_compensation"] = wanted
-    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+    write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
 
     # The sound changes here, before anything slow is asked of systemd.  Only
     # the compensator and the gain that pays its attenuation back move, so
@@ -305,7 +317,7 @@ def loudness_toggle():
         method = "live"
         # Keep the graph on disk in step, so a restart keeps the setting.
         enhancer = bass_enhancer_status()["usable"]
-        FRAGMENT.write_text(filter_config(
+        write_atomic(FRAGMENT, filter_config(
             profile["speaker"]["name"], profile.get("fit") or {},
             bass_enhancer=enhancer,
             deep_bass=profile.get("deep_bass") == "on" and enhancer,
@@ -826,7 +838,7 @@ def backup(path):
     if path.exists():
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         destination = DATA / "backups" / f"{path.name}.{stamp}"
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        secure_directory(destination.parent)
         shutil.copy2(path, destination)
 
 
@@ -840,7 +852,7 @@ def move_apps(target):
 
 def compare_state():
     try:
-        state = json.loads(COMPARE_STATE.read_text())
+        state = json.loads(read_text_bounded(COMPARE_STATE) or '')
     except (OSError, ValueError):
         state = {}
     if state.get("active") not in ("current", "previous"):
@@ -850,8 +862,7 @@ def compare_state():
 
 
 def write_compare_state(state):
-    DATA.mkdir(parents=True, exist_ok=True)
-    COMPARE_STATE.write_text(json.dumps(state) + "\n")
+    write_atomic(COMPARE_STATE, json.dumps(state) + "\n")
 
 
 def transparent_controls(bass_enhancer=None, level_match_db=0.0):
@@ -876,7 +887,7 @@ def transparent_controls(bass_enhancer=None, level_match_db=0.0):
 def profile_summary(path):
     """A short label for a saved profile, or None when there is none."""
     try:
-        profile = json.loads(path.read_text())
+        profile = json.loads(read_text_bounded(path) or '')
     except (OSError, ValueError):
         return None
     fit = profile.get("fit") or {}
@@ -991,8 +1002,7 @@ def activate_profile(profile):
         fit, bass_enhancer=enhancer, deep_bass=deep_bass,
         loudness_compensation=compensation, sink_volume_db=volume,
     )
-    FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
-    FRAGMENT.write_text(filter_config(
+    write_atomic(FRAGMENT, filter_config(
         profile["speaker"]["name"], fit, bass_enhancer=enhancer, deep_bass=deep_bass,
         loudness_compensation=compensation, sink_volume_db=volume,
     ))
@@ -1151,21 +1161,21 @@ def restart_tuning():
 def install_profile(profile, graph):
     if not Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl").exists():
         raise SystemExit("Missing lsp-plugins-lv2. Install it with: omarchy pkg add lsp-plugins-lv2")
-    DATA.mkdir(parents=True, exist_ok=True)
+    secure_directory(DATA, repair_contents=True)
     keep_previous_profile()
     for path in (HOST, FRAGMENT, UNIT):
         backup(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-    HOST.write_text(HOST_TEXT)
-    FRAGMENT.write_text(graph)
-    UNIT.write_text(UNIT_TEXT)
-    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+        secure_directory(path.parent)
+    write_atomic(HOST, HOST_TEXT)
+    write_atomic(FRAGMENT, graph)
+    write_atomic(UNIT, UNIT_TEXT)
+    write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     return activate_profile(profile)
 
 
 def load_profile(path):
     try:
-        profile = json.loads(path.read_text())
+        profile = json.loads(read_text_bounded(path) or '')
     except (OSError, ValueError):
         return None
     if not profile.get("fit") or not profile.get("speaker", {}).get("name"):
@@ -1340,7 +1350,7 @@ def capture_measurement(
     channels = next(
         (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
     )
-    DATA.mkdir(parents=True, exist_ok=True)
+    secure_directory(DATA, repair_contents=True)
     level_search = find_measurement_level(
         sink_name, mic_name, channel, channels, level_sink=level_sink
     )
@@ -1454,7 +1464,7 @@ def profile_from_measurement(
         "quality": quality,
         "fit": fit_payload,
     }
-    PROPOSAL.write_text(json.dumps(profile, indent=2) + "\n")
+    write_atomic(PROPOSAL, json.dumps(profile, indent=2) + "\n")
     return profile
 
 
@@ -1489,7 +1499,7 @@ def reanalyze_saved_capture(
     recording = DATA / "measurement.wav"
     if not PROPOSAL.exists() or not recording.exists():
         raise SystemExit("No saved capture and proposal are available to reanalyze.")
-    previous = json.loads(PROPOSAL.read_text())
+    previous = json.loads(read_text_bounded(PROPOSAL) or '')
     sink = previous["speaker"]
     mic = previous["microphone"]
     channel = parse_channel_selection(
@@ -1576,7 +1586,7 @@ def calibrate_noninteractive(
 def install_proposal():
     if not PROPOSAL.exists():
         raise SystemExit("No measured proposal is available.")
-    profile = json.loads(PROPOSAL.read_text())
+    profile = json.loads(read_text_bounded(PROPOSAL) or '')
     return install_now(profile)
 
 
@@ -1608,7 +1618,7 @@ def install_if_accepted(profile):
 def load_verification():
     """The stored verification, marked stale when the profile has moved on."""
     try:
-        report = json.loads(VERIFICATION.read_text())
+        report = json.loads(read_text_bounded(VERIFICATION) or '')
     except (OSError, ValueError):
         return None
     profile = load_profile(PROFILE)
@@ -1632,7 +1642,7 @@ def deep_bass_toggle():
         raise SystemExit("Calibrate the speakers first; there is nothing to add bass to.")
     wanted = "off" if profile.get("deep_bass") == "on" else "on"
     profile["deep_bass"] = wanted
-    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+    write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     method = activate_profile(profile)
     return {**status, "started": False, "deep_bass": wanted, "method": method,
             "message": ("Deep bass on" if wanted == "on" else "Deep bass off")}
@@ -1748,14 +1758,29 @@ def verify_calibration(channel_override=None):
             "The check itself did not measure cleanly, so it says nothing about the "
             "calibration."
         ] + list(quality["failures"])
-    DATA.mkdir(parents=True, exist_ok=True)
-    VERIFICATION.write_text(json.dumps(report, indent=2) + "\n")
+    write_atomic(VERIFICATION, json.dumps(report, indent=2) + "\n")
     return report
 
 
+def cached_status():
+    """The last status this plugin wrote, for drawing the panel immediately.
+
+    Read here rather than in the panel: the panel is the shell, and a file at
+    a predictable name under the data directory is something any process
+    running as this user can replace with a symlink or a pipe.  Anything
+    unreadable, oversized or not the shape written is simply absent, because
+    a stale panel is better than a wrong one.
+    """
+    try:
+        payload = json.loads(read_text_bounded(STATUS_CACHE) or "")
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) and payload.get("service") else {}
+
+
 def status_payload():
-    profile = json.loads(PROFILE.read_text()) if PROFILE.exists() else None
-    proposal = json.loads(PROPOSAL.read_text()) if PROPOSAL.exists() else None
+    profile = load_profile(PROFILE)
+    proposal = load_profile(PROPOSAL)
     active = run(["systemctl", "--user", "is-active", SERVICE], check=False, capture=True).stdout.strip()
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
     compare = compare_payload()
@@ -1770,8 +1795,7 @@ def status_payload():
             "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
             "loudnessTracker": "running" if loudness_running() else "stopped"}
     try:
-        DATA.mkdir(parents=True, exist_ok=True)
-        STATUS_CACHE.write_text(json.dumps(payload) + "\n")
+        write_atomic(STATUS_CACHE, json.dumps(payload) + "\n")
     except OSError:
         pass
     return payload
@@ -1919,7 +1943,7 @@ def status():
 
 
 def disable():
-    profile = json.loads(PROFILE.read_text()) if PROFILE.exists() else None
+    profile = load_profile(PROFILE)
     target = profile["speaker"]["name"] if profile else None
     if target:
         move_apps(target)
@@ -1931,7 +1955,8 @@ def disable():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
-    for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
+    for name in ("wizard", "status", "status-json", "status-cache-json",
+                 "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
     for name in ("deep-bass-toggle", "install-bass-enhancer", "loudness-toggle"):
@@ -1967,6 +1992,8 @@ def main():
         print(json.dumps(devices_payload()))
     elif command == "status-json":
         print(json.dumps(status_payload()))
+    elif command == "status-cache-json":
+        print(json.dumps(cached_status()))
     elif command == "calibrate-json":
         profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,

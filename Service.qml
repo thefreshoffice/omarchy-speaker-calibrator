@@ -14,6 +14,13 @@ Item {
   property string message: ""
   property string _stdout: ""
   property string _stderr: ""
+  // The helper is ours, but its output is still input to this process: the
+  // shell hosts every widget, so a run that never stops printing must not be
+  // allowed to grow without bound here.  Collected in chunks against a budget
+  // rather than whole, and the run is killed the moment it goes over.
+  readonly property int _maxOutput: 262144
+  readonly property int _maxError: 8192
+  property bool _overflowed: false
 
   function start(operation, arguments) {
     if (busy || helperPath === "") return
@@ -30,6 +37,7 @@ Item {
       : operation === "refit" ? "Applying…" : "Working…"
     _stdout = ""
     _stderr = ""
+    _overflowed = false
     // Keep mise/user-site packages from shadowing Arch's matched NumPy/SciPy
     // pair.  -s disables only the user site; /usr/lib Python packages remain.
     process.command = ["/usr/bin/env", "-u", "PYTHONHOME", "-u", "PYTHONPATH",
@@ -98,6 +106,11 @@ Item {
     }
   }
   function refresh() { if (!busy) start("devices", ["devices-json"]) }
+  // Draw from the last known state before the full check answers.  The helper
+  // reads that file, not the panel: it lives at a predictable name that any
+  // process running as this user could replace with a symlink or a pipe, and
+  // this is the shell.
+  function loadCache() { if (!busy) start("cache", ["status-cache-json"]) }
   function refreshStatus() { start("status", ["status-json"]) }
   // Measure; with install=true the result is installed and played as soon as
   // it passes, so one press does the whole job.
@@ -142,15 +155,55 @@ Item {
       + ((check.notes && check.notes.length > 0) ? check.notes[0] : "off plan by " + off + " dB.")
   }
 
+  // Append one chunk if it fits, and stop the run if it does not.  Killing on
+  // overflow is the point: truncating would leave a half-read JSON document
+  // that parses into something arbitrary.
+  function _collect(chunk, isError) {
+    if (_overflowed) return
+    var limit = isError ? _maxError : _maxOutput
+    var current = isError ? _stderr : _stdout
+    if (current.length + chunk.length > limit) {
+      _overflowed = true
+      _stdout = ""
+      _stderr = ""
+      process.signal(15)
+      killTimer.restart()
+      return
+    }
+    if (isError) _stderr += chunk
+    else _stdout += chunk
+  }
+
+  // If the term did not land, insist.
+  Timer {
+    id: killTimer
+    interval: 2000
+    onTriggered: if (process.running) process.signal(9)
+  }
+
+  Component.onDestruction: if (process.running) process.signal(15)
+
   Process {
     id: process
     running: false
     command: []
-    stdout: StdioCollector { id: stdoutCollector; waitForEnd: true; onStreamFinished: root._stdout = text }
-    stderr: StdioCollector { id: stderrCollector; waitForEnd: true; onStreamFinished: root._stderr = text }
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) { root._collect(chunk, false) }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function (chunk) { root._collect(chunk, true) }
+    }
     onExited: function(exitCode) {
-      var raw = String(stdoutCollector.text || root._stdout || "").trim()
-      var err = String(stderrCollector.text || root._stderr || "").trim()
+      var raw = String(root._stdout || "").trim()
+      var err = String(root._stderr || "").trim()
+      if (root._overflowed) {
+        root.error = "The helper produced more output than the panel will read."
+        root.message = ""
+        root.phase = ""
+        return
+      }
       if (exitCode !== 0) {
         root.error = err || raw || "Operation failed"
         root.message = ""
@@ -165,6 +218,13 @@ Item {
           root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "cache") {
+          root.applyCachedStatus(raw)
+          root.message = ""
+          root.phase = ""
+          Qt.callLater(root.refresh)
           return
         }
         if (root.phase === "status") {

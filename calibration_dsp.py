@@ -12,6 +12,8 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
+
+from calibration_io import MAX_CALIBRATION_BYTES, read_text_bounded
 from typing import Iterable
 
 try:
@@ -136,13 +138,17 @@ def parse_mic_calibration(path: str | Path | None) -> dict | None:
     """Parse common frequency/correction-dB microphone calibration text files."""
     if not path:
         return None
-    source = Path(path).expanduser().resolve()
-    if not source.is_file():
-        raise ValueError(f"Microphone calibration file not found: {source}")
+    # The user picked this path, so it is input like any other: read it once
+    # through a descriptor that refuses a symlink and caps the size, rather
+    # than testing the name and opening it again afterwards.
+    source = Path(path).expanduser()
     frequencies: list[float] = []
     corrections: list[float] = []
     sensitivity_dbfs = None
-    for line in source.read_text(errors="replace").splitlines():
+    body = read_text_bounded(source, MAX_CALIBRATION_BYTES, errors="replace")
+    if body is None:
+        raise ValueError(f"Microphone calibration file not found: {source}")
+    for line in body.splitlines():
         sensitivity = re.search(
             r"sens(?:itivity)?[^-+0-9]*([-+]?\d+(?:\.\d+)?)\s*dBFS",
             line, re.IGNORECASE,

@@ -8,8 +8,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "local.speaker-calibrator"
-  ipcTarget: "local.speaker-calibrator.panel"
+  moduleName: "thefreshoffice.speaker-calibrator"
+  ipcTarget: "thefreshoffice.speaker-calibrator.panel"
   manageIpc: false
 
   property var anchorItem: null
@@ -465,6 +465,7 @@ Panel {
     property string value: ""
     spacing: Style.space(10)
     Text {
+      textFormat: Text.PlainText
       Layout.preferredWidth: Style.space(130)
       Layout.alignment: Qt.AlignTop
       text: key
@@ -474,6 +475,7 @@ Panel {
       elide: Text.ElideRight
     }
     Text {
+      textFormat: Text.PlainText
       Layout.fillWidth: true
       text: value
       color: root.foreground
@@ -490,6 +492,7 @@ Panel {
     Repeater {
       model: tableRow.cells
       Text {
+        textFormat: Text.PlainText
         Layout.preferredWidth: [Style.space(26), Style.space(92), Style.space(84), Style.space(46), Style.space(76)][index]
         horizontalAlignment: index >= 2 ? Text.AlignRight : Text.AlignLeft
         text: String(modelData)
@@ -678,22 +681,11 @@ Panel {
     context.globalAlpha = 1.0
   }
 
-  readonly property string dataDirectory:
-    (Quickshell.env("XDG_DATA_HOME")
-      || ((Quickshell.env("HOME") || "") + "/.local/share"))
-    + "/omarchy-speaker-calibrator"
-
   Service { id: service; helperPath: root.helperPath }
 
-  // The panel is drawn from this before the helper has answered.
-  FileView {
-    id: statusCache
-    path: root.dataDirectory + "/status-cache.json"
-    watchChanges: false
-    preload: true
-    printErrors: false
-    onLoaded: service.applyCachedStatus(text())
-  }
+  // The panel is drawn from the last known state before the helper has
+  // answered.  Reading that file is the helper's job, not this process's.
+  Component.onCompleted: service.loadCache()
 
   Connections {
     target: service
@@ -750,6 +742,7 @@ Panel {
             fontFamily: root.fontFamily
             iconComponent: Component {
               Text {
+                textFormat: Text.PlainText
                 text: "󰓃"
                 color: root.foreground
                 font.family: root.fontFamily
@@ -758,6 +751,7 @@ Panel {
             }
           }
           Text {
+            textFormat: Text.PlainText
             visible: service.error !== ""
             width: parent.width
             text: service.error
@@ -768,6 +762,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: service.message !== "" && !service.busy
             width: parent.width
             text: service.message
@@ -778,6 +773,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: !service.busy && service.proposal !== null && service.proposal !== undefined
               && service.proposal.quality !== undefined && service.proposal.quality.accepted === false
             width: parent.width
@@ -789,6 +785,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: !service.busy && service.status.verification !== undefined
               && service.status.verification !== null
             width: parent.width
@@ -850,6 +847,29 @@ Panel {
               onClicked: service.deepBass()
             }
 
+            RowLayout {
+              visible: root.bassWarningText() !== ""
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                textFormat: Text.PlainText
+                Layout.alignment: Qt.AlignTop
+                text: "󰀪"
+                color: bar ? bar.urgent : Color.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+              Text {
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                text: root.bassWarningText()
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+
             Toggle {
               visible: service.status.enabled
               width: parent.width
@@ -862,30 +882,6 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: service.bypass()
-            }
-
-
-
-
-            RowLayout {
-              visible: root.bassWarningText() !== ""
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                Layout.alignment: Qt.AlignTop
-                text: "󰀪"
-                color: bar ? bar.urgent : Color.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.icon
-              }
-              Text {
-                Layout.fillWidth: true
-                text: root.bassWarningText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
             }
 
             Column {
@@ -911,6 +907,7 @@ Panel {
                 onWidthChanged: requestPaint()
               }
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: "Each coloured band is one filter, its node at the frequency and gain; the bright line is everything added together. The dashed line is the gain applied before the limiter."
                 color: root.dim
@@ -943,6 +940,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             text: "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
             color: root.dim
@@ -972,6 +970,7 @@ Panel {
               }
             }
             Text {
+              textFormat: Text.PlainText
               visible: service.sinks.length === 0
               width: parent.width
               text: "No speakers found. Middle-click the bar icon to refresh."
@@ -1006,6 +1005,7 @@ Panel {
               }
             }
             Text {
+              textFormat: Text.PlainText
               visible: service.microphones.length === 0
               width: parent.width
               text: "No microphone found. Plug one in or middle-click the bar icon to refresh."
@@ -1019,6 +1019,7 @@ Panel {
               width: parent.width
               spacing: Style.space(8)
               Text {
+                textFormat: Text.PlainText
                 Layout.alignment: Qt.AlignTop
                 text: "󰋽"
                 color: root.dim
@@ -1026,6 +1027,7 @@ Panel {
                 font.pixelSize: Style.font.icon
               }
               Text {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 Layout.alignment: Qt.AlignVCenter
                 text: "The built-in mics already give a big improvement. An external measuring mic, placed where you sit, improves the sound a lot more."
@@ -1076,7 +1078,7 @@ Panel {
               columnSpacing: Style.space(10)
               rowSpacing: Style.space(8)
 
-              Text { text: "VOICING"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "VOICING"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
               QQC.ComboBox {
                 id: voicingBox
                 Layout.fillWidth: true
@@ -1086,7 +1088,7 @@ Panel {
                 onActivated: function(index) { root.voicingMode = index === 1 ? "warm" : "neutral" }
               }
 
-              Text { text: "LOUDER"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "LOUDER"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
               QQC.ComboBox {
                 id: loudnessBox
                 Layout.fillWidth: true
@@ -1098,7 +1100,7 @@ Panel {
                 onActivated: function(index) { root.loudnessMode = ["protected", "balanced", "matched"][index] }
               }
 
-              Text { text: "BASS"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "BASS"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
               QQC.ComboBox {
                 id: bassBox
                 Layout.fillWidth: true
@@ -1109,7 +1111,7 @@ Panel {
                 onActivated: function(index) { root.bassMode = index === 1 ? "full" : "normal" }
               }
 
-              Text { text: "CHANNEL BALANCE"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+              Text { textFormat: Text.PlainText; text: "CHANNEL BALANCE"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
               QQC.ComboBox {
                 id: channelTrimBox
                 Layout.fillWidth: true
@@ -1121,6 +1123,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.multiMicAvailable() || !root.selectedMicIsInternal()
                 text: "MIC CHANNEL"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
               }
@@ -1133,6 +1136,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: !root.selectedMicIsInternal()
                 text: "MIC CAL FILE"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true
               }
@@ -1158,6 +1162,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: "Loudness toggle = Bass full. Make it louder = Louder matched. Refit applies these to the last measurement without new sweeps. CHANNEL BALANCE only ever acts on a measurement made with an external microphone placed where you listen, and only when the difference stands clear of what the measurement itself varies by; built-in microphones sit closer to one speaker than the other, so what they measure is where they are rather than what reaches you."
               color: root.dim
@@ -1293,6 +1298,7 @@ Panel {
               Repeater {
                 model: root.issueLines()
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   text: "•  " + modelData
                   color: service.proposal && service.proposal.quality
@@ -1310,6 +1316,7 @@ Panel {
               width: parent.width
               spacing: Style.space(2)
               Text {
+                textFormat: Text.PlainText
                 text: "TRY"
                 color: root.dim
                 font.family: root.fontFamily
@@ -1319,6 +1326,7 @@ Panel {
               Repeater {
                 model: root.guidanceLines()
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   text: "→  " + modelData
                   color: root.foreground
@@ -1330,6 +1338,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.microphoneArrayText() !== ""
               width: parent.width
               text: root.microphoneArrayText()
@@ -1591,6 +1600,7 @@ Panel {
                 Repeater {
                   model: (service.status.verification || {}).notes || []
                   Text {
+                    textFormat: Text.PlainText
                     width: parent.width
                     text: "•  " + modelData
                     color: (service.status.verification || {}).verdict === "fail"
