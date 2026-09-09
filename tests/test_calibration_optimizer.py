@@ -1197,9 +1197,15 @@ class StartupCostTests(unittest.TestCase):
 class LoudnessCompensationTests(unittest.TestCase):
     """The curve must be the only thing it applies; the level is not ours."""
 
-    def net_gain_db(self, controls):
+    def net_gain_db(self, controls, base_gain=1.0):
+        """What the compensation does to the level, contour aside.
+
+        The contour attenuates by its volume setting and the make-up on the
+        limiter pays that back, so the two have to cancel.
+        """
         import math
-        return controls["loudcomp:volume"] + 20 * math.log10(controls["loudcomp:input"])
+        return (controls["loudcomp:volume"]
+                + 20 * math.log10(controls["limiter:g_in"] / base_gain))
 
     def test_the_volume_is_read_from_what_pactl_prints(self):
         # The number and its unit are separate words, and every channel is
@@ -1217,30 +1223,56 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(speaker_calibrate.parse_sink_volume_db("no volume here"), 0.0)
 
     def test_it_never_changes_the_level(self):
-        # Its volume control attenuates as well as choosing the curve, and the
-        # attenuating belongs to the output device, so the two must cancel.
-        for volume in (0.0, -6.0, -9.4, -20.0, -35.0):
-            controls = speaker_calibrate.loudness_controls(volume, True)
-            self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
+        # Its volume control attenuates as well as choosing the contour, and
+        # the attenuating belongs to the output device, so the two must cancel.
+        for volume in (0.0, -6.0, -9.4, -12.0, -35.0):
+            for base in (1.0, 1.663413):
+                controls = speaker_calibrate.loudness_controls(volume, True, base)
+                self.assertAlmostEqual(self.net_gain_db(controls, base), 0.0, places=4)
+
+    def test_the_make_up_never_goes_in_front_of_the_compensator(self):
+        # The plugin decides how much to compensate from the level reaching
+        # it, so gain on its own input reads as the music being loud again and
+        # cancels the contour: measured at 60 Hz against 1500 Hz, +25 dB of
+        # bass at -20 dB became -1 dB once the matching input gain was set.
+        # The make-up belongs downstream, on the limiter.
+        for volume in (0.0, -6.0, -12.0, -40.0):
+            controls = speaker_calibrate.loudness_controls(volume, True, 1.5)
+            self.assertEqual(controls["loudcomp:input"], 1.0)
+        quiet = speaker_calibrate.loudness_controls(-12.0, True, 1.5)
+        self.assertGreater(quiet["limiter:g_in"], 1.5)
 
     def test_a_quieter_setting_asks_for_a_lower_contour(self):
         loud = speaker_calibrate.loudness_controls(0.0, True)
-        quiet = speaker_calibrate.loudness_controls(-20.0, True)
+        quiet = speaker_calibrate.loudness_controls(-9.0, True)
         self.assertLess(quiet["loudcomp:volume"], loud["loudcomp:volume"])
-        self.assertAlmostEqual(
-            loud["loudcomp:volume"], speaker_calibrate.LOUDNESS_FULL_SCALE_OFFSET_DB
-        )
+        # Full volume is the reference, so there it asks for nothing at all.
+        self.assertEqual(loud["loudcomp:volume"], 0.0)
+        self.assertEqual(loud["limiter:g_in"], 1.0)
 
     def test_the_contour_stops_at_the_floor(self):
         controls = speaker_calibrate.loudness_controls(-90.0, True)
         self.assertEqual(controls["loudcomp:volume"], speaker_calibrate.LOUDNESS_FLOOR_DB)
         self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
 
+    def test_the_make_up_cannot_drive_the_limiter_harder(self):
+        # The make-up is exactly the attenuation the volume control already
+        # applied, so what arrives at the limiter is never louder than it
+        # would be at full volume, however far down the contour goes.
+        import math
+        for volume in (0.0, -3.0, -12.0, -30.0, -60.0):
+            controls = speaker_calibrate.loudness_controls(volume, True)
+            headroom = volume + 20 * math.log10(controls["limiter:g_in"])
+            # The gain is rounded for the wire, so allow that much and no more.
+            self.assertLessEqual(headroom, 0.001)
+
     def test_switched_off_it_is_inert(self):
-        controls = speaker_calibrate.loudness_controls(-30.0, False)
+        controls = speaker_calibrate.loudness_controls(-30.0, False, 1.663413)
         self.assertEqual(controls["loudcomp:enabled"], 0.0)
         self.assertEqual(controls["loudcomp:input"], 1.0)
         self.assertEqual(controls["loudcomp:volume"], 0.0)
+        # And the calibrated gain is handed back untouched.
+        self.assertAlmostEqual(controls["limiter:g_in"], 1.663413, places=5)
 
     def test_it_uses_the_current_equal_loudness_standard(self):
         controls = speaker_calibrate.loudness_controls(-10.0, True)
@@ -1256,10 +1288,13 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(set(off), set(on))
         self.assertEqual(off["loudcomp:enabled"], 0.0)
         self.assertEqual(on["loudcomp:enabled"], 1.0)
+        # The limiter's gain carries the make-up, so it moves with it.
+        self.assertGreater(on["limiter:g_in"], off["limiter:g_in"])
         # Nothing else moves, so switching it is a control change, not a rebuild.
+        skip = ("loudcomp:", "limiter:g_in")
         self.assertEqual(
-            {k: v for k, v in off.items() if not k.startswith("loudcomp:")},
-            {k: v for k, v in on.items() if not k.startswith("loudcomp:")},
+            {k: v for k, v in off.items() if not k.startswith(skip)},
+            {k: v for k, v in on.items() if not k.startswith(skip)},
         )
 
     def test_bypassing_the_calibration_also_flattens_it(self):

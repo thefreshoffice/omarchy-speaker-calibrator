@@ -295,8 +295,11 @@ def loudness_toggle():
     PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
 
     # The sound changes here, before anything slow is asked of systemd.  Only
-    # the compensator's own controls move, so this is a handful of milliseconds.
-    controls = loudness_controls(sink_volume_db(VIRTUAL_SINK), wanted == "on")
+    # the compensator and the gain that pays its attenuation back move, so
+    # this is a handful of milliseconds.
+    fit = profile.get("fit") or {}
+    controls = loudness_controls(
+        sink_volume_db(VIRTUAL_SINK), wanted == "on", fit.get("input_gain_linear", 1.0))
     if apply_controls_live(controls):
         method = "live"
         # Keep the graph on disk in step, so a restart keeps the setting.
@@ -494,16 +497,27 @@ LOUDNESS_STANDARD = 4.0        # ISO 226:2023
 LOUDNESS_MODE = 1.0            # IIR: minimum phase, so it adds no latency
 LOUDNESS_APPROX = 2.0
 # Its volume control is where the listening level goes, and it attenuates by
-# that much as well as choosing the contour.  The attenuation belongs to the
-# output device, not to us, so the input gain cancels it and only the contour
-# is left.
-LOUDNESS_FLOOR_DB = -40.0
-# What full volume is assumed to be, relative to the 83 dB reference the
-# compensator is calibrated against.  A laptop at arm's length is well short
-# of that, and this is an assumption rather than a measurement: it decides how
-# much compensation a given volume setting earns, not whether the shape is
-# right.
-LOUDNESS_FULL_SCALE_OFFSET_DB = -5.0
+# that much as well as choosing the contour.  The attenuation has to be paid
+# back somewhere downstream of the plugin: its own input gain looks like the
+# obvious place and is not, because the plugin works out how much to
+# compensate from the level it sees, so gain in front of it is read as the
+# music being loud again and cancels the contour exactly.  Measured at 60 Hz
+# against 1500 Hz, the contour is worth +25 dB of bass at -20 dB with unity
+# input and -1 dB with the input gain that matches it.  The make-up therefore
+# goes on the limiter's input gain, which is past the compensator.
+#
+# Full volume is the reference: at 0 dB nothing is compensated and nothing is
+# paid back.  That is also what keeps this safe, because the make-up is
+# exactly the attenuation the volume control already applied, so the level
+# arriving at the limiter is the same as it would be at full volume however
+# far down the contour goes.
+#
+# The floor stops the contour deepening past the point where it is still
+# about hearing rather than about effect.  Measured on speakers whose usable
+# range starts at 196 Hz, it is worth about 2 dB of warmth at 70% volume and
+# 4 dB at 50%; most of what the contour asks for lives below where a laptop
+# speaker plays at all, and the high-pass after the compensator drops it.
+LOUDNESS_FLOOR_DB = -25.0
 LOUDNESS_SERVICE = "omarchy-speaker-loudness.service"
 LOUDNESS_TRACKER = "loudness-tracker.py"
 
@@ -579,25 +593,36 @@ def highpass_settings(fit_payload):
     return corner, q, max(1, min(2, stages))
 
 
-def loudness_controls(sink_volume_db, enabled):
+def loudness_level_db(sink_volume_db):
+    """The listening level the contour is chosen for, in dB below full volume.
+
+    Only how far the volume has been turned down matters, because that is the
+    part of the listening level actually known here.  How loud full volume is
+    in the room is not, so it is taken as the reference and left alone.
+    """
+    return float(np_free_clip(float(sink_volume_db), LOUDNESS_FLOOR_DB, 0.0))
+
+
+def loudness_controls(sink_volume_db, enabled, input_gain_linear=1.0):
     """Compensator settings for the level the speakers are playing at.
 
     ``volume`` carries the listening level, which selects the contour and
-    attenuates by the same amount; ``input`` is a linear gain, so cancelling
-    it there leaves the contour and nothing else.  The output device keeps
-    doing the actual attenuating, which means this never fights the volume
-    keys and never doubles them.
+    attenuates by the same amount.  Its own ``input`` gain stays at unity:
+    the plugin reads the level in front of it to decide how much to
+    compensate, so paying the attenuation back there would tell it the music
+    is loud and leave a contour worth nothing.  It is paid back on the
+    limiter instead, which the signal reaches after the compensator.
     """
-    level = float(np_free_clip(
-        float(sink_volume_db) + LOUDNESS_FULL_SCALE_OFFSET_DB, LOUDNESS_FLOOR_DB, 0.0
-    ))
+    level = loudness_level_db(sink_volume_db) if enabled else 0.0
+    makeup = 10.0 ** (-level / 20.0)
     return {
         "loudcomp:enabled": 1.0 if enabled else 0.0,
-        "loudcomp:volume": level if enabled else 0.0,
-        "loudcomp:input": round(10.0 ** (-level / 20.0), 6) if enabled else 1.0,
+        "loudcomp:volume": level,
+        "loudcomp:input": 1.0,
         "loudcomp:std": LOUDNESS_STANDARD,
         "loudcomp:mode": LOUDNESS_MODE,
         "loudcomp:approx": LOUDNESS_APPROX,
+        "limiter:g_in": round(float(input_gain_linear) * makeup, 6),
     }
 
 
@@ -657,8 +682,10 @@ def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False,
         controls[f"bal_{side}:Add"] = 0.0
     if bass_enhancer:
         controls.update(bass_enhancer_controls(corner, deep_bass))
-    controls.update(loudness_controls(sink_volume_db, loudness_compensation))
-    controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
+    # Last, because the compensation's make-up rides on the limiter's input
+    # gain and needs the calibrated value to build on.
+    controls.update(loudness_controls(
+        sink_volume_db, loudness_compensation, fit_payload["input_gain_linear"]))
     return controls
 
 
@@ -979,9 +1006,16 @@ def added_sound_silenced():
         name: value for name, value in live.items() if name.startswith("loudcomp:")
     }
     if compensation and compensation.get("loudcomp:enabled", 0.0) >= 0.5:
+        # The make-up that pays back the contour's attenuation lives on the
+        # limiter, so silencing the contour has to take that back off too, or
+        # the speaker would be measured louder than it plays.
+        makeup = 10.0 ** (-float(compensation.get("loudcomp:volume", 0.0)) / 20.0)
+        gain = float(live.get("limiter:g_in", 1.0))
         running.update(compensation)
+        running["limiter:g_in"] = gain
         quiet.update({**compensation, "loudcomp:enabled": 0.0,
-                      "loudcomp:volume": 0.0, "loudcomp:input": 1.0})
+                      "loudcomp:volume": 0.0, "loudcomp:input": 1.0,
+                      "limiter:g_in": round(gain / makeup, 6)})
 
     if not quiet or not apply_controls_live(quiet):
         yield False

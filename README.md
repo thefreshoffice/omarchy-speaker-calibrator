@@ -171,16 +171,30 @@ switching the sound does and the toggle should be quick enough to hear the
 difference. It is only ever running while the compensation is on: started with
 the compensation off, it reads that and stops again.
 
-Two honest caveats. The compensator's volume control attenuates as well as
-selecting the curve, so the input gain cancels that and leaves the curve alone;
-the output device keeps doing the actual attenuating, which means this never
-fights the volume keys. And how much compensation a given volume earns depends
-on what full volume is in real decibels, which no uncalibrated measurement can
-tell us; the assumption is that full volume is a normal listening level. The
-shape of the correction is right regardless, only the amount depends on that.
-Whatever it lifts below the speaker's knee is removed again by the high-pass,
-so on a small laptop speaker most of its effect lands between the knee and the
-midrange.
+The compensator's volume control attenuates as well as selecting the curve,
+and that attenuation has to be paid back. Its own input gain is the obvious
+place and the wrong one: the plugin works out how much to compensate from the
+level reaching it, so gain in front of it reads as the music being loud again
+and cancels the curve exactly. Measured at 60 Hz against 1500 Hz, the curve is
+worth +25 dB of bass at −20 dB with unity input and −1 dB once the matching
+input gain is set — which is to say, nothing at all. The make-up therefore goes
+on the limiter's input gain, downstream of the compensator, where it restores
+the level and leaves the curve intact.
+
+That placement is also what makes it safe. The make-up is exactly the
+attenuation the volume control already applied, so the level arriving at the
+limiter is never higher than it would be at full volume, however deep the
+curve goes.
+
+Full volume is the reference: at 0 dB nothing is compensated and nothing is
+paid back, and the effect grows the further down you play. That sidesteps the
+one thing no uncalibrated measurement can know — what full volume is in real
+decibels — by only ever compensating the part of the listening level it can
+actually see, which is how far the volume has been turned down. Whatever the
+curve lifts below the speaker's knee is removed again by the high-pass, so on
+a small laptop speaker most of its effect lands between the knee and the
+midrange: on speakers whose usable range starts at 196 Hz it is worth about
+2 dB of warmth at 70% volume and 4 dB at 50%, with the loudness unchanged.
 
 ### Channel balance
 

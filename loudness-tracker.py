@@ -11,10 +11,14 @@ resubscribing after every change: restarting it each time leaves a window in
 which a volume move is missed, and a missed move leaves the wrong contour
 applied until the next one.
 
-It writes nothing but the compensator's own controls, so a failure here can
-change the loudness balance but never the calibration.  On the way out it
-switches the compensation off, which is the safe state: leaving a low-volume
-contour applied while the volume is high would be heard as far too much bass.
+It writes the compensator's controls and one gain downstream of it, the
+limiter's input gain, which pays back the attenuation the contour comes with.
+That gain is never invented here: it is the calibrated value from the profile
+multiplied by the make-up, so the worst a failure can do is leave the wrong
+loudness, never the wrong correction.  On the way out it switches the
+compensation off and puts that gain back, which is the safe state: leaving a
+low-volume contour applied while the volume is high would be heard as far too
+much bass, and leaving its make-up behind would be heard as too loud.
 """
 
 import importlib.util
@@ -45,6 +49,7 @@ class Tracker:
         self.applied_db = None
         self.profile_stamp = None
         self.enabled = False
+        self.input_gain = 1.0
         self.running = True
 
     def stop(self, *_):
@@ -72,7 +77,7 @@ class Tracker:
         node = self.find_node()
         if node is None:
             return False
-        controls = self.helper.loudness_controls(volume_db, enabled)
+        controls = self.helper.loudness_controls(volume_db, enabled, self.input_gain)
         if not self.helper.write_controls(node, controls):
             self.node = None
             return False
@@ -91,8 +96,12 @@ class Tracker:
         except OSError:
             return False
         if stamp != self.profile_stamp:
-            profile = self.helper.load_profile(self.helper.PROFILE)
-            self.enabled = (profile or {}).get("loudness_compensation") == "on"
+            profile = self.helper.load_profile(self.helper.PROFILE) or {}
+            self.enabled = profile.get("loudness_compensation") == "on"
+            # The make-up rides on the limiter's gain, so the calibrated value
+            # it builds on has to come from the same profile.
+            self.input_gain = float(
+                (profile.get("fit") or {}).get("input_gain_linear", 1.0))
             self.profile_stamp = stamp
         return self.enabled
 
@@ -151,7 +160,11 @@ def main():
         tracker.run()
     finally:
         # Whatever went wrong, do not leave a quiet-level contour running.
-        tracker.apply(0.0, enabled=False)
+        # Only when something was actually applied, though: the reset writes
+        # the calibrated gain back, and that value is only known once the
+        # profile has been read.
+        if tracker.applied_db is not None:
+            tracker.apply(0.0, enabled=False)
 
 
 if __name__ == "__main__":

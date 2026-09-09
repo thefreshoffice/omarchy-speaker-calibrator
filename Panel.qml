@@ -151,8 +151,8 @@ Panel {
     return "On, following the volume"
       + (service.status.loudnessTracker === "running" ? "." : " — but the service that "
          + "watches the volume is not running, so the amount is frozen where it was.")
-      + " How much it applies assumes full volume is a normal listening level; the shape "
-      + "is right either way."
+      + " Full volume is the reference, so it does nothing there and more the further "
+      + "down you play. The loudness stays the same either way; only the tone moves."
   }
   function heroMeta() {
     if (service.busy) return service.message
