@@ -43,6 +43,8 @@ class Tracker:
         self.helper = helper
         self.node = None
         self.applied_db = None
+        self.profile_stamp = None
+        self.enabled = False
         self.running = True
 
     def stop(self, *_):
@@ -77,8 +79,27 @@ class Tracker:
         self.applied_db = volume_db if enabled else None
         return True
 
+    def wanted(self):
+        """Whether the profile currently asks for compensation.
+
+        Read rather than assumed, so that switching the compensation off does
+        not race with an event already in flight here and turn it back on.
+        The profile is only re-read when it has actually changed.
+        """
+        try:
+            stamp = self.helper.PROFILE.stat().st_mtime
+        except OSError:
+            return False
+        if stamp != self.profile_stamp:
+            profile = self.helper.load_profile(self.helper.PROFILE)
+            self.enabled = (profile or {}).get("loudness_compensation") == "on"
+            self.profile_stamp = stamp
+        return self.enabled
+
     def follow_volume(self):
         """Apply the current volume if it has moved enough to matter."""
+        if not self.wanted():
+            return self.apply(0.0, enabled=False) if self.applied_db is not None else True
         volume = self.helper.sink_volume_db(self.helper.VIRTUAL_SINK)
         if self.applied_db is not None and abs(volume - self.applied_db) < VOLUME_EPSILON_DB:
             return True

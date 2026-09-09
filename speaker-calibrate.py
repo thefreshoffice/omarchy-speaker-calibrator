@@ -233,16 +233,39 @@ def loudness_running():
     ).stdout.strip() == "active"
 
 
-def start_loudness_tracker():
+def ensure_loudness_unit():
+    """Write the tracker's unit only when it is missing or out of date.
+
+    Reloading systemd costs more than everything else this does put together,
+    and the unit only changes when the plugin moves.
+    """
     unit = loudness_unit_path()
+    wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
+    try:
+        if unit.read_text() == wanted:
+            return False
+    except OSError:
+        pass
     unit.parent.mkdir(parents=True, exist_ok=True)
-    unit.write_text(LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path()))
+    unit.write_text(wanted)
     run(["systemctl", "--user", "daemon-reload"], check=False)
-    run(["systemctl", "--user", "enable", "--now", LOUDNESS_SERVICE], check=False)
+    return True
+
+
+def start_loudness_tracker():
+    """Ask for the tracker without waiting for it to come up.
+
+    The compensation has already been switched on in the running filter by the
+    time this is called, so nothing audible is waiting on systemd.
+    """
+    ensure_loudness_unit()
+    run(["systemctl", "--user", "enable", LOUDNESS_SERVICE], check=False)
+    run(["systemctl", "--user", "start", "--no-block", LOUDNESS_SERVICE], check=False)
 
 
 def stop_loudness_tracker():
-    run(["systemctl", "--user", "disable", "--now", LOUDNESS_SERVICE], check=False)
+    run(["systemctl", "--user", "stop", "--no-block", LOUDNESS_SERVICE], check=False)
+    run(["systemctl", "--user", "disable", LOUDNESS_SERVICE], check=False)
 
 
 def loudness_toggle():
@@ -253,14 +276,31 @@ def loudness_toggle():
     wanted = "off" if profile.get("loudness_compensation") == "on" else "on"
     profile["loudness_compensation"] = wanted
     PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
-    method = activate_profile(profile)
+
+    # The sound changes here, before anything slow is asked of systemd.  Only
+    # the compensator's own controls move, so this is a handful of milliseconds.
+    controls = loudness_controls(sink_volume_db(VIRTUAL_SINK), wanted == "on")
+    if apply_controls_live(controls):
+        method = "live"
+        # Keep the graph on disk in step, so a restart keeps the setting.
+        enhancer = bass_enhancer_status()["usable"]
+        FRAGMENT.write_text(filter_config(
+            profile["speaker"]["name"], profile.get("fit") or {},
+            bass_enhancer=enhancer,
+            deep_bass=profile.get("deep_bass") == "on" and enhancer,
+            loudness_compensation=wanted == "on",
+            sink_volume_db=sink_volume_db(VIRTUAL_SINK),
+        ))
+    else:
+        method = activate_profile(profile)
+
     if wanted == "on":
         start_loudness_tracker()
     else:
         stop_loudness_tracker()
     return {
         "loudness_compensation": wanted,
-        "tracker": "running" if loudness_running() else "stopped",
+        "tracker": "starting" if wanted == "on" else "stopping",
         "method": method,
         "message": ("Loudness compensation on, following the volume"
                     if wanted == "on" else "Loudness compensation off"),
