@@ -199,7 +199,7 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "bass_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
             "input_gain_linear": 0.5,
         }
-        controls = speaker_calibrate.graph_controls(fit)
+        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
         self.assertEqual(controls["ls_l:Freq"], 300.0)
         self.assertEqual(controls["ls_r:Gain"], -3.0)
         self.assertEqual(controls["bs_l:Freq"], 500.0)
@@ -208,13 +208,13 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertEqual(controls["p2_l:Gain"], 0.0)
         self.assertEqual(controls["hs_l:Freq"], 4000.0)
         self.assertEqual(controls["hs_r:Gain"], -4.0)
-        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit)
+        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit, bass_enhancer=False)
         self.assertIn('name = bs_l label = bq_lowshelf control = { "Freq" = 500 "Q" = 0.707 "Gain" = 3 }', graph)
         # A 0.10.0 profile stored the bass shelf as low_shelf.
         legacy = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.5],
                   "low_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
                   "input_gain_linear": 0.5}
-        legacy_controls = speaker_calibrate.graph_controls(legacy)
+        legacy_controls = speaker_calibrate.graph_controls(legacy, bass_enhancer=False)
         self.assertEqual(legacy_controls["bs_l:Gain"], 3.0)
         self.assertEqual(legacy_controls["ls_l:Gain"], 0.0)
 
@@ -318,7 +318,7 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "gains_db": [-2.5, 0.75],
             "input_gain_linear": 0.812345,
         }
-        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit)
+        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit, bass_enhancer=False)
         self.assertIn('"Freq" = 1000 "Q" = 1 "Gain" = -2.5', graph)
         self.assertIn('"Freq" = 2500 "Q" = 1.2 "Gain" = 0.75', graph)
         self.assertIn('"g_in" = 0.812345', graph)
@@ -336,7 +336,7 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "gains_db": [-2.5, 0.75],
             "input_gain_linear": 0.812345,
         }
-        controls = speaker_calibrate.graph_controls(fit)
+        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
         slots = speaker_calibrate.PEAKING_SLOTS
         self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3) + 1)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
@@ -354,21 +354,21 @@ class CalibrationOptimizerTests(unittest.TestCase):
                 "q": [1.0] * (slots + 1),
                 "gains_db": [-1.0] * (slots + 1),
                 "input_gain_linear": 1.0,
-            })
+            }, bass_enhancer=False)
 
     def test_graph_parks_the_second_highpass_when_one_stage_is_enough(self):
         base = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.0], "input_gain_linear": 0.9}
         one = speaker_calibrate.graph_controls(dict(
-            base, highpass={"frequency_hz": 160.0, "q": 0.707, "stages": 1}))
+            base, highpass={"frequency_hz": 160.0, "q": 0.707, "stages": 1}), bass_enhancer=False)
         self.assertEqual(one["hp1_l:Freq"], 160.0)
         self.assertEqual(one["hp2_l:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
         self.assertEqual(one["hp2_r:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
         two = speaker_calibrate.graph_controls(dict(
-            base, highpass={"frequency_hz": 80.0, "q": 0.707, "stages": 2}))
+            base, highpass={"frequency_hz": 80.0, "q": 0.707, "stages": 2}), bass_enhancer=False)
         self.assertEqual(two["hp1_r:Freq"], 80.0)
         self.assertEqual(two["hp2_r:Freq"], 80.0)
         # A profile from before the high-pass was measured keeps its old chain.
-        legacy = speaker_calibrate.graph_controls(base)
+        legacy = speaker_calibrate.graph_controls(base, bass_enhancer=False)
         self.assertEqual(legacy["hp1_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
         self.assertEqual(legacy["hp2_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
 
@@ -520,7 +520,7 @@ class BypassTests(unittest.TestCase):
             self.assertEqual(applied[-1]["hp1_l:Freq"], 10.0)
 
     def test_transparent_controls_pass_audio_through(self):
-        controls = speaker_calibrate.transparent_controls()
+        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
         self.assertEqual(controls["limiter:g_in"], 1.0)
         for name, value in controls.items():
             if name.endswith(":Gain"):
@@ -528,7 +528,7 @@ class BypassTests(unittest.TestCase):
             if name.startswith("hp") and name.endswith(":Freq"):
                 self.assertEqual(value, 10.0, name)
         self.assertEqual(set(controls), set(speaker_calibrate.graph_controls(
-            {"filters": [], "input_gain_linear": 1.0}
+            {"filters": [], "input_gain_linear": 1.0}, bass_enhancer=False
         )))
 
 
@@ -639,12 +639,13 @@ class RawMeasurementTests(unittest.TestCase):
         module = speaker_calibrate
         saved = {name: getattr(module, name) for name in (
             "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
-            "compare_state",
+            "compare_state", "transparent_controls",
         )}
+        original_transparent = module.transparent_controls
         installed = module.graph_controls({
             "filters": [{"type": "peaking", "frequency_hz": 800.0, "q": 1.0, "gain_db": -6.0}],
             "input_gain_linear": 0.9,
-        })
+        }, bass_enhancer=False)
         applied = []
         try:
             module.service_active = lambda: True
@@ -652,6 +653,9 @@ class RawMeasurementTests(unittest.TestCase):
             module.compare_state = lambda: {"active": "current", "bypass": False}
             module.live_controls = lambda node_id: dict(installed, **{"limiter:grgv_l": 1.0})
             module.apply_controls_live = lambda controls: applied.append(dict(controls)) or True
+            module.transparent_controls = lambda bass_enhancer=None: original_transparent(
+                bass_enhancer=False
+            )
             with module.correction_silenced() as silenced:
                 self.assertTrue(silenced)
                 self.assertEqual(applied[-1]["p1_l:Gain"], 0.0)

@@ -22,7 +22,7 @@ Panel {
 
   // The sound options, shared by the simple toggles and the advanced
   // selectors.  They follow the installed profile until the user changes them.
-  property string voicingMode: "warm"
+  property string voicingMode: "neutral"
   property string bassMode: "normal"
   property string loudnessMode: "protected"
   property bool advanced: false
@@ -99,7 +99,7 @@ Panel {
   }
   function adoptOptions(profile) {
     if (!profile) return
-    root.voicingMode = profile.voicing === "neutral" ? "neutral" : "warm"
+    root.voicingMode = profile.voicing === "warm" ? "warm" : "neutral"
     root.bassMode = profile.bass === "full" ? "full" : "normal"
     root.loudnessMode = profile.loudness || "protected"
   }
@@ -988,10 +988,10 @@ Panel {
               QQC.ComboBox {
                 id: voicingBox
                 Layout.fillWidth: true
-                model: ["Warm — softer, less sharp", "Flat — balanced, more detail"]
+                model: ["Flat — balanced, more detail", "Warm — softer, less sharp"]
                 enabled: !service.busy
-                currentIndex: root.voicingMode === "neutral" ? 1 : 0
-                onActivated: function(index) { root.voicingMode = index === 1 ? "neutral" : "warm" }
+                currentIndex: root.voicingMode === "warm" ? 1 : 0
+                onActivated: function(index) { root.voicingMode = index === 1 ? "warm" : "neutral" }
               }
 
               Text { text: "LOUDER"; color: root.dim; font.family: root.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }

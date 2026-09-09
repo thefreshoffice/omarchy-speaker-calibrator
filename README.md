@@ -140,13 +140,13 @@ serial-number calibration text file can be supplied. Keep the room quiet and do
 not move the computer or microphone during the roughly 30-second level check and
 sweep sequence.
 
-### Warm or Flat?
+### Flat or Warm?
 
+- **Flat** is the default. It keeps the sound balanced, preserves the most
+  clarity, and may sound a little brighter. Flat does not mean the measured
+  graph must become a perfectly straight line.
 - **Warm** makes sharp voices, cymbals, and hiss gentler. It sounds softer and
   can be easier to enjoy for a long time.
-- **Flat** keeps the sound more balanced without adding Warm's extra softness.
-  It preserves more clarity and may sound a little brighter. Flat does not mean
-  the measured graph must become a perfectly straight line.
 
 ### Bass: Normal or Full?
 
@@ -216,6 +216,38 @@ asking them to try, the **Deep bass** switch plays the harmonics of those notes,
 which the speakers can produce, and the ear supplies the fundamental it never
 heard. This is what laptop and phone makers do to get bass out of hardware that
 has none.
+
+#### Why this works
+
+A note is not only its fundamental. A bass guitar playing a 55 Hz note also
+radiates energy at 110, 165, 220 Hz and beyond, and the ear works out the pitch
+from the *spacing* of that series rather than from the presence of the lowest
+tone. Remove the fundamental entirely and the pitch does not change: the brain
+still reports 55 Hz, because only a 55 Hz note produces harmonics spaced 55 Hz
+apart. This is the missing fundamental, described by Seebeck in 1841, and it is
+why a telephone limited to 300 Hz and above still carries a voice whose
+fundamental is near 100 Hz.
+
+Your speakers stop somewhere between 150 and 250 Hz, so a bass line's
+fundamentals are simply absent. The add-on takes what lies below that corner,
+generates its second and third harmonics, and plays those instead. They land
+where the speaker is efficient, so they are actually heard, and the ear
+reconstructs the pitch that was never reproduced. The bass line becomes
+audible, in tune, and follows the music.
+
+Compare that with the obvious alternative of turning the bass up. Below the
+corner the cone still travels its full distance while radiating almost nothing,
+because a small driver cannot move enough air at long wavelengths. Boosting
+there buys distortion and stolen headroom and no more sound. Playing the
+harmonics asks the speaker only for frequencies it is good at.
+
+What it cannot do is give you the physical weight of real low frequencies,
+because nothing is moving that much air. It supplies pitch and line, not
+impact. Pushed hard it also turns honky, as the added harmonics start to
+compete with the music's own midrange, which is why the amount here is modest
+and the upper limit follows the measured knee rather than a fixed frequency.
+The same trick, under various names, is what laptop and phone makers use to get
+bass out of hardware that has none.
 
 It needs one free package, `bankstown`. Nothing else here depends on it:
 without it the filter chain is built exactly as before and the switch offers to

@@ -573,10 +573,10 @@ def profile_summary(path):
     return {
         "created_at": profile.get("created_at"),
         "label": f"{created} · {fit.get('filter_count', 0)} filters · "
-                 f"{VOICING_LABELS.get(profile.get('voicing'), 'warm')} · "
+                 f"{VOICING_LABELS.get(profile.get('voicing'), 'neutral')} · "
                  f"{BASS_LABELS.get(profile.get('bass'), 'normal bass')} · "
                  f"{LOUDNESS_LABELS.get(profile.get('loudness'), 'protected')}",
-        "voicing": profile.get("voicing", "warm"),
+        "voicing": profile.get("voicing", "neutral"),
         "bass": profile.get("bass", "normal"),
         "loudness": profile.get("loudness", "protected"),
         "plugin_version": profile.get("plugin_version"),
@@ -1129,7 +1129,7 @@ def reanalyze_saved_capture(voicing=None, channel_override=None, loudness=None, 
         )
         measurement["refinement"] = refinement
     return profile_from_measurement(
-        sink, mic, channel, voicing or previous.get("voicing", "warm"), measurement,
+        sink, mic, channel, voicing or previous.get("voicing", "neutral"), measurement,
         loudness or previous.get("loudness", "protected"),
         bass or previous.get("bass", "normal"),
     )
@@ -1263,7 +1263,7 @@ def refine_from_check():
     }
     mic = profile["microphone"]
     return profile_from_measurement(
-        profile["speaker"], mic, mic.get("channel", 0), profile.get("voicing", "warm"),
+        profile["speaker"], mic, mic.get("channel", 0), profile.get("voicing", "neutral"),
         refined, profile.get("loudness", "protected"), profile.get("bass", "normal"),
     )
 
@@ -1386,10 +1386,10 @@ def wizard():
             answer = input(f"Microphone channel 1-{channels} [1]: ").strip()
             if answer.isdigit() and 1 <= int(answer) <= channels:
                 channel = int(answer) - 1
-    print("\nVoicing:\n  Warm: softer and less sharp; comfortable for long listening."
-          "\n  Flat: balanced with more clarity; may sound a little brighter.")
-    answer = input("Choose [w]arm (recommended) or [f]lat? [w]: ").strip().lower()
-    voicing = "neutral" if answer.startswith(("f", "n")) else "warm"
+    print("\nVoicing:\n  Flat: balanced with more clarity; may sound a little brighter."
+          "\n  Warm: softer and less sharp; comfortable for long listening.")
+    answer = input("Choose [f]lat (recommended) or [w]arm? [f]: ").strip().lower()
+    voicing = "warm" if answer.startswith("w") else "neutral"
     print("\nBass:\n  Normal: the measured correction only."
           "\n  Full: a +3 dB low shelf at the speaker's knee, paid for by input trim.")
     answer = input("Choose [n]ormal (recommended) or [f]ull? [n]: ").strip().lower()
@@ -1484,7 +1484,7 @@ def status():
     if profile:
         print(f"Speaker: {profile['speaker']['description']}\nMicrophone: {profile['microphone']['description']}")
         gains = profile.get("fit", {}).get("gains_db") if profile.get("fit") else None
-        voicing = VOICING_LABELS.get(profile.get("voicing"), "warm")
+        voicing = VOICING_LABELS.get(profile.get("voicing"), "neutral")
         loudness = LOUDNESS_LABELS.get(profile.get("loudness"), "protected")
         bass = BASS_LABELS.get(profile.get("bass"), "normal bass")
         print(f"Voicing: {voicing}\nBass: {bass}\nLoudness: {loudness}\n"
@@ -1519,7 +1519,7 @@ def main():
     calibrate.add_argument("--sink", required=True)
     calibrate.add_argument("--mic", required=True)
     calibrate.add_argument("--channel", default="0")
-    calibrate.add_argument("--voicing", choices=("warm", "neutral"), default="warm")
+    calibrate.add_argument("--voicing", choices=("warm", "neutral"), default="neutral")
     calibrate.add_argument("--loudness", choices=("protected", "balanced", "matched"),
                            default="protected")
     calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")

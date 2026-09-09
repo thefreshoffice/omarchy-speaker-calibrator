@@ -44,7 +44,7 @@ Item {
     var loudness = profile.loudness || "protected"
     parts.push(loudness === "matched" ? "Louder on"
       : loudness === "balanced" ? "Louder halfway" : "Louder off")
-    if (profile.voicing === "neutral") parts.push("flat voicing")
+    if (profile.voicing === "warm") parts.push("warm voicing")
     return parts.join(" · ")
   }
   // Technical label: "warm · full bass · matched".
@@ -75,7 +75,7 @@ Item {
     return other && other.label ? other.label : (compare.active === "previous" ? "current" : "previous")
   }
   function optionArguments(options) {
-    return ["--voicing", options.voicing || "warm",
+    return ["--voicing", options.voicing || "neutral",
             "--loudness", options.loudness || "protected",
             "--bass", options.bass || "normal"]
   }
