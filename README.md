@@ -160,8 +160,8 @@ long-lived Omarchy shell process.
   microphone channel and calibration file, refit and install controls, the
   measurement quality and response graph, the list of sections, the switch
   between the two stored profiles, and the stop button.
-- For a multi-microphone laptop, keep **All built-in microphones (recommended)**
-  selected. Individual channels remain available for troubleshooting.
+- For a multi-microphone laptop, keep the recommended option that uses all the
+  built-in microphones. Individual channels remain available for troubleshooting.
 - Measure first, review the proposed filters and graph, then explicitly install
   the profile.
 - After a second install, **Hear the previous profile** plays the profile you

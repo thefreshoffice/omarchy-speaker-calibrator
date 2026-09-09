@@ -56,7 +56,7 @@ Panel {
     var count = mic ? Math.max(1, Number(mic.channels || 1)) : 1
     var result = []
     if (mic && mic.internal === true && count > 1) {
-      result.push("All " + count + " built-in microphones (recommended)")
+      result.push("All " + count + " built-in microphones — recommended")
       for (var index = 0; index < count; index++)
         result.push("Microphone " + (index + 1) + " only")
     } else {
