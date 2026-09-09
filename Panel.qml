@@ -134,6 +134,13 @@ Panel {
       + "Nobody has checked it for you. You can read it first at "
       + "aur.archlinux.org/packages/" + name + "."
   }
+  // Switching the correction off also drops the level to the one the
+  // correction plays at, so the two can be judged on tone alone.
+  function bypassMatchText() {
+    var match = Number(((service.status.compare || {}).level_match_db) || 0)
+    if (match > -0.05) return ""
+    return ", matched " + Math.abs(match).toFixed(1) + " dB quieter so only the tone changes"
+  }
   function heroMeta() {
     if (service.busy) return service.message
     if (!service.status.enabled)
@@ -835,8 +842,8 @@ Panel {
               width: parent.width
               label: "Calibration"
               description: service.status.bypass
-                ? "Off — you are hearing the plain speakers"
-                : "On — switch off to hear the speakers as they were"
+                ? "Off — the plain speakers" + root.bypassMatchText()
+                : "On — switch off to hear the speakers as they were" + root.bypassMatchText()
               checked: !service.status.bypass
               enabled: !service.busy
               foreground: root.foreground

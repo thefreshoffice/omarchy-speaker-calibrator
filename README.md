@@ -386,6 +386,11 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 - The limiter has auto-level and boost disabled.
 - The limiter ceiling is -1 dBFS.
 - The generated filter output is pinned to the selected physical sink.
+- Switching the calibration off level-matches the plain speakers to the
+  loudness the correction plays at, so the comparison is about tone rather
+  than volume; louder wins otherwise. It only ever turns the plain sound down,
+  never up, and a calibration measurement flattens the filter without that
+  attenuation, since the speaker has to be measured as it is.
 - The graph always has the same shape: two high-pass sections, a low shelf,
   twelve parametric slots, a high shelf, and the limiter, per channel. Unused
   sections sit at 0 dB. Installing or comparing profiles therefore updates the

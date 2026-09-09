@@ -223,8 +223,11 @@ Item {
         } else if (root.phase === "bypass") {
           var bypassPayload = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { compare: bypassPayload, bypass: bypassPayload.bypass })
+          var match = Number(bypassPayload.level_match_db || 0)
           root.message = bypassPayload.bypass
-            ? "Calibration switched off — you are hearing the plain speakers"
+            ? "Calibration off — the plain speakers"
+              + (match < -0.05 ? ", turned down " + Math.abs(match).toFixed(1)
+                                 + " dB to the same loudness so only the tone changes" : "")
             : "Calibration switched on"
         } else if (root.phase === "disable") {
           root.status = Object.assign({}, root.status, { service: "inactive", enabled: false })

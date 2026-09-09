@@ -161,6 +161,26 @@ def pink_loudness_db(
     return 10.0 * math.log10(float(np.mean(10.0 ** (weighted / 10.0))))
 
 
+# Comparing a correction against no correction is only meaningful when both
+# play at the same loudness; louder almost always wins otherwise.  Anything
+# past this is a sign the numbers are wrong rather than the speaker.
+BYPASS_MATCH_FLOOR_DB = -20.0
+
+
+def bypass_level_match_db(fit: dict) -> float:
+    """How far to turn the plain speakers down so a comparison is about tone.
+
+    The corrected speaker is quieter than the raw one by the loudness the cuts
+    removed, less whatever make-up was added back at the input.  Turning the
+    bypassed path down by the same amount leaves only the tone to judge.  It
+    never turns the plain speakers up: that would ask for headroom the raw
+    signal has not got.
+    """
+    loss = float(fit.get("loudness_loss_db", 0.0))
+    net = float(fit.get("net_input_gain_db", -float(fit.get("headroom_db", 1.0))))
+    return round(max(BYPASS_MATCH_FLOOR_DB, min(0.0, net - loss)), 2)
+
+
 def loudness_makeup_db(loudness_loss_db: float, loudness: str) -> float:
     """Input gain that pays back part of the loudness the cuts removed.
 

@@ -13,11 +13,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    BYPASS_MATCH_FLOOR_DB,
     CHANNEL_TRIM_LIMIT_DB,
     CHECK_REPEATABILITY_DB,
     HIGHPASS_BOUNDS_HZ,
     REFINEMENT_LIMIT_DB,
     apply_refinement,
+    bypass_level_match_db,
     estimate_channel_trim,
     refinement_residual,
     verification_report,
@@ -531,6 +533,52 @@ class BypassTests(unittest.TestCase):
             self.assertEqual(attempts["count"], 2)
             self.assertEqual(applied[-1]["limiter:g_in"], 1.0)
             self.assertEqual(applied[-1]["hp1_l:Freq"], 10.0)
+
+    def test_the_plain_speakers_are_matched_to_the_correction(self):
+        # Cuts cost 13 dB of loudness and 4.4 dB was added back, so the
+        # correction plays 8.6 dB below the raw speaker.
+        self.assertAlmostEqual(
+            bypass_level_match_db({"loudness_loss_db": 13.0, "net_input_gain_db": 4.4}),
+            -8.6, places=2,
+        )
+        # Protected mode gives back nothing, so the gap is wider.
+        self.assertAlmostEqual(
+            bypass_level_match_db({"loudness_loss_db": 13.0, "net_input_gain_db": -1.0}),
+            -14.0, places=2,
+        )
+
+    def test_the_plain_speakers_are_never_turned_up(self):
+        # A correction that ends up louder than the raw speaker cannot be
+        # matched by boosting the raw signal, which has no headroom to give.
+        self.assertEqual(
+            bypass_level_match_db({"loudness_loss_db": 0.5, "net_input_gain_db": 5.0}), 0.0
+        )
+
+    def test_an_absurd_match_is_floored(self):
+        self.assertEqual(
+            bypass_level_match_db({"loudness_loss_db": 60.0, "net_input_gain_db": 0.0}),
+            BYPASS_MATCH_FLOOR_DB,
+        )
+
+    def test_a_profile_from_before_this_is_left_at_unity(self):
+        self.assertEqual(bypass_level_match_db({"headroom_db": 1.0}), -1.0)
+        self.assertEqual(bypass_level_match_db({}), -1.0)
+
+    def test_the_match_reaches_the_graph_as_input_gain(self):
+        controls = speaker_calibrate.transparent_controls(
+            bass_enhancer=False, level_match_db=-8.6
+        )
+        self.assertAlmostEqual(controls["limiter:g_in"], 10 ** (-8.6 / 20.0), places=5)
+        # Everything else is still flat, so only the level differs.
+        for name, value in controls.items():
+            if name.endswith(":Gain"):
+                self.assertEqual(value, 0.0, name)
+
+    def test_a_measurement_flattens_without_the_match(self):
+        # The speaker has to be measured as it is, not as the correction
+        # leaves it, so the flattening used for a calibration is unity.
+        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        self.assertEqual(controls["limiter:g_in"], 1.0)
 
     def test_transparent_controls_pass_audio_through(self):
         controls = speaker_calibrate.transparent_controls(bass_enhancer=False)

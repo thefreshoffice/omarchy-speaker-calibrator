@@ -581,15 +581,17 @@ def write_compare_state(state):
     COMPARE_STATE.write_text(json.dumps(state) + "\n")
 
 
-def transparent_controls(bass_enhancer=None):
+def transparent_controls(bass_enhancer=None, level_match_db=0.0):
     """Controls that make the running graph pass audio through unchanged.
 
-    The high-pass sections drop to 10 Hz, every gain goes to 0 dB, the bass
-    add-on is bypassed, and the limiter input gain returns to unity; only the
-    -1 dBFS ceiling remains.
+    The high-pass sections drop to 10 Hz, every gain goes to 0 dB and the bass
+    add-on is bypassed, so what is left is the speaker as it was; only the
+    -1 dBFS ceiling remains.  ``level_match_db`` turns that plain sound down
+    to the loudness the correction plays at, so switching between them is a
+    question about tone rather than about volume.
     """
     controls = graph_controls(
-        {"filters": [], "input_gain_linear": 1.0},
+        {"filters": [], "input_gain_linear": 10.0 ** (float(level_match_db) / 20.0)},
         bass_enhancer=bass_enhancer, deep_bass=False,
     )
     for name in list(controls):
@@ -761,6 +763,8 @@ def correction_silenced():
     if node_id is None or compare_state()["bypass"]:
         yield False
         return
+    # Flattened, not level-matched: a calibration measures the speaker as it
+    # is, and an attenuation here would be measured as the speaker being quiet.
     wanted = set(transparent_controls())
     live = live_controls(node_id)
     saved = {name: value for name, value in live.items() if name in wanted}
@@ -782,20 +786,32 @@ def playing_profile():
     return load_profile(target) or load_profile(PROFILE)
 
 
+def bypass_level_match(profile):
+    """Attenuation for the plain speakers, matched to the correction's loudness."""
+    fit = (profile or {}).get("fit") or {}
+    if "loudness_loss_db" not in fit:
+        # A profile from before the loudness of a correction was measured.
+        return 0.0
+    from calibration_optimizer import bypass_level_match_db
+    return bypass_level_match_db(fit)
+
+
 def bypass_toggle():
     """Switch the running graph between unity and the playing profile, live."""
     state = compare_state()
     profile = playing_profile()
     if profile is None:
         raise SystemExit("No calibration is installed, so there is nothing to switch off.")
+    match = bypass_level_match(profile)
     if not state["bypass"]:
         method = "live"
-        if not (service_active() and apply_controls_live(transparent_controls())):
+        flat = transparent_controls(level_match_db=match)
+        if not (service_active() and apply_controls_live(flat)):
             # The running graph has an older shape, so its controls cannot be
             # zeroed by name.  Activating the profile regenerates the graph in
             # the current shape (restarting once); then unity can be applied.
             method = activate_profile(profile)
-            if not apply_controls_live(transparent_controls()):
+            if not apply_controls_live(transparent_controls(level_match_db=match)):
                 raise SystemExit(
                     "Could not switch the calibration off; the tuning was restarted with it on."
                 )
@@ -807,6 +823,7 @@ def bypass_toggle():
         method = activate_profile(profile)
     payload = compare_payload()
     payload["method"] = method
+    payload["level_match_db"] = match
     return payload
 
 
@@ -854,6 +871,7 @@ def compare_payload():
         and load_profile(PROFILE) is not None,
         "active": state["active"],
         "bypass": state["bypass"],
+        "level_match_db": bypass_level_match(playing_profile()),
         "current": profile_summary(PROFILE),
         "previous": profile_summary(PREVIOUS_PROFILE),
     }
