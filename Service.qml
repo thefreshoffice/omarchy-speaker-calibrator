@@ -108,7 +108,15 @@ Item {
       return false
     }
   }
-  function refresh() { if (!busy) start("devices", ["devices-json"]) }
+  // Asking while something else is running used to drop the request on the
+  // floor, which left the device list showing whatever it last managed to
+  // fetch: a microphone plugged in since then simply never appeared.  A
+  // refresh asked for now happens, even if it has to wait its turn.
+  property bool _refreshPending: false
+  function refresh() {
+    if (busy) { _refreshPending = true; return }
+    start("devices", ["devices-json"])
+  }
   // Draw from the last known state before the full check answers.  The helper
   // reads that file, not the panel: it lives at a predictable name that any
   // process running as this user could replace with a symlink or a pipe, and
@@ -187,6 +195,15 @@ Item {
     interval: 2000
     onTriggered: if (process.running) process.signal(9)
   }
+
+  // Whatever the run was, if a refresh was asked for while it held the
+  // process, do it now.
+  onBusyChanged: if (!busy && _refreshPending) Qt.callLater(function () {
+    if (!root.busy && root._refreshPending) {
+      root._refreshPending = false
+      root.start("devices", ["devices-json"])
+    }
+  })
 
   Component.onDestruction: if (process.running) process.signal(15)
 

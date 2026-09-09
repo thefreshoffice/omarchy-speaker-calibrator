@@ -140,6 +140,19 @@ Panel {
       + "Nobody has checked it for you. You can read it first at "
       + "aur.archlinux.org/packages/" + name + "."
   }
+  // "Recalibrate" says nothing about which microphone did the one in use.
+  // Each row now carries its own history: whether it has measured at all,
+  // when, and whether that measurement is the calibration playing right now.
+  function microphoneNote(entry) {
+    var archive = (service.status.microphones || {})
+    var record = entry.internal ? archive.internal : archive.external
+    if (!record) return "never measured"
+    var when = String(record.created_at || "").slice(0, 10)
+    var active = ((service.status.profile || {}).microphone || {})
+    var inUse = active.internal === entry.internal
+    return (inUse ? "in use, measured " : "measured ") + when
+      + (record.verdict && record.verdict !== "pass" ? " (" + record.verdict + ")" : "")
+  }
   // What the two microphones say, in words rather than decibels.
   function microphoneComparisonText() {
     var comparison = service.micComparison
@@ -1104,6 +1117,7 @@ Panel {
                   + (modelData.internal
                       ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
                       : "  ·  external")
+                  + "  ·  " + root.microphoneNote(modelData)
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
