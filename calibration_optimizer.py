@@ -681,6 +681,67 @@ def _measurement_confidence(measurement: dict) -> tuple[np.ndarray, np.ndarray]:
     return np.clip(confidence, 0.05, 1.0), uncertainty
 
 
+# What a boost costs, and what there is to spend.
+#
+# A boost is never free.  It is electrical headroom, which the limiter has to
+# be given back before anything else can use it, so every decibel spent here
+# is a decibel "Make it louder" cannot return.  It also costs cone travel, and
+# that cost is not flat: for the same sound pressure a driver moves four times
+# as far an octave lower, so the same decibel asks far more of the speaker
+# near where it gives up than it does in the presence region.
+#
+# The allowance is therefore spent rather than merely capped, and what it
+# costs is read from this speaker's own measurement: the weighting is anchored
+# to the measured high-pass corner, so a speaker that reaches lower earns a
+# wider band of cheap boost without any of it being decided in advance.
+BOOST_HEADROOM_BUDGET_DB = 3.0
+# Above this multiple of the measured corner, excursion has stopped being the
+# binding constraint and a decibel costs only the headroom it takes.
+EXCURSION_FREE_ABOVE_CORNER = 3.0
+# Past this the arithmetic stops meaning anything: the high-pass is already
+# removing the band, so the boost is refused rather than priced.
+EXCURSION_WEIGHT_CEILING = 16.0
+
+
+def excursion_weight(
+    frequencies: np.ndarray | float, highpass_hz: float
+) -> np.ndarray | float:
+    """What one decibel of boost costs here, relative to the easy band.
+
+    Excursion for a given sound pressure goes as the inverse square of
+    frequency, so the cost is that ratio, measured from where this speaker
+    stops keeping up rather than from a fixed frequency.
+    """
+    free_above = max(1.0, float(highpass_hz) * EXCURSION_FREE_ABOVE_CORNER)
+    ratio = free_above / np.maximum(np.asarray(frequencies, dtype=float), 1.0)
+    return np.clip(ratio ** 2.0, 1.0, EXCURSION_WEIGHT_CEILING)
+
+
+def boost_allowance_db(
+    frequencies: np.ndarray | float, highpass_hz: float, trust_cap_db: float
+) -> np.ndarray | float:
+    """The most a boost may be at each frequency.
+
+    Two limits, whichever is tighter: what the measurement is good enough to
+    justify, and what the budget will pay for at that frequency.
+    """
+    weights = excursion_weight(frequencies, highpass_hz)
+    return np.minimum(float(trust_cap_db), BOOST_HEADROOM_BUDGET_DB / weights)
+
+
+def _window_boost_limit(
+    low_hz: float, high_hz: float, highpass_hz: float, trust_cap_db: float
+) -> float:
+    """The tightest allowance anywhere a section could move to.
+
+    A filter is fitted with its centre free inside a window, so pricing it at
+    its starting frequency would let it drift into a costlier band at full
+    gain, which is the same mistake the cut limits already avoid.
+    """
+    samples = np.geomspace(max(low_hz, 1.0), max(high_hz, low_hz, 1.0), 9)
+    return float(np.min(boost_allowance_db(samples, highpass_hz, trust_cap_db)))
+
+
 def _safe_boost_floor(
     frequencies: np.ndarray, measured: np.ndarray, confidence: np.ndarray
 ) -> float:
@@ -964,6 +1025,7 @@ def _new_filter(
     frequency_range: tuple[float, float],
     internal_mic: bool,
     maximum_boost: float,
+    highpass_hz: float,
 ) -> dict:
     center = float(frequencies[index])
     need = np.maximum(residual, 0.0) if kind == "cut" else np.maximum(-residual, 0.0)
@@ -977,8 +1039,13 @@ def _new_filter(
         gain = -min(abs(lower_gain), max(0.35, float(residual[index]) * 0.72))
         gain_bounds = (lower_gain, 0.0)
     else:
-        gain = min(maximum_boost, max(0.25, float(-residual[index]) * 0.55))
-        gain_bounds = (0.0, maximum_boost)
+        # Priced across the whole window the centre can move in, so the filter
+        # cannot drift down into a band the budget will not pay for.
+        upper_gain = _window_boost_limit(
+            low_frequency, high_frequency, highpass_hz, maximum_boost
+        )
+        gain = min(upper_gain, max(0.25, float(-residual[index]) * 0.55))
+        gain_bounds = (0.0, upper_gain)
     return {
         "kind": kind,
         "shape": "peaking",
@@ -1173,6 +1240,7 @@ def optimize_peq(
             candidate_specs.append(_new_filter(
                 "cut", index, residual, frequencies, q_bounds,
                 frequency_range, internal_mic, maximum_boost,
+                highpass["frequency_hz"],
             ))
         for index in _candidate_indices(boost_score, valid, 4):
             center = float(frequencies[index])
@@ -1186,6 +1254,7 @@ def optimize_peq(
             candidate_specs.append(_new_filter(
                 "boost", index, residual, frequencies, q_bounds,
                 frequency_range, internal_mic, maximum_boost,
+                highpass["frequency_hz"],
             ))
         candidate_specs.extend(_shelf_candidates(
             residual, frequencies, confidence, valid, internal_mic, filters
@@ -1326,6 +1395,20 @@ def optimize_peq(
     predicted = measured_smooth + correction
     positive_peak = max(0.0, float(np.max(correction)))
     headroom_db = max(1.0, math.ceil((positive_peak + 1.0) * 100.0) / 100.0)
+    # What the boosts actually cost, so the trade stops being invisible: this
+    # much headroom is reserved for them, and it is the same headroom the
+    # loudness make-up would otherwise have returned.
+    peak_index = int(np.argmax(correction)) if correction.size else 0
+    boost_budget = {
+        "allowance_db": BOOST_HEADROOM_BUDGET_DB,
+        "spent_db": round(positive_peak, 2),
+        "spent_at_hz": round(float(frequencies[peak_index]), 1) if positive_peak > 0 else None,
+        "excursion_weight": round(float(np.asarray(excursion_weight(
+            frequencies[peak_index], highpass["frequency_hz"])).item()), 2),
+        "free_above_hz": round(
+            float(highpass["frequency_hz"]) * EXCURSION_FREE_ABOVE_CORNER, 1),
+        "costs_makeup_db": round(headroom_db, 2),
+    }
     # The cuts land where the speaker was loudest, so the corrected speaker
     # plays quieter at the same volume setting.  Estimate how much, and let
     # the loudness mode decide how much of it to add back before the limiter.
@@ -1384,6 +1467,7 @@ def optimize_peq(
         "safe_boost_floor_hz": round(safe_boost_floor, 1),
         "boost_decisions": boost_decisions,
         "headroom_db": headroom_db,
+        "boost_budget": boost_budget,
         "highpass": highpass,
         # Flat keys for the graph and for older panels.
         "highpass_hz": highpass["frequency_hz"],

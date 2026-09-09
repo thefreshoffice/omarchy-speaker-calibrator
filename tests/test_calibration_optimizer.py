@@ -13,6 +13,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
+    BOOST_HEADROOM_BUDGET_DB,
+    EXCURSION_WEIGHT_CEILING,
+    _window_boost_limit,
+    boost_allowance_db,
+    excursion_weight,
     BYPASS_MATCH_FLOOR_DB,
     CHANNEL_TRIM_LIMIT_DB,
     CHECK_REPEATABILITY_DB,
@@ -1333,6 +1338,54 @@ class LoudnessCompensationTests(unittest.TestCase):
         controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
         self.assertEqual(controls["loudcomp:enabled"], 0.0)
         self.assertEqual(controls["loudcomp:input"], 1.0)
+
+
+class BoostBudgetTests(unittest.TestCase):
+    """A boost is priced by what it asks of the speaker that was measured."""
+
+    def test_the_cheap_band_follows_the_measured_corner(self):
+        # Nothing here is decided in advance: a speaker measured down to 60 Hz
+        # earns full allowance where a laptop cornering at 196 Hz does not.
+        deep = boost_allowance_db(200.0, 60.0, 1.5)
+        shallow = boost_allowance_db(200.0, 196.0, 1.5)
+        self.assertAlmostEqual(float(deep), 1.5, places=6)
+        self.assertLess(float(shallow), 0.5)
+
+    def test_a_decibel_costs_more_the_lower_it_is_asked_for(self):
+        # Excursion goes as the inverse square of frequency, so an octave down
+        # is four times the ask.
+        corner = 100.0
+        near = excursion_weight(150.0, corner)
+        octave_up = excursion_weight(300.0, corner)
+        self.assertAlmostEqual(float(near) / float(octave_up), 4.0, places=6)
+
+    def test_it_never_exceeds_what_the_measurement_justifies(self):
+        # The budget can only ever tighten the trust cap, never loosen it.
+        for cap in (1.5, 2.0, 3.0):
+            for hz in (200.0, 500.0, 2000.0, 12000.0):
+                allowed = float(boost_allowance_db(hz, 55.0, cap))
+                self.assertLessEqual(allowed, cap + 1e-9)
+
+    def test_a_filter_is_priced_where_it_could_move_to(self):
+        # The centre is free inside a window, so pricing it at its starting
+        # point would let it drift into a band the budget will not pay for.
+        corner = 196.0
+        window = _window_boost_limit(300.0, 900.0, corner, 1.5)
+        self.assertLessEqual(
+            window, float(boost_allowance_db(900.0, corner, 1.5))
+        )
+        self.assertAlmostEqual(
+            window, float(boost_allowance_db(300.0, corner, 1.5)),
+            places=6,
+        )
+
+    def test_the_weighting_stops_rather_than_running_away(self):
+        # Far below the corner the arithmetic stops meaning anything; the
+        # high-pass is already removing the band.
+        weight = excursion_weight(1.0, 200.0)
+        self.assertEqual(
+            float(weight), EXCURSION_WEIGHT_CEILING
+        )
 
 
 if __name__ == "__main__":

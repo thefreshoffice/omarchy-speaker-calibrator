@@ -428,6 +428,18 @@ omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 - One section may cut at most 12 dB, and the whole correction is held to
   -15 dB at any frequency inside the fit; boosts require the confidence and
   held-out-repeat gates above.
+- A boost is spent from a budget rather than simply capped. Every decibel of
+  it is electrical headroom the limiter has to be given back, which is the
+  same headroom **Make it louder** would otherwise return, and it is also cone
+  travel: for the same sound pressure a driver moves four times as far an
+  octave lower. So each decibel is priced by the inverse square of frequency,
+  measured from where *this* speaker stops keeping up rather than from a fixed
+  frequency. The same 4 dB dip at 260 Hz earns a 0.31 dB boost on a laptop
+  whose knee is at 196 Hz and the full 1.5 dB on speakers measured down to
+  55 Hz. Above three times the corner, excursion is no longer the binding
+  constraint and a decibel costs only its headroom. What the boosts cost is
+  recorded in the profile as `boost_budget`, so the trade against loudness is
+  visible rather than silent.
 - With an uncalibrated built-in microphone the total depth is limited by
   frequency, from -6 dB at 160 Hz and -8 dB at 10 kHz to the full -15 dB in
   the more reliable midrange.
