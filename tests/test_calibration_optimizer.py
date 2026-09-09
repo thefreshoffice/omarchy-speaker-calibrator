@@ -1428,6 +1428,34 @@ class MicrophoneComparisonTests(unittest.TestCase):
         self.assertAlmostEqual(bands["midrange"], 0.0, places=2)
         self.assertEqual(result["worst"]["band"], "bass")
 
+    def test_a_device_cannot_name_itself_a_paragraph(self):
+        # A USB microphone's product string is whatever its firmware says, and
+        # it ends up in a row in the shell.
+        self.assertEqual(len(speaker_calibrate.short_label("x" * 5000)),
+                         speaker_calibrate.DEVICE_LABEL_LIMIT)
+        self.assertEqual(speaker_calibrate.short_label("  Usb   Mic  "), "Usb Mic")
+        self.assertIsNone(speaker_calibrate.short_label(None))
+        self.assertIsNone(speaker_calibrate.short_label(""))
+
+    def test_a_stored_curve_is_checked_before_it_is_drawn(self):
+        good = {"frequency_hz": [100.0, 1000.0], "response_db": [0.0, 1.0]}
+        self.assertIsNotNone(speaker_calibrate.valid_microphone_record(dict(good)))
+        rejected = [
+            {"frequency_hz": [100.0], "response_db": [0.0]},                 # too few
+            {"frequency_hz": [100.0, 200.0], "response_db": [0.0]},          # mismatched
+            {"frequency_hz": [100.0, 200.0], "response_db": [0.0, "x"]},     # not a number
+            {"frequency_hz": [100.0, 200.0], "response_db": [0.0, float("inf")]},
+            {"frequency_hz": [100.0, 200.0], "response_db": [0.0, float("nan")]},
+            {"frequency_hz": "nope", "response_db": []},
+            {},
+        ]
+        for record in rejected:
+            self.assertIsNone(speaker_calibrate.valid_microphone_record(record), record)
+        # And no more points than the analysis grid could ever hold.
+        huge = speaker_calibrate.MICROPHONE_CURVE_LIMIT + 1
+        self.assertIsNone(speaker_calibrate.valid_microphone_record(
+            {"frequency_hz": [1.0] * huge, "response_db": [0.0] * huge}))
+
     def test_one_microphone_alone_is_not_a_comparison(self):
         directory = Path(tempfile.mkdtemp())
         self._archive(directory, "internal", [0.0, 0.0], [100.0, 1000.0])

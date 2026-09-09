@@ -154,6 +154,22 @@ MICROPHONE_ARCHIVE = DATA / "microphone-archive"
 # Where two microphones are compared: shape only, so a difference in
 # sensitivity between them does not read as a difference in the speakers.
 MICROPHONE_ALIGN_BAND_HZ = (250.0, 1000.0)
+# A device names itself.  A USB microphone's product string is whatever its
+# firmware says, so it is text from outside kept in a file and then drawn in
+# the shell: long enough to wreck a row, and there is no reason to store more
+# than fits one.
+DEVICE_LABEL_LIMIT = 120
+# The analysis grid is under two hundred points.  This is only a ceiling, so a
+# file that has been rewritten cannot ask the panel to draw a million.
+MICROPHONE_CURVE_LIMIT = 4096
+
+
+def short_label(value, limit=DEVICE_LABEL_LIMIT):
+    """A device's own name, cut to something that belongs in a row."""
+    if not isinstance(value, str):
+        return None
+    trimmed = " ".join(value.split())
+    return trimmed[:limit] if trimmed else None
 VERIFICATION_SWEEPS = DATA / "verification-sweeps.wav"
 VERIFICATION_RECORDING = DATA / "verification.wav"
 SERVICE = "omarchy-speaker-tuning.service"
@@ -1572,14 +1588,14 @@ def archive_measurement(profile):
     record = {
         "kind": microphone_kind(profile),
         "created_at": profile.get("created_at"),
-        "microphone": mic.get("description"),
-        "calibration_file": mic.get("calibration_file"),
+        "microphone": short_label(mic.get("description")),
+        "calibration_file": bool(mic.get("calibration_file")),
         "frequency_hz": [round(float(value), 2) for value in grid],
         "response_db": [round(float(value), 3) for value in combined],
         "uncertainty_db": ([round(float(value), 3) for value in uncertainty]
                            if uncertainty is not None else None),
         "verdict": (profile.get("quality") or {}).get("verdict"),
-        "speaker": (profile.get("speaker") or {}).get("description"),
+        "speaker": short_label((profile.get("speaker") or {}).get("description")),
     }
     try:
         write_atomic(MICROPHONE_ARCHIVE / f"{record['kind']}.json",
@@ -1607,6 +1623,36 @@ def backfill_archive():
         archive_measurement(profile)
 
 
+def valid_microphone_record(record):
+    """A stored curve, or None if it is not the shape this wrote.
+
+    The file is the plugin's own, but it sits at a predictable name under the
+    data directory, so what comes back is checked rather than trusted: two
+    equal-length arrays of finite numbers, no more points than the analysis
+    grid could ever hold, and labels cut to a row.
+    """
+    if not isinstance(record, dict):
+        return None
+    frequencies = record.get("frequency_hz")
+    response = record.get("response_db")
+    if not isinstance(frequencies, list) or not isinstance(response, list):
+        return None
+    if not 2 <= len(frequencies) <= MICROPHONE_CURVE_LIMIT:
+        return None
+    if len(response) != len(frequencies):
+        return None
+    for series in (frequencies, response):
+        for value in series:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                return None
+            if value != value or value in (float("inf"), float("-inf")):
+                return None
+    record["microphone"] = short_label(record.get("microphone"))
+    record["speaker"] = short_label(record.get("speaker"))
+    record["verdict"] = short_label(record.get("verdict"), 32)
+    return record
+
+
 def microphone_comparison():
     """Both archived measurements, and where they disagree.
 
@@ -1624,9 +1670,10 @@ def microphone_comparison():
             raw = None
         if raw:
             try:
-                records[kind] = json.loads(raw)
+                records[kind] = valid_microphone_record(json.loads(raw))
             except ValueError:
                 pass
+    records = {kind: record for kind, record in records.items() if record}
     payload = {
         "internal": records.get("internal"),
         "external": records.get("external"),
@@ -1977,9 +2024,9 @@ def archived_microphones():
         except ValueError:
             continue
         found[kind] = {
-            "microphone": record.get("microphone"),
-            "created_at": record.get("created_at"),
-            "verdict": record.get("verdict"),
+            "microphone": short_label(record.get("microphone")),
+            "created_at": short_label(record.get("created_at"), 40),
+            "verdict": short_label(record.get("verdict"), 32),
             "calibrated": bool(record.get("calibration_file")),
         }
     return found
