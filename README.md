@@ -14,8 +14,8 @@ Everything here runs with what Omarchy already ships. Measure, install, and the
 speakers are calibrated: no downloads, no accounts, nothing to configure. That
 is the whole plugin, and it is the part most people will ever need.
 
-One thing is left out on purpose. **Deep bass** — the switch that makes small
-speakers sound like they reach lower than they physically can — needs a free
+One thing is left out on purpose. **Deep bass**, the switch that makes small
+speakers sound like they reach lower than they physically can, needs a free
 package called **`bankstown`**, and it is *not* installed unless you ask for it.
 The reason is that `bankstown` is not in Omarchy's curated packages. It comes
 from the Arch User Repository, where anyone can publish, and it is built from
@@ -83,7 +83,7 @@ measurement microphones retain the stricter stable-gain requirement.
 Phase 2 uses a fully adaptive parametric EQ against a smooth, pleasant in-room
 loudspeaker target: a gentle bass rise, flat midband, and gradual treble decline.
 It chooses the number of filters and optimizes every filter's frequency, gain, and
-Q (width). Built-in microphones are limited to six sections with Q 0.5–2.0;
+Q (width). Built-in microphones are limited to six sections with Q 0.5 to 2.0;
 an uncalibrated external microphone may use eight, and a calibrated external
 microphone may use ten with narrower Q up to 4.0. These are upper bounds, not
 targets: a broad problem that needs one filter gets one filter rather than a
@@ -160,7 +160,7 @@ long-lived Omarchy shell process.
   microphone channel and calibration file, refit and install controls, the
   measurement quality and response graph, the list of sections, the switch
   between the two stored profiles, and the stop button.
-- For a multi-microphone laptop, keep **All built-in microphones — recommended**
+- For a multi-microphone laptop, keep **All built-in microphones (recommended)**
   selected. Individual channels remain available for troubleshooting.
 - Measure first, review the proposed filters and graph, then explicitly install
   the profile.
@@ -204,8 +204,8 @@ and that attenuation has to be paid back. Its own input gain is the obvious
 place and the wrong one: the plugin works out how much to compensate from the
 level reaching it, so gain in front of it reads as the music being loud again
 and cancels the curve exactly. Measured at 60 Hz against 1500 Hz, the curve is
-worth +25 dB of bass at −20 dB with unity input and −1 dB once the matching
-input gain is set — which is to say, nothing at all. The make-up therefore goes
+worth +25 dB of bass at -20 dB with unity input and -1 dB once the matching
+input gain is set, which is to say nothing at all. The make-up therefore goes
 on the limiter's input gain, downstream of the compensator, where it restores
 the level and leaves the curve intact.
 
@@ -216,9 +216,9 @@ curve goes.
 
 Full volume is the reference: at 0 dB nothing is compensated and nothing is
 paid back, and the effect grows the further down you play. That sidesteps the
-one thing no uncalibrated measurement can know — what full volume is in real
-decibels — by only ever compensating the part of the listening level it can
-actually see, which is how far the volume has been turned down. Whatever the
+one thing no uncalibrated measurement can know, which is what full volume is
+in real decibels, by only ever compensating the part of the listening level
+it can actually see, which is how far the volume has been turned down. Whatever the
 curve lifts below the speaker's knee is removed again by the high-pass, so on
 a small laptop speaker most of its effect lands between the knee and the
 midrange: on speakers whose usable range starts at 196 Hz it is worth about
@@ -262,7 +262,7 @@ visible without acting.
 - **Normal** applies the measured correction only.
 - **Full** adds a +3 dB low shelf placed above the protective high-pass, at
   the measured knee or two and a half times the high-pass corner, whichever is
-  higher, clamped to 150–600 Hz. A low shelf reaches its full lift below its
+  higher, clamped to between 150 and 600 Hz. A low shelf reaches its full lift below its
   corner, so putting the corner on the high-pass would drop the whole boost
   into the band the high-pass has just removed. Placed clear of it, the lift
   lands where the driver still turns voltage into sound. Like any boost it is
@@ -506,7 +506,7 @@ speaker side, which only ever offers real outputs.
 
 **Advanced** keeps the last measurement from each kind of microphone and draws
 them on one set of axes: the built-in array in the dim line, a USB measuring
-microphone in the bright one. Both are levelled on the 250 Hz–1 kHz band first,
+microphone in the bright one. Both are levelled on the 250 Hz to 1 kHz band first,
 so what you see is the difference in *shape* rather than in sensitivity, and
 the difference is also read out by band underneath.
 
