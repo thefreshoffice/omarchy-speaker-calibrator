@@ -203,6 +203,70 @@ def bass_enhancer_install_command():
     return f"omarchy pkg aur add {BASS_ENHANCER_PACKAGE}", None
 
 
+LOUDNESS_UNIT_TEXT = """[Unit]
+Description=Omarchy speaker loudness compensation
+After=omarchy-speaker-tuning.service
+PartOf=omarchy-speaker-tuning.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -s {tracker}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+def loudness_unit_path():
+    return CONFIG / "systemd/user" / LOUDNESS_SERVICE
+
+
+def loudness_tracker_path():
+    return Path(__file__).resolve().parent / LOUDNESS_TRACKER
+
+
+def loudness_running():
+    return run(
+        ["systemctl", "--user", "is-active", LOUDNESS_SERVICE], check=False, capture=True
+    ).stdout.strip() == "active"
+
+
+def start_loudness_tracker():
+    unit = loudness_unit_path()
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    unit.write_text(LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path()))
+    run(["systemctl", "--user", "daemon-reload"], check=False)
+    run(["systemctl", "--user", "enable", "--now", LOUDNESS_SERVICE], check=False)
+
+
+def stop_loudness_tracker():
+    run(["systemctl", "--user", "disable", "--now", LOUDNESS_SERVICE], check=False)
+
+
+def loudness_toggle():
+    """Switch volume-following loudness compensation on or off."""
+    profile = load_profile(PROFILE)
+    if profile is None:
+        raise SystemExit("Calibrate the speakers first; there is nothing to compensate.")
+    wanted = "off" if profile.get("loudness_compensation") == "on" else "on"
+    profile["loudness_compensation"] = wanted
+    PROFILE.write_text(json.dumps(profile, indent=2) + "\n")
+    method = activate_profile(profile)
+    if wanted == "on":
+        start_loudness_tracker()
+    else:
+        stop_loudness_tracker()
+    return {
+        "loudness_compensation": wanted,
+        "tracker": "running" if loudness_running() else "stopped",
+        "method": method,
+        "message": ("Loudness compensation on, following the volume"
+                    if wanted == "on" else "Loudness compensation off"),
+    }
+
+
 def bass_enhancer_state():
     """Add-on status, including where it would come from if it is missing.
 
@@ -245,6 +309,37 @@ def install_bass_enhancer():
             "finishes, switch Deep bass on again."
         ),
     }
+
+
+def parse_sink_volume_db(text):
+    """The loudest channel's volume in dB from what pactl prints.
+
+    The reading looks like "front-left: 36044 /  55% / -15.58 dB", with the
+    number and its unit as separate words, and one group per channel.  The
+    loudest is the one to follow: it is what sets how loud the speakers are.
+    """
+    levels = [
+        float(value)
+        for value, unit in zip(text.split(), text.split()[1:])
+        if unit.rstrip(",") == "dB" and _is_number(value)
+    ]
+    return max(levels) if levels else 0.0
+
+
+def _is_number(value):
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def sink_volume_db(name):
+    """The output's current volume in dB, or 0 when it cannot be read."""
+    result = run(["pactl", "get-sink-volume", name], check=False, capture=True)
+    if result.returncode != 0:
+        return 0.0
+    return parse_sink_volume_db(result.stdout)
 
 
 def is_physical_sink(name):
@@ -333,6 +428,28 @@ BASS_ENHANCER_BLEND = 1.0
 BASS_ENHANCER_FLOOR_HZ = 20.0
 BASS_ENHANCER_MAX_HZ = 250.0
 
+# Volume-dependent loudness compensation.  The ear loses bass and, less so,
+# treble as the level drops, which is why quiet music sounds thin.  The LSP
+# compensator applies the equal-loudness contour for a given listening level;
+# it is already a dependency, so nothing new has to be installed.
+LOUDNESS_URI = "http://lsp-plug.in/plugins/lv2/loud_comp_stereo"
+LOUDNESS_STANDARD = 4.0        # ISO 226:2023
+LOUDNESS_MODE = 1.0            # IIR: minimum phase, so it adds no latency
+LOUDNESS_APPROX = 2.0
+# Its volume control is where the listening level goes, and it attenuates by
+# that much as well as choosing the contour.  The attenuation belongs to the
+# output device, not to us, so the input gain cancels it and only the contour
+# is left.
+LOUDNESS_FLOOR_DB = -40.0
+# What full volume is assumed to be, relative to the 83 dB reference the
+# compensator is calibrated against.  A laptop at arm's length is well short
+# of that, and this is an assumption rather than a measurement: it decides how
+# much compensation a given volume setting earns, not whether the shape is
+# right.
+LOUDNESS_FULL_SCALE_OFFSET_DB = -5.0
+LOUDNESS_SERVICE = "omarchy-speaker-loudness.service"
+LOUDNESS_TRACKER = "loudness-tracker.py"
+
 PEAKING_SLOTS = 12
 DEFAULT_HIGHPASS_HZ = 55.0
 # A high-pass section is switched off by moving it below the audible band
@@ -405,6 +522,33 @@ def highpass_settings(fit_payload):
     return corner, q, max(1, min(2, stages))
 
 
+def loudness_controls(sink_volume_db, enabled):
+    """Compensator settings for the level the speakers are playing at.
+
+    ``volume`` carries the listening level, which selects the contour and
+    attenuates by the same amount; ``input`` is a linear gain, so cancelling
+    it there leaves the contour and nothing else.  The output device keeps
+    doing the actual attenuating, which means this never fights the volume
+    keys and never doubles them.
+    """
+    level = float(np_free_clip(
+        float(sink_volume_db) + LOUDNESS_FULL_SCALE_OFFSET_DB, LOUDNESS_FLOOR_DB, 0.0
+    ))
+    return {
+        "loudcomp:enabled": 1.0 if enabled else 0.0,
+        "loudcomp:volume": level if enabled else 0.0,
+        "loudcomp:input": round(10.0 ** (-level / 20.0), 6) if enabled else 1.0,
+        "loudcomp:std": LOUDNESS_STANDARD,
+        "loudcomp:mode": LOUDNESS_MODE,
+        "loudcomp:approx": LOUDNESS_APPROX,
+    }
+
+
+def np_free_clip(value, low, high):
+    """A clamp that costs no import; the fast paths must stay light."""
+    return max(low, min(high, value))
+
+
 def bass_enhancer_controls(corner_hz, deep_bass):
     """Controls for the bass add-on, tuned to where this speaker gives up."""
     limit = float(min(BASS_ENHANCER_MAX_HZ, max(10.0, corner_hz)))
@@ -422,7 +566,8 @@ def bass_enhancer_controls(corner_hz, deep_bass):
     }
 
 
-def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False):
+def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False,
+                   loudness_compensation=False, sink_volume_db=0.0):
     """Every control of the fixed-shape graph, for both channels, in order."""
     if bass_enhancer is None:
         bass_enhancer = bass_enhancer_status()["usable"]
@@ -455,6 +600,7 @@ def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False):
         controls[f"bal_{side}:Add"] = 0.0
     if bass_enhancer:
         controls.update(bass_enhancer_controls(corner, deep_bass))
+    controls.update(loudness_controls(sink_volume_db, loudness_compensation))
     controls["limiter:g_in"] = float(fit_payload["input_gain_linear"])
     return controls
 
@@ -463,11 +609,13 @@ def _number(value):
     return f"{float(value):.4f}".rstrip("0").rstrip(".") or "0"
 
 
-def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False):
+def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False,
+                  loudness_compensation=False, sink_volume_db=0.0):
     if bass_enhancer is None:
         bass_enhancer = bass_enhancer_status()["usable"]
     controls = graph_controls(
-        fit_payload, bass_enhancer=bass_enhancer, deep_bass=deep_bass
+        fit_payload, bass_enhancer=bass_enhancer, deep_bass=deep_bass,
+        loudness_compensation=loudness_compensation, sink_volume_db=sink_volume_db,
     )
     nodes, links, inputs, outputs = [], [], [], []
     for side, port in (("l", "l"), ("r", "r")):
@@ -489,13 +637,17 @@ def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False):
                 f'{{ type = builtin name = {name} label = {label} control = {{ {settings} }} }}'
             )
             chain.append(name)
+        # The compensator lifts what the ear loses at low level; the
+        # high-pass after it still throws away whatever the speaker cannot
+        # play, so the lift only survives where it can be heard.
+        links.append(f'{{ output = "loudcomp:out_{port}" input = "{chain[0]}:In" }}')
         if bass_enhancer:
-            # The add-on has to see the low notes before the high-pass takes
-            # them away, so it comes first and feeds each channel's chain.
-            links.append(f'{{ output = "bass:out_{port}" input = "{chain[0]}:In" }}')
+            # The add-on has to see the low notes before anything takes them
+            # away, so it comes first and feeds the compensator.
+            links.append(f'{{ output = "bass:out_{port}" input = "loudcomp:in_{port}" }}')
             inputs.append(f'"bass:in_{port}"')
         else:
-            inputs.append(f'"{chain[0]}:In"')
+            inputs.append(f'"loudcomp:in_{port}"')
         for before, after in zip(chain, chain[1:]):
             links.append(f'{{ output = "{before}:Out" input = "{after}:In" }}')
         links.append(f'{{ output = "{chain[-1]}:Out" input = "limiter:in_{port}" }}')
@@ -510,6 +662,14 @@ def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False):
         nodes.insert(0, f'''{{ type = lv2 name = bass
       plugin = "{BASS_ENHANCER_URI}"
       control = {{ {settings} }}
+    }}''')
+    loudness = " ".join(
+        f'"{name.split(":", 1)[1]}" = {_number(value)}'
+        for name, value in controls.items() if name.startswith("loudcomp:")
+    )
+    nodes.insert(0, f'''{{ type = lv2 name = loudcomp
+      plugin = "{LOUDNESS_URI}"
+      control = {{ {loudness} }}
     }}''')
     input_gain = controls["limiter:g_in"]
     nodes.append(f'''{{ type = lv2 name = limiter
@@ -703,10 +863,16 @@ def activate_profile(profile):
     fit = profile.get("fit") or {}
     enhancer = bass_enhancer_status()["usable"]
     deep_bass = profile.get("deep_bass") == "on" and enhancer
-    controls = graph_controls(fit, bass_enhancer=enhancer, deep_bass=deep_bass)
+    compensation = profile.get("loudness_compensation") == "on"
+    volume = sink_volume_db(VIRTUAL_SINK)
+    controls = graph_controls(
+        fit, bass_enhancer=enhancer, deep_bass=deep_bass,
+        loudness_compensation=compensation, sink_volume_db=volume,
+    )
     FRAGMENT.parent.mkdir(parents=True, exist_ok=True)
     FRAGMENT.write_text(filter_config(
-        profile["speaker"]["name"], fit, bass_enhancer=enhancer, deep_bass=deep_bass
+        profile["speaker"]["name"], fit, bass_enhancer=enhancer, deep_bass=deep_bass,
+        loudness_compensation=compensation, sink_volume_db=volume,
     ))
     state = compare_state()
     if state["bypass"]:
@@ -720,32 +886,44 @@ def activate_profile(profile):
 
 
 @contextlib.contextmanager
-def bass_enhancer_silenced():
-    """Mute the psychoacoustic bass while the linear correction is checked.
+def added_sound_silenced():
+    """Mute everything that invents sound while the filters are measured.
 
-    The add-on invents harmonics that no linear model predicts, and it puts
-    them just above the high-pass corner.  Left running during a check it is
-    measured as several decibels of error exactly there, which is not the
-    filters getting anything wrong.  Worse, feeding that back would have the
-    optimizer cut away the bass the add-on had just added.  Only its own
-    controls are touched, so the filters under test are untouched.
+    The bass add-on makes harmonics that were never in the signal, and the
+    loudness compensator bends the response by an amount that depends on the
+    volume knob.  Neither is something a linear model of the filters
+    predicts, so a check that left them running would measure them as error
+    exactly where they act, and feeding that back would have the optimizer
+    cut away what they had just added.  Only their own controls are touched,
+    so the filters under test are untouched.
     """
     node_id = tuning_node_id() if service_active() else None
     if node_id is None:
         yield False
         return
     live = live_controls(node_id)
-    saved = {name: value for name, value in live.items() if name.startswith("bass:")}
-    if not saved or saved.get("bass:bypass", 1.0) >= 0.5:
-        yield False
-        return
-    if not apply_controls_live({**saved, "bass:bypass": 1.0, "bass:amt": 0.0}):
+    running, quiet = {}, {}
+
+    enhancer = {name: value for name, value in live.items() if name.startswith("bass:")}
+    if enhancer and enhancer.get("bass:bypass", 1.0) < 0.5:
+        running.update(enhancer)
+        quiet.update({**enhancer, "bass:bypass": 1.0, "bass:amt": 0.0})
+
+    compensation = {
+        name: value for name, value in live.items() if name.startswith("loudcomp:")
+    }
+    if compensation and compensation.get("loudcomp:enabled", 0.0) >= 0.5:
+        running.update(compensation)
+        quiet.update({**compensation, "loudcomp:enabled": 0.0,
+                      "loudcomp:volume": 0.0, "loudcomp:input": 1.0})
+
+    if not quiet or not apply_controls_live(quiet):
         yield False
         return
     try:
         yield True
     finally:
-        apply_controls_live(saved)
+        apply_controls_live(running)
 
 
 @contextlib.contextmanager
@@ -1124,8 +1302,10 @@ def profile_from_measurement(
         "loudness": loudness,
         "bass": bass,
         "channel_trim": channel_trim,
-        # Carried across refits so switching voicing does not lose the add-on.
+        # Carried across refits so switching voicing does not lose them.
         "deep_bass": (load_profile(PROFILE) or {}).get("deep_bass", "off"),
+        "loudness_compensation":
+            (load_profile(PROFILE) or {}).get("loudness_compensation", "off"),
         "safety": {
             "eq_max_db": fit_payload["maximum_allowed_boost_db"] if fit_payload else 0,
             "eq_min_db": fit_payload["cut_limit_db"] if fit_payload else 0,
@@ -1278,6 +1458,8 @@ def install_now(profile):
         filter_config(
             profile["speaker"]["name"], profile["fit"], bass_enhancer=enhancer,
             deep_bass=profile.get("deep_bass") == "on" and enhancer,
+            loudness_compensation=profile.get("loudness_compensation") == "on",
+            sink_volume_db=sink_volume_db(VIRTUAL_SINK),
         ),
     )
     profile["installed"] = True
@@ -1394,7 +1576,7 @@ def verify_calibration(channel_override=None):
     calibration_file = mic.get("calibration_file")
     # The one measurement that is deliberately made through the correction,
     # but never through the add-on that invents frequencies.
-    with bass_enhancer_silenced() as muted:
+    with added_sound_silenced() as muted:
         measurement = capture_measurement(
             VIRTUAL_SINK, mic["name"], channel, calibration_file,
             # The level default belongs to the real speakers behind the filter.
@@ -1453,7 +1635,9 @@ def status_payload():
             "compare": compare,
             "verification": load_verification(),
             "bassEnhancer": bass_enhancer_state(),
-            "deepBass": (profile or {}).get("deep_bass", "off")}
+            "deepBass": (profile or {}).get("deep_bass", "off"),
+            "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
+            "loudnessTracker": "running" if loudness_running() else "stopped"}
     try:
         DATA.mkdir(parents=True, exist_ok=True)
         STATUS_CACHE.write_text(json.dumps(payload) + "\n")
@@ -1608,6 +1792,7 @@ def disable():
     target = profile["speaker"]["name"] if profile else None
     if target:
         move_apps(target)
+    stop_loudness_tracker()
     run(["systemctl", "--user", "disable", "--now", SERVICE], check=False)
     print("Speaker calibration disabled." + (f" Output restored to {target}." if target else ""))
 
@@ -1618,7 +1803,7 @@ def main():
     for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
-    for name in ("deep-bass-toggle", "install-bass-enhancer"):
+    for name in ("deep-bass-toggle", "install-bass-enhancer", "loudness-toggle"):
         sub.add_parser(name)
     verify = sub.add_parser("verify-json")
     verify.add_argument("--channel")
@@ -1672,6 +1857,8 @@ def main():
         print(json.dumps(verify_calibration(args.channel)))
     elif command == "deep-bass-toggle":
         print(json.dumps(deep_bass_toggle()))
+    elif command == "loudness-toggle":
+        print(json.dumps(loudness_toggle()))
     elif command == "install-bass-enhancer":
         print(json.dumps(install_bass_enhancer()))
     elif command == "refine-json":

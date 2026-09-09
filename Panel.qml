@@ -141,6 +141,19 @@ Panel {
     if (match > -0.05) return ""
     return ", matched " + Math.abs(match).toFixed(1) + " dB quieter so only the tone changes"
   }
+  // The compensator needs to know the listening level, which only the output
+  // device knows, so a small service follows the volume and passes it on.
+  function loudnessCompensationDescription() {
+    if (service.status.loudnessCompensation !== "on")
+      return "Off. Quiet music loses its bass to the ear, not to the speakers. "
+        + "Switching this on follows the volume and puts back what hearing drops, "
+        + "using the ISO 226 equal-loudness curves."
+    return "On, following the volume"
+      + (service.status.loudnessTracker === "running" ? "." : " — but the service that "
+         + "watches the volume is not running, so the amount is frozen where it was.")
+      + " How much it applies assumes full volume is a normal listening level; the shape "
+      + "is right either way."
+  }
   function heroMeta() {
     if (service.busy) return service.message
     if (!service.status.enabled)
@@ -1131,6 +1144,17 @@ Panel {
                 placeholderText: "Optional path to serial-number calibration .txt"
                 selectByMouse: true
               }
+            }
+
+            Toggle {
+              width: parent.width
+              label: "Loudness compensation"
+              description: root.loudnessCompensationDescription()
+              checked: service.status.loudnessCompensation === "on"
+              enabled: !service.busy && service.status.enabled
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.loudnessCompensation()
             }
 
             Text {

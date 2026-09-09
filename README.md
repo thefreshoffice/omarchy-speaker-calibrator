@@ -151,6 +151,31 @@ serial-number calibration text file can be supplied. Keep the room quiet and do
 not move the computer or microphone during the roughly 30-second level check and
 sweep sequence.
 
+### Loudness compensation
+
+Quiet music sounds thin because the ear loses bass as the level drops, not
+because the speakers do. **Loudness compensation** in Advanced puts back what
+hearing drops, using the ISO 226:2023 equal-loudness curves, and follows the
+volume so the amount is right at every setting.
+
+It is the only part of this that needs something running in the background: the
+compensator has to be told the listening level, and only the output device
+knows it, so a small service watches the volume and passes it on. That service
+writes nothing but the compensator's own controls, and switches the
+compensation off when it stops, because a quiet-level curve left applied at
+high volume would be heard as far too much bass.
+
+Two honest caveats. The compensator's volume control attenuates as well as
+selecting the curve, so the input gain cancels that and leaves the curve alone;
+the output device keeps doing the actual attenuating, which means this never
+fights the volume keys. And how much compensation a given volume earns depends
+on what full volume is in real decibels, which no uncalibrated measurement can
+tell us; the assumption is that full volume is a normal listening level. The
+shape of the correction is right regardless, only the amount depends on that.
+Whatever it lifts below the speaker's knee is removed again by the high-pass,
+so on a small laptop speaker most of its effect lands between the knee and the
+midrange.
+
 ### Channel balance
 
 A broadband level difference between the two speakers pulls the stereo image

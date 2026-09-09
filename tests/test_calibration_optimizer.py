@@ -350,8 +350,9 @@ class CalibrationOptimizerTests(unittest.TestCase):
         controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
         slots = speaker_calibrate.PEAKING_SLOTS
         # Per channel: two high-passes, three shelves, the parametric slots,
-        # and the balance trim's two controls; plus the limiter's input gain.
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1)
+        # and the balance trim's two controls; plus the limiter's input gain
+        # and the compensator's six, which are not per channel.
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Add"], 0.0)
@@ -729,7 +730,7 @@ class RawMeasurementTests(unittest.TestCase):
         self.assertEqual(applied[-1], installed)
         self.assertNotIn("limiter:grgv_l", applied[-1])
 
-    def test_the_check_mutes_the_add_on_and_restores_it(self):
+    def test_the_check_mutes_what_invents_sound_and_restores_it(self):
         module = speaker_calibrate
         saved = {name: getattr(module, name) for name in (
             "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
@@ -737,6 +738,7 @@ class RawMeasurementTests(unittest.TestCase):
         running = {
             "hp1_l:Freq": 195.8, "p1_l:Gain": -7.0, "limiter:g_in": 1.66,
             "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
+            "loudcomp:enabled": 0.0,
         }
         applied = []
         try:
@@ -744,7 +746,7 @@ class RawMeasurementTests(unittest.TestCase):
             module.tuning_node_id = lambda: 7
             module.live_controls = lambda node_id: dict(running)
             module.apply_controls_live = lambda controls: applied.append(dict(controls)) or True
-            with module.bass_enhancer_silenced() as muted:
+            with module.added_sound_silenced() as muted:
                 self.assertTrue(muted)
         finally:
             for name, value in saved.items():
@@ -759,7 +761,7 @@ class RawMeasurementTests(unittest.TestCase):
             "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
         })
 
-    def test_nothing_is_muted_when_the_add_on_is_already_off(self):
+    def test_nothing_is_muted_when_nothing_is_inventing_sound(self):
         module = speaker_calibrate
         saved = {name: getattr(module, name) for name in (
             "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
@@ -768,9 +770,11 @@ class RawMeasurementTests(unittest.TestCase):
         try:
             module.service_active = lambda: True
             module.tuning_node_id = lambda: 7
-            module.live_controls = lambda node_id: {"bass:bypass": 1.0, "bass:amt": 0.0}
+            module.live_controls = lambda node_id: {
+                "bass:bypass": 1.0, "bass:amt": 0.0, "loudcomp:enabled": 0.0,
+            }
             module.apply_controls_live = lambda controls: touched.append(controls) or True
-            with module.bass_enhancer_silenced() as muted:
+            with module.added_sound_silenced() as muted:
                 self.assertFalse(muted)
         finally:
             for name, value in saved.items():
@@ -959,8 +963,10 @@ class BassEnhancerTests(unittest.TestCase):
         )
         self.assertNotIn("bankstown", graph)
         self.assertNotIn("bass:", graph)
-        self.assertIn('inputs  = [ "hp1_l:In" "hp1_r:In" ]'.replace("  ", " "),
+        # Without the add-on the compensator is what the sound enters through.
+        self.assertIn('inputs  = [ "loudcomp:in_l" "loudcomp:in_r" ]'.replace("  ", " "),
                       graph.replace("  ", " "))
+        self.assertIn('{ output = "loudcomp:out_l" input = "hp1_l:In" }', graph)
         controls = speaker_calibrate.graph_controls(self.fit, bass_enhancer=False)
         self.assertFalse([name for name in controls if name.startswith("bass:")])
 
@@ -969,12 +975,16 @@ class BassEnhancerTests(unittest.TestCase):
             "alsa_output.x", self.fit, bass_enhancer=True, deep_bass=True
         )
         self.assertIn(speaker_calibrate.BASS_ENHANCER_URI, graph)
-        self.assertIn('{ output = "bass:out_l" input = "hp1_l:In" }', graph)
-        self.assertIn('{ output = "bass:out_r" input = "hp1_r:In" }', graph)
+        self.assertIn('{ output = "bass:out_l" input = "loudcomp:in_l" }', graph)
+        self.assertIn('{ output = "bass:out_r" input = "loudcomp:in_r" }', graph)
         self.assertIn('"bass:in_l"', graph)
         self.assertIn('"bass:in_r"', graph)
-        # It must be the first node, so it sees the bass before it is removed.
-        self.assertLess(graph.index("name = bass"), graph.index("name = hp1_l"))
+        # The links are what order a filter chain, not the order the nodes
+        # happen to be declared in: sound enters the add-on, so it sees the
+        # bass before anything shapes or removes it.
+        self.assertIn('"bass:in_l"', graph)
+        self.assertIn('{ output = "loudcomp:out_l" input = "hp1_l:In" }', graph)
+        self.assertNotIn('input = "bass:in_l" }', graph)
 
     def test_its_band_follows_the_measured_knee(self):
         controls = speaker_calibrate.graph_controls(
@@ -1182,6 +1192,80 @@ class StartupCostTests(unittest.TestCase):
         spec = SweepSpec()
         self.assertEqual(speaker_calibrate.RATE, spec.rate)
         self.assertEqual(speaker_calibrate.EXTERNAL_SPEAKER_LEVEL_DBFS, spec.level_dbfs)
+
+
+class LoudnessCompensationTests(unittest.TestCase):
+    """The curve must be the only thing it applies; the level is not ours."""
+
+    def net_gain_db(self, controls):
+        import math
+        return controls["loudcomp:volume"] + 20 * math.log10(controls["loudcomp:input"])
+
+    def test_the_volume_is_read_from_what_pactl_prints(self):
+        # The number and its unit are separate words, and every channel is
+        # listed; an earlier version matched the bare "dB" and always read 0.
+        reading = ("Volume: front-left: 36044 /  55% / -15.58 dB,"
+                   "   front-right: 36044 /  55% / -15.58 dB\n        balance 0.00\n")
+        self.assertAlmostEqual(speaker_calibrate.parse_sink_volume_db(reading), -15.58)
+        full = ("Volume: front-left: 65536 / 100% / 0.00 dB,"
+                "   front-right: 65536 / 100% / 0.00 dB\n")
+        self.assertAlmostEqual(speaker_calibrate.parse_sink_volume_db(full), 0.0)
+        # An unbalanced pair follows the louder side, which sets the level.
+        lopsided = ("Volume: front-left: 36044 /  55% / -15.58 dB,"
+                    "   front-right: 65536 / 100% / -2.00 dB\n")
+        self.assertAlmostEqual(speaker_calibrate.parse_sink_volume_db(lopsided), -2.0)
+        self.assertEqual(speaker_calibrate.parse_sink_volume_db("no volume here"), 0.0)
+
+    def test_it_never_changes_the_level(self):
+        # Its volume control attenuates as well as choosing the curve, and the
+        # attenuating belongs to the output device, so the two must cancel.
+        for volume in (0.0, -6.0, -9.4, -20.0, -35.0):
+            controls = speaker_calibrate.loudness_controls(volume, True)
+            self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
+
+    def test_a_quieter_setting_asks_for_a_lower_contour(self):
+        loud = speaker_calibrate.loudness_controls(0.0, True)
+        quiet = speaker_calibrate.loudness_controls(-20.0, True)
+        self.assertLess(quiet["loudcomp:volume"], loud["loudcomp:volume"])
+        self.assertAlmostEqual(
+            loud["loudcomp:volume"], speaker_calibrate.LOUDNESS_FULL_SCALE_OFFSET_DB
+        )
+
+    def test_the_contour_stops_at_the_floor(self):
+        controls = speaker_calibrate.loudness_controls(-90.0, True)
+        self.assertEqual(controls["loudcomp:volume"], speaker_calibrate.LOUDNESS_FLOOR_DB)
+        self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
+
+    def test_switched_off_it_is_inert(self):
+        controls = speaker_calibrate.loudness_controls(-30.0, False)
+        self.assertEqual(controls["loudcomp:enabled"], 0.0)
+        self.assertEqual(controls["loudcomp:input"], 1.0)
+        self.assertEqual(controls["loudcomp:volume"], 0.0)
+
+    def test_it_uses_the_current_equal_loudness_standard(self):
+        controls = speaker_calibrate.loudness_controls(-10.0, True)
+        self.assertEqual(controls["loudcomp:std"], 4.0)   # ISO 226:2023
+        self.assertEqual(controls["loudcomp:mode"], 1.0)  # IIR, so no added latency
+
+    def test_the_graph_always_carries_it_so_it_can_be_switched_live(self):
+        fit = {"filters": [], "input_gain_linear": 1.0}
+        off = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        on = speaker_calibrate.graph_controls(
+            fit, bass_enhancer=False, loudness_compensation=True, sink_volume_db=-12.0
+        )
+        self.assertEqual(set(off), set(on))
+        self.assertEqual(off["loudcomp:enabled"], 0.0)
+        self.assertEqual(on["loudcomp:enabled"], 1.0)
+        # Nothing else moves, so switching it is a control change, not a rebuild.
+        self.assertEqual(
+            {k: v for k, v in off.items() if not k.startswith("loudcomp:")},
+            {k: v for k, v in on.items() if not k.startswith("loudcomp:")},
+        )
+
+    def test_bypassing_the_calibration_also_flattens_it(self):
+        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        self.assertEqual(controls["loudcomp:enabled"], 0.0)
+        self.assertEqual(controls["loudcomp:input"], 1.0)
 
 
 if __name__ == "__main__":
