@@ -516,7 +516,6 @@ Panel {
 
   // ---- row components for the advanced view -----------------------------------
 
-
   // A clickable row in the shell's control style: glyph, short title, and a
   // dim description.  Long option lists belong in the description, never in
   // the title, so nothing overflows or gets centred into unreadability.
@@ -633,7 +632,6 @@ Panel {
       }
     }
   }
-
 
   // ---- biquad magnitudes for the equalizer view ----------------------------------
   function biquadDb(b0, b1, b2, a0, a1, a2, w) {
@@ -1083,8 +1081,6 @@ Panel {
             }
           }
 
-
-
           PanelSeparator { foreground: root.foreground }
 
           Button {
@@ -1190,6 +1186,19 @@ Panel {
             spacing: Style.space(6)
 
             PanelSectionHeader { text: "MICROPHONE"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+            // Said before the choice rather than after it.
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "The built-in mics already give a big improvement. An external measuring "
+                + "mic, placed where you sit, improves the sound a lot more."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
             Repeater {
               model: service.microphones
               // A button carries one line of text.  What this microphone has
@@ -1218,9 +1227,10 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   width: parent.width
-                  // A Column owns its children's x, so the indent that lines
-                  // this up under the button's label has to be padding.
-                  leftPadding: Style.space(11)
+                  // Flush with every other line in the section, so the panel
+                  // has one left edge rather than several.  It reads as this
+                  // device's caption because it sits tight under it: the gap
+                  // inside a row is a third of the gap between rows.
                   bottomPadding: Style.space(3)
                   text: root.microphoneNote(modelData)
                   color: root.dim
@@ -1259,41 +1269,7 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
-            RowLayout {
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                textFormat: Text.PlainText
-                Layout.alignment: Qt.AlignTop
-                text: "󰋽"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.icon
-              }
-              Text {
-                textFormat: Text.PlainText
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignVCenter
-                text: "The built-in mics already give a big improvement. An external measuring mic, placed where you sit, improves the sound a lot more."
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-            }
           }
-
-
-
-
-
-
-
-
-
-
-
-
 
           PanelSeparator { foreground: root.foreground }
 

@@ -558,7 +558,8 @@ def devices_payload():
         name = item["name"]
         return {
             "name": name,
-            "description": label(item),
+            # A device names itself, and some do it with ragged spacing.
+            "description": short_label(label(item)) or label(item),
             "channels": channel_count(item),
             "kind": kind,
             "internal": name.startswith(("alsa_input.pci-", "alsa_output.pci-")),
