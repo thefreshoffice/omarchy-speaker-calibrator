@@ -299,7 +299,8 @@ def loudness_toggle():
     # this is a handful of milliseconds.
     fit = profile.get("fit") or {}
     controls = loudness_controls(
-        sink_volume_db(VIRTUAL_SINK), wanted == "on", fit.get("input_gain_linear", 1.0))
+        sink_volume_db(listening_sink(profile)), wanted == "on",
+        fit.get("input_gain_linear", 1.0))
     if apply_controls_live(controls):
         method = "live"
         # Keep the graph on disk in step, so a restart keeps the setting.
@@ -309,7 +310,7 @@ def loudness_toggle():
             bass_enhancer=enhancer,
             deep_bass=profile.get("deep_bass") == "on" and enhancer,
             loudness_compensation=wanted == "on",
-            sink_volume_db=sink_volume_db(VIRTUAL_SINK),
+            sink_volume_db=sink_volume_db(listening_sink(profile)),
         ))
     else:
         method = activate_profile(profile)
@@ -405,6 +406,22 @@ def sink_volume_db(name):
 def is_physical_sink(name):
     """True for a real output device, never the calibrated sink in front of one."""
     return str(name).startswith("alsa_output.") and str(name) != VIRTUAL_SINK
+
+
+def listening_sink(profile=None):
+    """The sink whose volume says how loud the speakers actually are.
+
+    Not this filter's own.  The volume keys deliberately resolve through a DSP
+    sink to the device behind it, so that the keys move real loudness and the
+    processing keeps seeing full-scale input; this filter's volume therefore
+    never moves, and reading it reports full volume however quiet the room is.
+    Following it would leave the contour flat at every setting, which is what
+    it did.
+    """
+    if profile is None:
+        profile = load_profile(PROFILE)
+    name = ((profile or {}).get("speaker") or {}).get("name")
+    return name or VIRTUAL_SINK
 
 
 def physical_sinks():
@@ -969,7 +986,7 @@ def activate_profile(profile):
     enhancer = bass_enhancer_status()["usable"]
     deep_bass = profile.get("deep_bass") == "on" and enhancer
     compensation = profile.get("loudness_compensation") == "on"
-    volume = sink_volume_db(VIRTUAL_SINK)
+    volume = sink_volume_db(listening_sink(profile))
     controls = graph_controls(
         fit, bass_enhancer=enhancer, deep_bass=deep_bass,
         loudness_compensation=compensation, sink_volume_db=volume,
@@ -1573,7 +1590,7 @@ def install_now(profile):
             profile["speaker"]["name"], profile["fit"], bass_enhancer=enhancer,
             deep_bass=profile.get("deep_bass") == "on" and enhancer,
             loudness_compensation=profile.get("loudness_compensation") == "on",
-            sink_volume_db=sink_volume_db(VIRTUAL_SINK),
+            sink_volume_db=sink_volume_db(listening_sink(profile)),
         ),
     )
     profile["installed"] = True

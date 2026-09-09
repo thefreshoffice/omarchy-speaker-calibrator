@@ -6,6 +6,11 @@ compensator in the filter graph can undo that, but only if it is told the
 listening level, and only the output device knows it.  This watches the
 volume and passes it on.
 
+The volume it watches is the physical device's, not the filter's.  The volume
+keys resolve through a DSP sink to the device behind it so that they move real
+loudness and the processing keeps seeing full-scale input, which means the
+filter's own volume sits at full however quiet the room is.
+
 It holds one subscription open for the life of the service rather than
 resubscribing after every change: restarting it each time leaves a window in
 which a volume move is missed, and a missed move leaves the wrong contour
@@ -50,6 +55,7 @@ class Tracker:
         self.profile_stamp = None
         self.enabled = False
         self.input_gain = 1.0
+        self.sink = None
         self.running = True
 
     def stop(self, *_):
@@ -102,6 +108,9 @@ class Tracker:
             # it builds on has to come from the same profile.
             self.input_gain = float(
                 (profile.get("fit") or {}).get("input_gain_linear", 1.0))
+            # The device behind the filter, not the filter: the volume keys
+            # resolve through it, so its own volume never moves.
+            self.sink = self.helper.listening_sink(profile)
             self.profile_stamp = stamp
         return self.enabled
 
@@ -109,7 +118,7 @@ class Tracker:
         """Apply the current volume if it has moved enough to matter."""
         if not self.wanted():
             return self.apply(0.0, enabled=False) if self.applied_db is not None else True
-        volume = self.helper.sink_volume_db(self.helper.VIRTUAL_SINK)
+        volume = self.helper.sink_volume_db(self.sink or self.helper.VIRTUAL_SINK)
         if self.applied_db is not None and abs(volume - self.applied_db) < VOLUME_EPSILON_DB:
             return True
         return self.apply(volume)

@@ -1272,6 +1272,25 @@ class LoudnessCompensationTests(unittest.TestCase):
             self.assertGreaterEqual(contour, speaker_calibrate.LOUDNESS_FLOOR_DB)
             self.assertLessEqual(contour, 0.0)
 
+    def test_it_follows_the_device_the_volume_keys_move(self):
+        # The volume keys resolve through this filter to the device behind it,
+        # so the filter's own volume never moves.  Following it left the
+        # contour flat at every setting, which is why nothing was audible.
+        profile = {"speaker": {"name": "alsa_output.pci-0000_00_1f.3.analog-stereo"}}
+        self.assertEqual(
+            speaker_calibrate.listening_sink(profile),
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        )
+        self.assertNotEqual(
+            speaker_calibrate.listening_sink(profile), speaker_calibrate.VIRTUAL_SINK
+        )
+
+    def test_without_a_profile_it_falls_back_to_the_filter(self):
+        # Nothing else is known then, and a wrong contour is worse than none.
+        self.assertEqual(
+            speaker_calibrate.listening_sink({}), speaker_calibrate.VIRTUAL_SINK
+        )
+
     def test_full_volume_is_left_alone(self):
         # There is no headroom for a boost at full scale, and nothing to
         # compensate either: the reference is what full volume is.
