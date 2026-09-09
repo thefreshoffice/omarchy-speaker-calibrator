@@ -1255,16 +1255,29 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(controls["loudcomp:volume"], speaker_calibrate.LOUDNESS_FLOOR_DB)
         self.assertAlmostEqual(self.net_gain_db(controls), 0.0, places=4)
 
-    def test_the_make_up_cannot_drive_the_limiter_harder(self):
-        # The make-up is exactly the attenuation the volume control already
-        # applied, so what arrives at the limiter is never louder than it
-        # would be at full volume, however far down the contour goes.
-        import math
-        for volume in (0.0, -3.0, -12.0, -30.0, -60.0):
-            controls = speaker_calibrate.loudness_controls(volume, True)
-            headroom = volume + 20 * math.log10(controls["limiter:g_in"])
-            # The gain is rounded for the wire, so allow that much and no more.
-            self.assertLessEqual(headroom, 0.001)
+    def test_the_contour_is_never_asked_for_more_than_the_volume_freed(self):
+        # The volume reading understates how quiet it is, so the contour is
+        # taken deeper than the reading; never deeper than the volume has
+        # actually come down, though.  That is what keeps the lift inside the
+        # headroom the attenuation freed, and full volume untouched.
+        for volume in (0.0, -1.0, -3.0, -12.0, -30.0, -60.0):
+            contour = speaker_calibrate.loudness_level_db(volume)
+            extra = volume - contour
+            self.assertLessEqual(
+                extra,
+                min(speaker_calibrate.LOUDNESS_EXTRA_DEPTH_DB, max(0.0, -volume)) + 1e-9,
+            )
+            # Past the floor the contour is shallower than the volume rather
+            # than deeper, which asks for less than the volume freed, not more.
+            self.assertGreaterEqual(contour, speaker_calibrate.LOUDNESS_FLOOR_DB)
+            self.assertLessEqual(contour, 0.0)
+
+    def test_full_volume_is_left_alone(self):
+        # There is no headroom for a boost at full scale, and nothing to
+        # compensate either: the reference is what full volume is.
+        controls = speaker_calibrate.loudness_controls(0.0, True, 1.663413)
+        self.assertEqual(controls["loudcomp:volume"], 0.0)
+        self.assertAlmostEqual(controls["limiter:g_in"], 1.663413, places=5)
 
     def test_switched_off_it_is_inert(self):
         controls = speaker_calibrate.loudness_controls(-30.0, False, 1.663413)

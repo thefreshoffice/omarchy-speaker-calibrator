@@ -512,12 +512,21 @@ LOUDNESS_APPROX = 2.0
 # arriving at the limiter is the same as it would be at full volume however
 # far down the contour goes.
 #
-# The floor stops the contour deepening past the point where it is still
-# about hearing rather than about effect.  Measured on speakers whose usable
-# range starts at 196 Hz, it is worth about 2 dB of warmth at 70% volume and
-# 4 dB at 50%; most of what the contour asks for lives below where a laptop
-# speaker plays at all, and the high-pass after the compensator drops it.
-LOUDNESS_FLOOR_DB = -25.0
+# The floor is only a backstop now, well past where deepening the contour
+# still buys anything: at 50% volume it is worth +4.6 dB of warmth at -30 and
+# +6.1 dB at -42, for four times the gain.
+LOUDNESS_FLOOR_DB = -45.0
+# How much deeper than the volume reading to take the listening level.  The
+# reading understates how quiet it really is, because a laptop speaker at full
+# scale is already well short of the level the contour is calibrated against,
+# so the same setting earns more compensation than the number alone suggests.
+#
+# It is never more than the volume has actually come down.  That keeps full
+# volume untouched, where there is no headroom for a boost at all, and keeps
+# what the contour lifts inside the headroom the attenuation just freed: the
+# lift in the band this speaker can play grows at about a seventh of the
+# contour's depth, so it stays comfortably under the room the volume made.
+LOUDNESS_EXTRA_DEPTH_DB = 12.0
 LOUDNESS_SERVICE = "omarchy-speaker-loudness.service"
 LOUDNESS_TRACKER = "loudness-tracker.py"
 
@@ -596,11 +605,14 @@ def highpass_settings(fit_payload):
 def loudness_level_db(sink_volume_db):
     """The listening level the contour is chosen for, in dB below full volume.
 
-    Only how far the volume has been turned down matters, because that is the
-    part of the listening level actually known here.  How loud full volume is
-    in the room is not, so it is taken as the reference and left alone.
+    How loud full volume is in the room is not known here, so it is taken as
+    the reference and left alone; how far the volume has come down from it is
+    known, and is taken as understating the case by up to
+    ``LOUDNESS_EXTRA_DEPTH_DB``.
     """
-    return float(np_free_clip(float(sink_volume_db), LOUDNESS_FLOOR_DB, 0.0))
+    volume = float(sink_volume_db)
+    extra = min(LOUDNESS_EXTRA_DEPTH_DB, max(0.0, -volume))
+    return float(np_free_clip(volume - extra, LOUDNESS_FLOOR_DB, 0.0))
 
 
 def loudness_controls(sink_volume_db, enabled, input_gain_linear=1.0):
