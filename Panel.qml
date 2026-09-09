@@ -301,6 +301,8 @@ Panel {
     var parts = []
     for (var name in bands) parts.push(name + " " + Number(bands[name]).toFixed(1))
     if (parts.length > 0) rows.push({ key: "Off plan by band", value: parts.join("  ·  ") + " dB" })
+    if (check.bass_enhancer_muted)
+      rows.push({ key: "Deep bass", value: "muted for the check, since the harmonics it invents are not something the filters predict" })
     if (check.analysis_band_hz)
       rows.push({ key: "Judged over", value: root.fmt(check.analysis_band_hz[0], 0) + " Hz to "
         + root.fmt(check.analysis_band_hz[1] / 1000, 0) + " kHz  ·  " + String(check.analysed_points) + " points" })

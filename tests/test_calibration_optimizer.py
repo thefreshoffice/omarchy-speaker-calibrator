@@ -672,6 +672,54 @@ class RawMeasurementTests(unittest.TestCase):
         self.assertEqual(applied[-1], installed)
         self.assertNotIn("limiter:grgv_l", applied[-1])
 
+    def test_the_check_mutes_the_add_on_and_restores_it(self):
+        module = speaker_calibrate
+        saved = {name: getattr(module, name) for name in (
+            "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
+        )}
+        running = {
+            "hp1_l:Freq": 195.8, "p1_l:Gain": -7.0, "limiter:g_in": 1.66,
+            "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
+        }
+        applied = []
+        try:
+            module.service_active = lambda: True
+            module.tuning_node_id = lambda: 7
+            module.live_controls = lambda node_id: dict(running)
+            module.apply_controls_live = lambda controls: applied.append(dict(controls)) or True
+            with module.bass_enhancer_silenced() as muted:
+                self.assertTrue(muted)
+        finally:
+            for name, value in saved.items():
+                setattr(module, name, value)
+        self.assertEqual(len(applied), 2)
+        self.assertEqual(applied[0]["bass:bypass"], 1.0)
+        self.assertEqual(applied[0]["bass:amt"], 0.0)
+        # Only the add-on is touched: the filters under test stay as they are.
+        self.assertNotIn("p1_l:Gain", applied[0])
+        self.assertNotIn("limiter:g_in", applied[0])
+        self.assertEqual(applied[1], {
+            "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
+        })
+
+    def test_nothing_is_muted_when_the_add_on_is_already_off(self):
+        module = speaker_calibrate
+        saved = {name: getattr(module, name) for name in (
+            "service_active", "tuning_node_id", "live_controls", "apply_controls_live",
+        )}
+        touched = []
+        try:
+            module.service_active = lambda: True
+            module.tuning_node_id = lambda: 7
+            module.live_controls = lambda node_id: {"bass:bypass": 1.0, "bass:amt": 0.0}
+            module.apply_controls_live = lambda controls: touched.append(controls) or True
+            with module.bass_enhancer_silenced() as muted:
+                self.assertFalse(muted)
+        finally:
+            for name, value in saved.items():
+                setattr(module, name, value)
+        self.assertEqual(touched, [])
+
     def test_nothing_is_touched_when_the_tuning_is_not_running(self):
         module = speaker_calibrate
         saved = {"service_active": module.service_active, "apply_controls_live": module.apply_controls_live}

@@ -682,6 +682,35 @@ def activate_profile(profile):
 
 
 @contextlib.contextmanager
+def bass_enhancer_silenced():
+    """Mute the psychoacoustic bass while the linear correction is checked.
+
+    The add-on invents harmonics that no linear model predicts, and it puts
+    them just above the high-pass corner.  Left running during a check it is
+    measured as several decibels of error exactly there, which is not the
+    filters getting anything wrong.  Worse, feeding that back would have the
+    optimizer cut away the bass the add-on had just added.  Only its own
+    controls are touched, so the filters under test are untouched.
+    """
+    node_id = tuning_node_id() if service_active() else None
+    if node_id is None:
+        yield False
+        return
+    live = live_controls(node_id)
+    saved = {name: value for name, value in live.items() if name.startswith("bass:")}
+    if not saved or saved.get("bass:bypass", 1.0) >= 0.5:
+        yield False
+        return
+    if not apply_controls_live({**saved, "bass:bypass": 1.0, "bass:amt": 0.0}):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        apply_controls_live(saved)
+
+
+@contextlib.contextmanager
 def correction_silenced():
     """Flatten the running filter while the raw speakers are measured.
 
@@ -1292,14 +1321,18 @@ def verify_calibration(channel_override=None):
         channel_override if channel_override is not None else mic.get("channel", 0)
     )
     calibration_file = mic.get("calibration_file")
-    # The one measurement that is deliberately made through the correction.
-    measurement = capture_measurement(
-        VIRTUAL_SINK, mic["name"], channel, calibration_file,
-        # The level default belongs to the real speakers behind the filter.
-        level_sink=profile["speaker"]["name"],
-        sweeps=VERIFICATION_SWEEPS, recording=VERIFICATION_RECORDING,
-    )
-    measurement["measured_through"] = {"sink": VIRTUAL_SINK, "corrected": True}
+    # The one measurement that is deliberately made through the correction,
+    # but never through the add-on that invents frequencies.
+    with bass_enhancer_silenced() as muted:
+        measurement = capture_measurement(
+            VIRTUAL_SINK, mic["name"], channel, calibration_file,
+            # The level default belongs to the real speakers behind the filter.
+            level_sink=profile["speaker"]["name"],
+            sweeps=VERIFICATION_SWEEPS, recording=VERIFICATION_RECORDING,
+        )
+    measurement["measured_through"] = {
+        "sink": VIRTUAL_SINK, "corrected": True, "bass_enhancer_muted": bool(muted),
+    }
     quality = measurement["quality"]
     channels = measurement.get("channels", [])
     snr = (
@@ -1316,6 +1349,7 @@ def verify_calibration(channel_override=None):
         profile["measurement"]["frequency_hz"],
     )
     report.update({
+        "bass_enhancer_muted": measurement["measured_through"]["bass_enhancer_muted"],
         "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "profile_created_at": profile.get("created_at"),
         "profile_label": profile_summary(PROFILE)["label"] if PROFILE.exists() else None,

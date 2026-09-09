@@ -213,6 +213,12 @@ would, which tests the model rather than the taste? And is the result closer to
 the target than the raw speaker was, which tests whether the correction was
 worth applying at all?
 
+The deep-bass add-on is muted for the duration. It invents harmonics that no
+linear model predicts, and it puts them just above the high-pass corner, so
+leaving it running would be measured as several decibels of error exactly
+there and feeding that back would have the optimizer cut away the bass the
+add-on had just added.
+
 Both curves are level-aligned before comparison, because the sweep level and
 the input trim differ between the two measurements and only shape matters. The
 high-passed region and any band where the check itself sank into the room noise
