@@ -45,9 +45,9 @@ OPTIMIZER_NAMES = (
 # the panel can offer to install them instead of letting a press of Calibrate
 # end in a stack trace.
 MEASUREMENT_PACKAGES = ("python-numpy", "python-scipy")
-# The filter chain ends in an LV2 limiter.  Omarchy carries this package, but
-# only installs it on machines one of its own shipped tunings applies to, so
-# it can be absent here as easily as numpy can.
+# The filter chain ends in an LV2 limiter.  Omarchy pacstraps this package from
+# its own list, so it is normally present; the check is here so that removing
+# it by hand gives a button rather than a dead end.
 LIMITER_PACKAGE = "lsp-plugins-lv2"
 LIMITER_PROBE = Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl")
 
