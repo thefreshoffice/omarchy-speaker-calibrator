@@ -14,31 +14,40 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
-from calibration_dsp import (
-    LEVEL_SEARCH_ABORT_STATUSES,
-    SweepSpec,
-    analyse_capture,
-    analyse_level_probe,
-    build_measurement_signal,
-    combine_microphone_measurements,
-    level_after_clipping,
-    level_search_advice,
-    parse_mic_calibration,
-    read_pcm16_wave_channels,
-    search_measurement_level,
-    write_pcm16_wave,
+# The measurement and fitting code pulls in NumPy and SciPy, a fifth of a
+# second every time the process starts.  Reading the status, listing devices
+# and flipping any switch need none of it, and those are the calls the panel
+# makes constantly, so the import waits until something actually measures.
+DSP_NAMES = (
+    "LEVEL_SEARCH_ABORT_STATUSES", "SweepSpec", "analyse_capture",
+    "analyse_level_probe", "build_measurement_signal",
+    "combine_microphone_measurements", "level_after_clipping",
+    "level_search_advice", "parse_mic_calibration", "read_pcm16_wave_channels",
+    "search_measurement_level", "write_pcm16_wave",
 )
-from calibration_optimizer import (
-    apply_refinement,
-    optimize_peq,
-    refinement_residual,
-    verification_report,
+OPTIMIZER_NAMES = (
+    "apply_refinement", "optimize_peq", "refinement_residual", "verification_report",
 )
 
-SWEEP_SPEC = SweepSpec()
-RATE = SWEEP_SPEC.rate
+
+def load_dsp():
+    """Bind the measurement and fitting names; called only when they are used."""
+    if "np" in globals():
+        return
+    import numpy
+    import calibration_dsp
+    import calibration_optimizer
+    globals()["np"] = numpy
+    for name in DSP_NAMES:
+        globals()[name] = getattr(calibration_dsp, name)
+    for name in OPTIMIZER_NAMES:
+        globals()[name] = getattr(calibration_optimizer, name)
+
+
+# Kept as plain numbers so nothing has to be imported to read them; the tests
+# check they still match what the sweep actually defaults to.
+RATE = 48_000
+EXTERNAL_SPEAKER_LEVEL_DBFS = -27.0
 RECORD_LEAD_SECONDS = 1.0
 INTERNAL_SPEAKER_LEVEL_DBFS = -12.0
 # Before the long sweeps, a short two-sided sweep is played at a quiet level,
@@ -72,6 +81,10 @@ COMPARE_STATE = DATA / "compare-state.json"
 # never land on the calibration capture: refitting an already-corrected
 # recording would correct the sound twice.
 VERIFICATION = DATA / "verification.json"
+# The last answer to "what is playing", so the panel can draw itself before
+# the real query has finished.  Never read back by this program: it is written
+# here and read by the panel, which then refreshes over the top of it.
+STATUS_CACHE = DATA / "status-cache.json"
 VERIFICATION_SWEEPS = DATA / "verification-sweeps.wav"
 VERIFICATION_RECORDING = DATA / "verification.wav"
 SERVICE = "omarchy-speaker-tuning.service"
@@ -188,6 +201,18 @@ def bass_enhancer_install_command():
     if repository:
         return f"omarchy pkg add {BASS_ENHANCER_PACKAGE}", repository
     return f"omarchy pkg aur add {BASS_ENHANCER_PACKAGE}", None
+
+
+def bass_enhancer_state():
+    """Add-on status, including where it would come from if it is missing.
+
+    Asking the package database costs a subprocess and only answers a question
+    that matters while nothing is installed, so it is skipped once it is.
+    """
+    status = bass_enhancer_status()
+    if status["installed"]:
+        return status
+    return {**status, "source": package_repository(BASS_ENHANCER_PACKAGE) or "AUR"}
 
 
 def install_bass_enhancer():
@@ -852,6 +877,7 @@ def compare_toggle():
 def analyze_recording(
     recording, channel, schedule, measurement_spec, *, internal_mic, calibration
 ):
+    load_dsp()
     captures = read_pcm16_wave_channels(recording, measurement_spec.rate)
     recorded_channels = captures.shape[1]
     if channel == "all":
@@ -894,7 +920,7 @@ def default_sweep_level(sink_name):
     """Built-in speakers get a louder sweep than external outputs."""
     if sink_name.startswith("alsa_output.pci-"):
         return INTERNAL_SPEAKER_LEVEL_DBFS
-    return SWEEP_SPEC.level_dbfs
+    return EXTERNAL_SPEAKER_LEVEL_DBFS
 
 
 def record_while_playing(
@@ -932,6 +958,7 @@ def playing_applications():
 
 def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
+    load_dsp()
     default_level = default_sweep_level(level_sink or sink_name)
     probe_program = DATA / "level-probe.wav"
     probe_recording = DATA / "level-probe-recording.wav"
@@ -976,6 +1003,7 @@ def capture_measurement(
     sink_name, mic_name, channel, mic_cal_file=None, *,
     level_sink=None, sweeps=None, recording=None,
 ):
+    load_dsp()
     """Find a safe level, play the Phase 1 program, capture it, and analyze it.
 
     ``level_sink`` names the output the level default should be taken from,
@@ -1048,6 +1076,7 @@ def profile_from_measurement(
     sink, mic, channel, voicing, measurement, loudness="protected", bass="normal",
     channel_trim="off",
 ):
+    load_dsp()
     quality = measurement["quality"]
     internal_mic = mic["name"].startswith("alsa_input.pci-")
     fit_payload = None
@@ -1127,6 +1156,7 @@ def reanalyze_saved_capture(
     voicing=None, channel_override=None, loudness=None, bass=None, channel_trim=None
 ):
     """Re-run current analysis and optimization on the last capture, without sound."""
+    load_dsp()
     recording = DATA / "measurement.wav"
     if not PROPOSAL.exists() or not recording.exists():
         raise SystemExit("No saved capture and proposal are available to reanalyze.")
@@ -1279,6 +1309,7 @@ def deep_bass_toggle():
 
 def refine_from_check():
     """Fold what the check measured back into the raw estimate and fit again."""
+    load_dsp()
     profile = load_profile(PROFILE)
     if profile is None:
         raise SystemExit("No calibration is installed to improve.")
@@ -1320,6 +1351,7 @@ def refine_from_check():
 
 def verify_calibration(channel_override=None):
     """Measure through the corrected output and compare it with the fit."""
+    load_dsp()
     profile = load_profile(PROFILE)
     if profile is None:
         raise SystemExit("No calibration is installed, so there is nothing to check.")
@@ -1396,15 +1428,20 @@ def status_payload():
     active = run(["systemctl", "--user", "is-active", SERVICE], check=False, capture=True).stdout.strip()
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
     compare = compare_payload()
-    return {"service": active or "inactive", "defaultSink": default or "unknown",
+    payload = {"service": active or "inactive", "defaultSink": default or "unknown",
             "profile": profile, "proposal": proposal,
             "enabled": active == "active" and default == VIRTUAL_SINK,
             "bypass": compare["bypass"],
             "compare": compare,
             "verification": load_verification(),
-            "bassEnhancer": {**bass_enhancer_status(),
-                             "source": package_repository(BASS_ENHANCER_PACKAGE) or "AUR"},
+            "bassEnhancer": bass_enhancer_state(),
             "deepBass": (profile or {}).get("deep_bass", "off")}
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        STATUS_CACHE.write_text(json.dumps(payload) + "\n")
+    except OSError:
+        pass
+    return payload
 
 
 def choose_mic():

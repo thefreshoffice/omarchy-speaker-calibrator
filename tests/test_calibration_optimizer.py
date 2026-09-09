@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import subprocess
 import sys
 import unittest
 import importlib.util
@@ -1090,6 +1091,49 @@ class ChannelTrimTests(unittest.TestCase):
         )
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Mult"], 1.0)
+
+
+class StartupCostTests(unittest.TestCase):
+    """The panel asks for status constantly; that path must stay cheap."""
+
+    HELPER = str(Path(__file__).resolve().parents[1] / "speaker-calibrate.py")
+
+    def test_importing_the_helper_does_not_drag_in_numpy(self):
+        probe = (
+            "import importlib.util, sys;"
+            f"spec = importlib.util.spec_from_file_location('sc', {self.HELPER!r});"
+            "module = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(module);"
+            "print('numpy' in sys.modules, 'calibration_dsp' in sys.modules)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            cwd=str(Path(self.HELPER).parent),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["False", "False"], result.stdout)
+
+    def test_asking_for_the_measurement_code_loads_it(self):
+        probe = (
+            "import importlib.util, sys;"
+            f"spec = importlib.util.spec_from_file_location('sc', {self.HELPER!r});"
+            "module = importlib.util.module_from_spec(spec);"
+            "spec.loader.exec_module(module);"
+            "module.load_dsp();"
+            "print('numpy' in sys.modules, callable(module.optimize_peq), module.SweepSpec().rate)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True,
+            cwd=str(Path(self.HELPER).parent),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["True", "True", "48000"])
+
+    def test_the_constants_still_match_the_sweep_they_describe(self):
+        from calibration_dsp import SweepSpec
+        spec = SweepSpec()
+        self.assertEqual(speaker_calibrate.RATE, spec.rate)
+        self.assertEqual(speaker_calibrate.EXTERNAL_SPEAKER_LEVEL_DBFS, spec.level_dbfs)
 
 
 if __name__ == "__main__":

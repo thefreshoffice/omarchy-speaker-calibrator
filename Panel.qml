@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
@@ -104,6 +105,13 @@ Panel {
     root.bassMode = profile.bass === "full" ? "full" : "normal"
     root.loudnessMode = profile.loudness || "protected"
     root.channelTrimMode = profile.channel_trim === "auto" ? "auto" : "off"
+  }
+  // A few words beside each switch; the longer telling is below the group.
+  function deepBassHint() {
+    var addon = service.status.bassEnhancer || {}
+    if (addon.installed === true && addon.usable !== true) return "add-on not usable"
+    if (addon.usable !== true) return "needs a small add-on"
+    return "low notes from their harmonics"
   }
   // One line under the Deep bass switch: what it is, or what pressing it does.
   function deepBassDescription() {
@@ -364,6 +372,67 @@ Panel {
   }
 
   // ---- row components for the advanced view -----------------------------------
+  // A switch on one line: a short name, a hint beside it, and the control at
+  // the end.  The full explanations live under the group, and only while they
+  // are still needed, so four switches cost a third of the height that four
+  // labelled blocks did.
+  component SwitchRow: BorderSurface {
+    id: switchRow
+    property string label: ""
+    property string hint: ""
+    property bool checked: false
+    signal toggled()
+    readonly property bool _hot: switchMouse.containsMouse
+    radius: Style.cornerRadius
+    implicitHeight: Math.max(Style.space(40), switchContent.implicitHeight + Style.space(12))
+    color: Style.controlFill(false, _hot && enabled, root.foreground, Color.accent)
+    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal",
+                                   root.foreground, Color.accent)
+    opacity: enabled ? 1.0 : 0.55
+    Behavior on color { ColorAnimation { duration: 100 } }
+
+    RowLayout {
+      id: switchContent
+      anchors.fill: parent
+      anchors.leftMargin: switchRow.borderLeft + Style.spacing.rowPaddingX
+      anchors.rightMargin: switchRow.borderRight + Style.spacing.rowPaddingX
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        text: switchRow.label
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.subtitle
+        font.bold: true
+      }
+      Text {
+        Layout.fillWidth: true
+        textFormat: Text.PlainText
+        text: switchRow.hint
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+      ToggleSwitch {
+        checked: switchRow.checked
+        interactive: false
+        foreground: root.foreground
+        trackHeight: Style.space(18)
+        Layout.alignment: Qt.AlignVCenter
+      }
+    }
+
+    MouseArea {
+      id: switchMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: switchRow.toggled()
+    }
+  }
+
   // A clickable row in the shell's control style: glyph, short title, and a
   // dim description.  Long option lists belong in the description, never in
   // the title, so nothing overflows or gets centred into unreadability.
@@ -654,7 +723,22 @@ Panel {
     context.globalAlpha = 1.0
   }
 
+  readonly property string dataDirectory:
+    (Quickshell.env("XDG_DATA_HOME")
+      || ((Quickshell.env("HOME") || "") + "/.local/share"))
+    + "/omarchy-speaker-calibrator"
+
   Service { id: service; helperPath: root.helperPath }
+
+  // The panel is drawn from this before the helper has answered.
+  FileView {
+    id: statusCache
+    path: root.dataDirectory + "/status-cache.json"
+    watchChanges: false
+    preload: true
+    printErrors: false
+    onLoaded: service.applyCachedStatus(text())
+  }
 
   Connections {
     target: service
@@ -678,8 +762,8 @@ Panel {
     open: root.opened
     centerOnBar: false
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(460))
-    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(640))
+    contentWidth: panel.fittedContentWidth(Style.space(520))
+    contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(760))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -761,11 +845,89 @@ Panel {
           }
 
           Column {
-            // The display and the day-to-day switches, kept above the
-            // setup below so neither has to be scrolled to.
+            // The switches that get used every day, then the picture of what
+            // they do.  The setup that gets used once sits below both.
             visible: service.status.profile !== null && service.status.profile !== undefined
             width: parent.width
             spacing: Style.space(12)
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              SwitchRow {
+                width: parent.width
+                label: "Loudness"
+                hint: "fuller sound, more bass"
+                checked: root.bassMode === "full"
+                enabled: !service.busy
+                onToggled: {
+                  root.bassMode = root.bassMode === "full" ? "normal" : "full"
+                  root.applyOptions()
+                }
+              }
+              SwitchRow {
+                width: parent.width
+                label: "Make it louder"
+                hint: "gives back the volume the correction takes"
+                checked: root.loudnessMode !== "protected"
+                enabled: !service.busy
+                onToggled: {
+                  root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
+                  root.applyOptions()
+                }
+              }
+              SwitchRow {
+                width: parent.width
+                label: "Deep bass"
+                hint: root.deepBassHint()
+                checked: service.status.deepBass === "on"
+                  && ((service.status.bassEnhancer || {}).usable === true)
+                enabled: !service.busy
+                onToggled: service.deepBass()
+              }
+              SwitchRow {
+                visible: service.status.enabled
+                width: parent.width
+                label: "Calibration"
+                hint: service.status.bypass ? "off, you are hearing the plain speakers"
+                                            : "on, switch off to hear them as they were"
+                checked: !service.status.bypass
+                enabled: !service.busy
+                onToggled: service.bypass()
+              }
+            }
+
+            Text {
+              visible: ((service.status.bassEnhancer || {}).usable !== true)
+              width: parent.width
+              text: root.deepBassDescription()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            RowLayout {
+              visible: root.bassWarningText() !== ""
+              width: parent.width
+              spacing: Style.space(8)
+              Text {
+                Layout.alignment: Qt.AlignTop
+                text: "󰀪"
+                color: bar ? bar.urgent : Color.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.icon
+              }
+              Text {
+                Layout.fillWidth: true
+                text: root.bassWarningText()
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
 
             Column {
               visible: service.status.profile !== null && service.status.profile !== undefined
@@ -797,81 +959,6 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.WordWrap
               }
-            }
-
-            Toggle {
-              width: parent.width
-              label: "Loudness"
-              description: "Fuller sound with more bass, like the loudness button on a stereo."
-              checked: root.bassMode === "full"
-              enabled: !service.busy
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: {
-                root.bassMode = root.bassMode === "full" ? "normal" : "full"
-                root.applyOptions()
-              }
-            }
-
-            Toggle {
-              width: parent.width
-              label: "Make it louder"
-              description: "Gives back the volume the correction takes away. At full volume the limiter works harder."
-              checked: root.loudnessMode !== "protected"
-              enabled: !service.busy
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: {
-                root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
-                root.applyOptions()
-              }
-            }
-
-            Toggle {
-              width: parent.width
-              label: "Deep bass"
-              description: root.deepBassDescription()
-              checked: service.status.deepBass === "on"
-                && ((service.status.bassEnhancer || {}).usable === true)
-              enabled: !service.busy
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: service.deepBass()
-            }
-
-            RowLayout {
-              visible: root.bassWarningText() !== ""
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                Layout.alignment: Qt.AlignTop
-                text: "󰀪"
-                color: bar ? bar.urgent : Color.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.icon
-              }
-              Text {
-                Layout.fillWidth: true
-                text: root.bassWarningText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-            }
-
-            Toggle {
-              visible: service.status.enabled
-              width: parent.width
-              label: "Calibration"
-              description: service.status.bypass
-                ? "Off — you are hearing the plain speakers"
-                : "On — switch off to hear the speakers as they were"
-              checked: !service.status.bypass
-              enabled: !service.busy
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              onClicked: service.bypass()
             }
           }
 

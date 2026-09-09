@@ -81,6 +81,21 @@ Item {
             "--channel-trim", options.channelTrim || "off"]
   }
 
+  // Draw the last known answer straight away.  The real query is already on
+  // its way and lands on top of this, so a stale cache is visible for a few
+  // dozen milliseconds at most and never decides anything.
+  function applyCachedStatus(raw) {
+    if (busy || status.service !== "unknown") return false
+    try {
+      var payload = JSON.parse(String(raw || ""))
+      if (!payload || !payload.service) return false
+      status = payload
+      proposal = payload.proposal || null
+      return true
+    } catch (exception) {
+      return false
+    }
+  }
   function refresh() { if (!busy) start("devices", ["devices-json"]) }
   function refreshStatus() { start("status", ["status-json"]) }
   // Measure; with install=true the result is installed and played as soon as
