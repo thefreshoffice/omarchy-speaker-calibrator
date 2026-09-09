@@ -73,6 +73,17 @@ and the sum of all sections never goes below -15 dB at any frequency, with
 tighter limits toward the band edges for built-in microphones, so stacked
 shallow cuts can no longer add up past what one deep cut is allowed to do.
 
+Before anything is fitted, the response is smoothed by the ear's own
+resolution rather than by a fixed fraction of an octave. The window follows the
+critical band, which is a wide fraction of an octave in the bass and about a
+sixth of an octave from 1 kHz upward, so the unreliable low end is averaged
+broadly while the midrange keeps its detail. The average is taken over cubed
+amplitudes, which lets peaks survive and largely fills narrow dips: a resonance
+is audible and worth removing, while a cancellation of the same depth mostly is
+not, and filling one with gain achieves nothing. Curves that are differences
+rather than responses, such as what the check feeds back, use a plain mean
+instead.
+
 Filter selection is cross-validated. The optimizer fits using earlier accepted
 repeat groups and adds a candidate only when a separate held-out repeat also
 improves without making the worst repeat worse. After the filter structure has
@@ -151,11 +162,14 @@ sweep sequence.
 ### Bass: Normal or Full?
 
 - **Normal** applies the measured correction only.
-- **Full** adds a +3 dB low shelf whose corner sits at the measured knee, the
-  frequency where the speaker stops keeping up with its midband, clamped to
-  150–600 Hz. The lift therefore lands where the driver still turns voltage
-  into sound. Like any boost it is paid for by input trim, so pair it with
-  Balanced or Matched loudness to keep the level.
+- **Full** adds a +3 dB low shelf placed above the protective high-pass, at
+  the measured knee or two and a half times the high-pass corner, whichever is
+  higher, clamped to 150–600 Hz. A low shelf reaches its full lift below its
+  corner, so putting the corner on the high-pass would drop the whole boost
+  into the band the high-pass has just removed. Placed clear of it, the lift
+  lands where the driver still turns voltage into sound. Like any boost it is
+  paid for by input trim, so pair it with Balanced or Matched loudness to keep
+  the level.
 
 ### Loudness: Protected, Balanced, or Matched?
 

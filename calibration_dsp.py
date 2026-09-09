@@ -396,6 +396,62 @@ def silence_buffer(
     return np.resize(silence, length)
 
 
+# REW calls the same idea a cubic mean.  Averaging cubed amplitudes rather
+# than decibels lets a peak dominate its neighbourhood while a narrow notch
+# barely counts, which matches what is audible: a resonance is heard, a
+# cancellation of the same depth and width mostly is not.
+PEAK_WEIGHT_EXPONENT = 3.0
+
+
+def erb_octaves(frequencies: np.ndarray) -> np.ndarray:
+    """Width of the ear's critical band at each frequency, in octaves.
+
+    Glasberg and Moore's equivalent rectangular bandwidth.  It is roughly a
+    fixed number of hertz through the bass, which is a large fraction of an
+    octave down there and a small one up high: about 0.9 octaves at 50 Hz,
+    a third of an octave at 200 Hz, and a sixth from 1 kHz upward.  Smoothing
+    a response by it shows what the ear can actually resolve, instead of
+    detail no listener could hear and no filter should chase.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    bandwidth = 24.7 * (4.37 * frequencies / 1000.0 + 1.0)
+    half = bandwidth / 2.0
+    return np.log2((frequencies + half) / np.maximum(frequencies - half, 1e-6))
+
+
+def perceptual_smooth(
+    frequencies: np.ndarray,
+    curve_db: np.ndarray,
+    *,
+    peak_weighted: bool = True,
+    width_scale: float = 1.0,
+) -> np.ndarray:
+    """Smooth a magnitude response the way the ear resolves it.
+
+    The window widens with the critical band, so the unreliable bass is
+    averaged over a broad span while the midrange keeps its detail.  With
+    ``peak_weighted`` the average is taken over cubed amplitudes, so peaks
+    survive and narrow dips are largely filled in; that is the asymmetry the
+    loudspeaker literature asks for, since filling a cancellation with gain
+    achieves nothing but a resonance is worth removing.  Pass
+    ``peak_weighted=False`` for a curve that is a difference rather than a
+    response, where a plain mean is the honest one.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    curve = np.asarray(curve_db, dtype=float)
+    sigma = np.maximum(erb_octaves(frequencies) * float(width_scale), 1e-3)
+    distance = np.log2(frequencies[np.newaxis, :] / frequencies[:, np.newaxis])
+    weights = np.exp(-0.5 * (distance / sigma[:, np.newaxis]) ** 2)
+    weights /= np.sum(weights, axis=1, keepdims=True)
+    if not peak_weighted:
+        return weights @ curve
+    amplitude = 10.0 ** (curve / 20.0)
+    averaged = weights @ (amplitude ** PEAK_WEIGHT_EXPONENT)
+    return 20.0 * np.log10(
+        np.maximum(averaged, 1e-30) ** (1.0 / PEAK_WEIGHT_EXPONENT)
+    )
+
+
 def snr_uncertainty_db(snr_db: np.ndarray) -> np.ndarray:
     """Largest magnitude error additive noise at this SNR can cause."""
     return 20.0 * np.log10(1.0 + 10.0 ** (-np.asarray(snr_db, dtype=float) / 20.0))

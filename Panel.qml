@@ -338,6 +338,11 @@ Panel {
       rows.push({ key: "Refined", value: "round " + refinement.iterations
         + "  ·  biggest change " + root.fmt(refinement.largest_step_db, 1) + " dB"
         + "  ·  from the check at " + String(refinement.from_check_at || "").slice(0, 16).replace("T", " ") })
+    if (fit.smoothing)
+      rows.push({ key: "Smoothing", value: String(fit.smoothing.method)
+        + "  ·  " + root.fmt((fit.smoothing.octaves || [])[0], 2) + " octaves at the bottom, "
+        + root.fmt((fit.smoothing.octaves || [])[(fit.smoothing.octaves || []).length - 1], 2)
+        + " at the top" })
     rows.push({ key: "Optimizer", value: (fit.optimizer_success ? "converged" : "did not converge") + "  ·  " + String(fit.algorithm || "") })
     return rows
   }

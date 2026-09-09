@@ -18,7 +18,12 @@ except ImportError as error:  # pragma: no cover
 # The one thing the optimizer borrows from the measurement side: how much a
 # given signal-to-noise ratio can move a magnitude reading.  Shared rather
 # than restated so the two cannot drift apart.
-from calibration_dsp import snr_uncertainty_db  # noqa: E402
+from calibration_dsp import (  # noqa: E402
+    PEAK_WEIGHT_EXPONENT,
+    erb_octaves,
+    perceptual_smooth,
+    snr_uncertainty_db,
+)
 
 
 DIAGNOSTIC_CENTERS = np.asarray(
@@ -92,6 +97,10 @@ BASS_MODES = ("normal", "full")
 BASS_SHELF_DB = 3.0
 BASS_SHELF_Q = 0.707
 BASS_SHELF_CORNER_HZ = (150.0, 600.0)
+# A low shelf reaches its full lift below its corner, so a corner sitting on
+# the high-pass would put the whole boost in the band the high-pass has just
+# removed and the option would do nothing.  Keep it clear of it.
+BASS_SHELF_ABOVE_HIGHPASS = 2.5
 
 
 def pleasant_in_room_target(frequencies: np.ndarray, voicing: str) -> np.ndarray:
@@ -310,7 +319,8 @@ def verification_report(
     predicted = onto_grid(fit["predicted_response_db"])
     original = onto_grid(fit["measured_smoothed_db"])
     target = onto_grid(fit["target"]["aligned_db"])
-    verified = gaussian_filter1d(np.asarray(verified_db, dtype=float), sigma=4.0, mode="nearest")
+    # Smoothed exactly as the curve it is compared against was.
+    verified = perceptual_smooth(frequencies, verified_db)
 
     # The high-passed region is deliberately empty, so it carries no
     # information about whether the filters landed.
@@ -424,7 +434,8 @@ def refinement_residual(verification: dict, frequencies: np.ndarray) -> np.ndarr
     shrink = difference ** 2 / (difference ** 2 + np.maximum(uncertainty, 1e-6) ** 2)
     applied = np.clip(difference * shrink, -REFINEMENT_LIMIT_DB, REFINEMENT_LIMIT_DB)
     applied = np.where(usable, applied, 0.0)
-    applied = gaussian_filter1d(applied, sigma=4.0, mode="nearest")
+    # A difference, not a response: a plain mean is the honest one here.
+    applied = perceptual_smooth(check_grid, applied, peak_weighted=False)
     # Outside the band the check could judge, the earlier measurement stands.
     edges = np.flatnonzero(usable)
     if edges.size:
@@ -500,11 +511,12 @@ def estimate_highpass(
     }
 
 
-def bass_shelf(knee_hz: float, bass: str) -> dict | None:
+def bass_shelf(knee_hz: float, bass: str, highpass_hz: float = 0.0) -> dict | None:
     """The full-bass shelf for this measurement, or None for normal bass."""
     if bass != "full":
         return None
-    corner = float(np.clip(knee_hz, BASS_SHELF_CORNER_HZ[0], BASS_SHELF_CORNER_HZ[1]))
+    corner = max(float(knee_hz), BASS_SHELF_ABOVE_HIGHPASS * float(highpass_hz))
+    corner = float(np.clip(corner, BASS_SHELF_CORNER_HZ[0], BASS_SHELF_CORNER_HZ[1]))
     return {"frequency_hz": round(corner, 1), "q": BASS_SHELF_Q, "gain_db": BASS_SHELF_DB}
 
 
@@ -648,7 +660,7 @@ def _boost_decision(
 def _smooth_and_level_align(
     curve: np.ndarray, reference: np.ndarray, frequencies: np.ndarray
 ) -> np.ndarray:
-    smoothed = gaussian_filter1d(np.asarray(curve, dtype=float), sigma=4.0, mode="nearest")
+    smoothed = perceptual_smooth(frequencies, curve)
     band = (frequencies >= 250.0) & (frequencies <= 2000.0)
     smoothed += float(np.median(reference[band] - smoothed[band]))
     return smoothed
@@ -948,7 +960,8 @@ def optimize_peq(
 ) -> dict:
     frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
     measured = np.asarray(measurement["level_dbfs"], dtype=float)
-    measured_smooth = gaussian_filter1d(measured, sigma=4.0, mode="nearest")
+    # Fitted to what the ear can resolve, not to every bin of the measurement.
+    measured_smooth = perceptual_smooth(frequencies, measured)
     confidence, uncertainty = _measurement_confidence(measurement)
     training, holdout, validation_groups, validation_info = _validation_data(
         measurement, measured_smooth, frequencies
@@ -985,7 +998,13 @@ def optimize_peq(
         training[valid] - selected_target[valid], confidence[valid], 0.22
     )
     aligned_target = selected_target + offset
-    highpass = estimate_highpass(frequencies, training, aligned_target)
+    # The knee asks how much output there is, not what will be heard as a
+    # resonance, so it reads a plain average.  A peak-weighted one lifts a
+    # steep roll-off and would place the corner lower than the speaker earns.
+    highpass = estimate_highpass(
+        frequencies, perceptual_smooth(frequencies, measured, peak_weighted=False),
+        aligned_target,
+    )
     safety_highpass = highpass["stages"] * _highpass_response_db(
         frequencies, highpass["frequency_hz"], highpass["q"], measurement["rate_hz"]
     )
@@ -1203,7 +1222,7 @@ def optimize_peq(
         shapes=list(shapes),
     )
     correction = safety_highpass + peq_response
-    shelf = bass_shelf(safe_boost_floor, bass)
+    shelf = bass_shelf(safe_boost_floor, bass, highpass["frequency_hz"])
     if shelf is not None:
         correction = correction + _lowshelf_response_db(
             frequencies, shelf["frequency_hz"], shelf["q"], shelf["gain_db"],
@@ -1298,6 +1317,11 @@ def optimize_peq(
             "selected_relative_db": np.round(selected_target, 3).tolist(),
             "aligned_db": np.round(aligned_target, 3).tolist(),
             "offset_db": round(offset, 3),
+        },
+        "smoothing": {
+            "method": "critical-band, peak-weighted",
+            "exponent": PEAK_WEIGHT_EXPONENT,
+            "octaves": np.round(erb_octaves(frequencies), 3).tolist(),
         },
         "measured_smoothed_db": np.round(measured_smooth, 3).tolist(),
         "predicted_response_db": np.round(predicted, 3).tolist(),
