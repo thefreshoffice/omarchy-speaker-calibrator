@@ -53,6 +53,18 @@ class SafeReadTests(unittest.TestCase):
         with self.assertRaises(UnsafeFile):
             read_bounded(fifo)
 
+    def test_a_root_owned_file_is_refused_unless_it_is_asked_for(self):
+        # Plugin descriptions under /usr/lib and packaged calibration files
+        # belong to root.  Refusing those made an installed add-on look
+        # missing, which is what this guards against; a file belonging to some
+        # other unprivileged user is still refused either way.
+        system = Path("/usr/lib/os-release")
+        if not system.exists() or system.stat().st_uid != 0:
+            self.skipTest("no root-owned file to read")
+        with self.assertRaises(UnsafeFile):
+            read_bounded(system)
+        self.assertIsNotNone(read_bounded(system, allow_root=True))
+
     def test_it_refuses_a_file_past_the_limit(self):
         target = self.root / "big.json"
         target.write_text("x" * 4096)

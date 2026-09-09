@@ -133,8 +133,10 @@ WantedBy=graphical-session.target
 def plugin_version():
     try:
         manifest = json.loads(
+            # Root owns this when the plugin is installed system-wide, and it
+            # sits next to this file either way.
             read_text_bounded(Path(__file__).resolve().parent / "manifest.json",
-                              missing_ok=False))
+                              missing_ok=False, allow_root=True))
         return str(manifest.get("version", "unknown"))
     except (OSError, ValueError):
         return "unknown"
@@ -162,8 +164,10 @@ def bass_enhancer_status():
             text = ""
             for turtle in sorted(bundle.glob("*.ttl")):
                 try:
+                    # Installed by a package manager, so root owns it.
                     chunk = read_text_bounded(
-                        turtle, MAX_DESCRIPTION_BYTES, errors="ignore")
+                        turtle, MAX_DESCRIPTION_BYTES, errors="ignore",
+                        allow_root=True)
                     text += chunk or ""
                 except (OSError, UnsafeFile):
                     continue

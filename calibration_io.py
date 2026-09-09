@@ -31,12 +31,17 @@ class UnsafeFile(OSError):
     """The name resolved to something that must not be read or written."""
 
 
-def read_bounded(path, limit=MAX_STATE_BYTES, *, missing_ok=True):
+def read_bounded(path, limit=MAX_STATE_BYTES, *, missing_ok=True, allow_root=False):
     """Bytes of a regular file this user owns, or None when it is absent.
 
     ``O_NOFOLLOW`` refuses a symlink at the final component and ``O_NONBLOCK``
     keeps a planted FIFO from blocking the open forever; the type is then
     checked on the descriptor that was actually opened, not on the name.
+
+    ``allow_root`` also accepts a file owned by root, for the ones the system
+    installed rather than this plugin: a package's own description under
+    ``/usr/lib`` is more trustworthy than anything here, not less.  What is
+    refused either way is a file belonging to some other unprivileged user.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -50,7 +55,8 @@ def read_bounded(path, limit=MAX_STATE_BYTES, *, missing_ok=True):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise UnsafeFile(f"refusing to read {path}: not a regular file")
-        if info.st_uid != os.geteuid():
+        permitted = {os.geteuid()} | ({0} if allow_root else set())
+        if info.st_uid not in permitted:
             raise UnsafeFile(f"refusing to read {path}: owned by another user")
         if info.st_size > limit:
             raise UnsafeFile(f"refusing to read {path}: larger than {limit} bytes")
@@ -69,8 +75,9 @@ def read_bounded(path, limit=MAX_STATE_BYTES, *, missing_ok=True):
         os.close(fd)
 
 
-def read_text_bounded(path, limit=MAX_STATE_BYTES, *, errors="strict", missing_ok=True):
-    raw = read_bounded(path, limit, missing_ok=missing_ok)
+def read_text_bounded(path, limit=MAX_STATE_BYTES, *, errors="strict",
+                      missing_ok=True, allow_root=False):
+    raw = read_bounded(path, limit, missing_ok=missing_ok, allow_root=allow_root)
     return None if raw is None else raw.decode("utf-8", errors)
 
 

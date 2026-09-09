@@ -145,7 +145,10 @@ def parse_mic_calibration(path: str | Path | None) -> dict | None:
     frequencies: list[float] = []
     corrections: list[float] = []
     sensitivity_dbfs = None
-    body = read_text_bounded(source, MAX_CALIBRATION_BYTES, errors="replace")
+    # A calibration file can just as well have come from a package as from the
+    # user's own directory, so root owning it is not a reason to refuse it.
+    body = read_text_bounded(
+        source, MAX_CALIBRATION_BYTES, errors="replace", allow_root=True)
     if body is None:
         raise ValueError(f"Microphone calibration file not found: {source}")
     for line in body.splitlines():
