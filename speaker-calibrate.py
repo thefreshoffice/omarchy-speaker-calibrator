@@ -45,6 +45,11 @@ OPTIMIZER_NAMES = (
 # the panel can offer to install them instead of letting a press of Calibrate
 # end in a stack trace.
 MEASUREMENT_PACKAGES = ("python-numpy", "python-scipy")
+# The filter chain ends in an LV2 limiter.  Omarchy carries this package, but
+# only installs it on machines one of its own shipped tunings applies to, so
+# it can be absent here as easily as numpy can.
+LIMITER_PACKAGE = "lsp-plugins-lv2"
+LIMITER_PROBE = Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl")
 
 
 def measurement_support():
@@ -55,11 +60,14 @@ def measurement_support():
             __import__(module)
         except Exception:
             missing.append(package)
+    if not LIMITER_PROBE.exists():
+        missing.append(LIMITER_PACKAGE)
     return {
         "available": not missing,
         "missing": missing,
-        "packages": list(MEASUREMENT_PACKAGES),
-        "command": "omarchy pkg add " + " ".join(MEASUREMENT_PACKAGES),
+        "packages": list(MEASUREMENT_PACKAGES) + [LIMITER_PACKAGE],
+        "command": "omarchy pkg add " + " ".join(missing or
+                                                 list(MEASUREMENT_PACKAGES)),
     }
 
 
@@ -164,12 +172,44 @@ DEVICE_LABEL_LIMIT = 120
 MICROPHONE_CURVE_LIMIT = 4096
 
 
+# The panel puts a verdict into a section heading, and a heading is drawn by
+# a shell component the plugin cannot pin to plain text.  The value comes from
+# a file at a predictable name, so it is checked against the words this code
+# actually produces rather than passed through.
+VERDICTS = ("pass", "warning", "fail", "inconclusive")
+
+
+def safe_verdict(value):
+    """One of the words this produces, or None."""
+    return value if value in VERDICTS else None
+
+
+# PipeWire reports a description of "(null)" for a node that has none, and it
+# should never be shown to anybody as if it were a name.
+PLACEHOLDER_LABELS = {"(null)", "null", "none", "unknown"}
+
+
 def short_label(value, limit=DEVICE_LABEL_LIMIT):
-    """A device's own name, cut to something that belongs in a row."""
+    """A device's own name, made safe to put in front of the shell.
+
+    Length is not the only problem.  These names reach a button's label and
+    the panel's heading, and both are drawn by shell components the plugin
+    cannot pin to plain text, so Qt decides for itself whether the string is
+    markup.  A name containing a tag would be rendered as one, and rich text
+    fetches whatever an image tag points at.  The three characters that begin
+    markup come out, along with anything non-printing.
+    """
     if not isinstance(value, str):
         return None
-    trimmed = " ".join(value.split())
-    return trimmed[:limit] if trimmed else None
+    stripped = "".join(
+        " " if character in "<>&" else character
+        for character in value
+        if character.isprintable() or character in " \t"
+    )
+    trimmed = " ".join(stripped.split())
+    if not trimmed or trimmed.strip().lower() in PLACEHOLDER_LABELS:
+        return None
+    return trimmed[:limit]
 VERIFICATION_SWEEPS = DATA / "verification-sweeps.wav"
 VERIFICATION_RECORDING = DATA / "verification.wav"
 SERVICE = "omarchy-speaker-tuning.service"
@@ -1290,8 +1330,12 @@ def restart_tuning():
 
 
 def install_profile(profile, graph):
-    if not Path("/usr/lib/lv2/lsp-plugins.lv2/limiter_stereo.ttl").exists():
-        raise SystemExit("Missing lsp-plugins-lv2. Install it with: omarchy pkg add lsp-plugins-lv2")
+    if not LIMITER_PROBE.exists():
+        raise SystemExit(
+            f"The filter chain needs {LIMITER_PACKAGE}, which this machine does "
+            "not have. The panel can install it for you, or run:\n"
+            f"  omarchy pkg add {LIMITER_PACKAGE}"
+        )
     secure_directory(DATA, repair_contents=True)
     keep_previous_profile()
     for path in (HOST, FRAGMENT, UNIT):
@@ -1645,7 +1689,7 @@ def archive_measurement(profile):
         "response_db": [round(float(value), 3) for value in combined],
         "uncertainty_db": ([round(float(value), 3) for value in uncertainty]
                            if uncertainty is not None else None),
-        "verdict": (profile.get("quality") or {}).get("verdict"),
+        "verdict": safe_verdict((profile.get("quality") or {}).get("verdict")),
         "speaker": short_label((profile.get("speaker") or {}).get("description")),
     }
     try:
@@ -1700,7 +1744,7 @@ def valid_microphone_record(record):
                 return None
     record["microphone"] = short_label(record.get("microphone"))
     record["speaker"] = short_label(record.get("speaker"))
-    record["verdict"] = short_label(record.get("verdict"), 32)
+    record["verdict"] = safe_verdict(record.get("verdict"))
     return record
 
 
@@ -1915,9 +1959,13 @@ def load_verification():
         report = json.loads(read_text_bounded(VERIFICATION) or '')
     except (OSError, ValueError):
         return None
+    if not isinstance(report, dict):
+        return None
     profile = load_profile(PROFILE)
     created = profile.get("created_at") if profile else None
     report["stale"] = report.get("profile_created_at") != created
+    # The panel puts this one in a section heading, which the shell draws.
+    report["verdict"] = safe_verdict(report.get("verdict"))
     return report
 
 
@@ -2077,7 +2125,7 @@ def archived_microphones():
         found[kind] = {
             "microphone": short_label(record.get("microphone")),
             "created_at": short_label(record.get("created_at"), 40),
-            "verdict": short_label(record.get("verdict"), 32),
+            "verdict": safe_verdict(record.get("verdict")),
             "calibrated": bool(record.get("calibration_file")),
         }
     return found
@@ -2106,7 +2154,10 @@ def status_payload():
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
     compare = compare_payload()
     payload = {"service": active or "inactive", "defaultSink": default or "unknown",
-            "defaultSinkDescription": short_label(sink_description(default)) or default,
+            # The fallback is a node name, which the device also chooses.
+            "defaultSinkDescription": (short_label(sink_description(default))
+                                       or short_label(default)
+                                       or "the calibrated output"),
             "calibratedSink": VIRTUAL_SINK,
             "profile": profile, "proposal": proposal,
             "enabled": active == "active" and default == VIRTUAL_SINK,

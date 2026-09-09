@@ -18,10 +18,11 @@ omarchy plugin add https://github.com/thefreshoffice/omarchy-speaker-calibrator.
 
 That is the whole installation. Omarchy asks where to put the bar widget.
 
-Measuring needs `python-numpy` and `python-scipy`, which Omarchy does not
-ship. The panel notices and offers to install them in one press, from
-Omarchy's own packages. The filter itself uses `lsp-plugins-lv2`, which
-Omarchy already ships.
+It needs three packages that may not be on your machine: `python-numpy` and
+`python-scipy` for measuring, and `lsp-plugins-lv2` for the filter chain. All
+three are Omarchy's own packages rather than the AUR, and the panel notices
+which are missing and installs them in one press. Nothing here needs a
+terminal.
 
 ## Using it
 
@@ -279,13 +280,12 @@ Remove it with `pacman -R bankstown` if you want it gone.
 | Package | Ships with Omarchy | Needed for |
 | --- | --- | --- |
 | `pipewire` | yes | everything |
-| `lsp-plugins-lv2` | yes | the filter chain, the limiter, loudness compensation |
+| `lsp-plugins-lv2` | in its package list, installed only where a shipped tuning applies | the filter chain, the limiter, loudness compensation |
 | `python-numpy` | no | measuring |
 | `python-scipy` | no | measuring |
 | `bankstown` | no, and it is from the AUR | the optional Deep bass switch |
 
-Only measuring waits on the two Omarchy does not ship, and the panel offers to
-install them itself. The plugin uses Arch's system Python so its DSP
+The panel checks all three and offers to install whichever are missing. The plugin uses Arch's system Python so its DSP
 environment is deterministic even when another Python is first on `PATH`.
 
 ## Research basis

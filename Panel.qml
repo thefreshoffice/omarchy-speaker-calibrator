@@ -1129,12 +1129,12 @@ Panel {
               Text {
                 textFormat: Text.PlainText
                 width: parent.width
-                text: "Measuring needs two packages this machine does not have yet: "
+                text: "This machine is missing "
                   + (service.status.measurementSupport
-                      ? (service.status.measurementSupport.missing || []).join(" and ")
+                      ? (service.status.measurementSupport.missing || []).join(", ")
                       : "")
-                  + ". They come from Omarchy's own packages, not the AUR. Everything "
-                  + "else here works without them; calibrating does not."
+                  + ". They come from Omarchy's own packages, not the AUR. The panel "
+                  + "and an existing calibration work without them; measuring does not."
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "thefreshoffice.speaker-calibrator",
   "name": "Speaker Calibrator",
-  "version": "0.26.0",
+  "version": "1.0.0",
   "author": "Michael de By",
   "license": "MIT",
   "description": "Measure with one or many microphones and generate adaptive, repeat-validated, protected parametric speaker tuning.",

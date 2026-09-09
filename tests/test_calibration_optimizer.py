@@ -1370,12 +1370,25 @@ class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""
 
     def test_it_reports_what_is_missing_and_how_to_get_it(self):
+        # Three things can be absent: the two Python packages measuring needs,
+        # and the LV2 limiter the filter chain ends in.  Omarchy carries that
+        # last one but installs it only where a shipped tuning applies.
         support = speaker_calibrate.measurement_support()
-        self.assertEqual(set(support["packages"]), {"python-numpy", "python-scipy"})
+        self.assertEqual(
+            set(support["packages"]),
+            {"python-numpy", "python-scipy", "lsp-plugins-lv2"},
+        )
         self.assertTrue(support["command"].startswith("omarchy pkg add"))
-        # Both packages are named in the command, whichever is missing.
-        for package in support["packages"]:
+        # The command installs what is actually missing, not everything.
+        for package in support["missing"]:
             self.assertIn(package, support["command"])
+
+    def test_the_limiter_package_is_checked_by_its_own_file(self):
+        # It is not a Python module, so importing proves nothing about it.
+        self.assertTrue(str(speaker_calibrate.LIMITER_PROBE).endswith(".ttl"))
+        support = speaker_calibrate.measurement_support()
+        present = speaker_calibrate.LIMITER_PROBE.exists()
+        self.assertEqual("lsp-plugins-lv2" not in support["missing"], present)
 
     def test_available_matches_what_can_actually_be_imported(self):
         support = speaker_calibrate.measurement_support()
@@ -1453,6 +1466,32 @@ class MicrophoneComparisonTests(unittest.TestCase):
         self.assertAlmostEqual(bands["bass"], 5.0, places=2)
         self.assertAlmostEqual(bands["midrange"], 0.0, places=2)
         self.assertEqual(result["worst"]["band"], "bass")
+
+    def test_a_device_cannot_name_itself_markup(self):
+        # A device name reaches a button label and the panel heading, and both
+        # are drawn by shell components that decide for themselves whether a
+        # string is markup.  Rich text fetches what an image tag points at.
+        hostile = 'Mic <img src="http://10.0.0.1/leak.png">'
+        cleaned = speaker_calibrate.short_label(hostile)
+        for character in "<>&":
+            self.assertNotIn(character, cleaned)
+        self.assertIn("Mic", cleaned)
+
+    def test_it_drops_characters_that_do_not_print(self):
+        noisy = "name" + chr(0x200B) + "with" + chr(7) + "control"
+        self.assertEqual(speaker_calibrate.short_label(noisy), "namewithcontrol")
+
+    def test_a_missing_description_is_absent_not_the_word_null(self):
+        # PipeWire reports "(null)" for a node with no description.
+        for placeholder in ("(null)", "NULL", " none ", "unknown", "", "   "):
+            self.assertIsNone(speaker_calibrate.short_label(placeholder), placeholder)
+
+    def test_a_verdict_is_one_of_the_words_this_produces(self):
+        # It goes into a section heading, which the shell draws.
+        for good in ("pass", "warning", "fail", "inconclusive"):
+            self.assertEqual(speaker_calibrate.safe_verdict(good), good)
+        for bad in ("<img src=x>", "PASS", "", None, 3):
+            self.assertIsNone(speaker_calibrate.safe_verdict(bad), bad)
 
     def test_a_device_cannot_name_itself_a_paragraph(self):
         # A USB microphone's product string is whatever its firmware says, and
