@@ -148,10 +148,24 @@ Panel {
     var haveExternal = !!comparison.external
     if (!haveInternal && !haveExternal)
       return "Nothing measured yet. Calibrate once and the measurement is kept here."
-    if (!haveExternal)
-      return "Only the built-in microphone has measured so far. Measure again with a "
-        + "USB measuring microphone placed where you listen, and both curves appear "
-        + "here together."
+    if (!haveExternal) {
+      // Whether one is plugged in right now is a different question from
+      // whether one has ever measured, and confusing the two reads as the
+      // microphone not being detected.
+      var connected = null
+      for (var i = 0; i < service.microphones.length; i++)
+        if (service.microphones[i].internal === false) {
+          connected = service.microphones[i].description
+          break
+        }
+      if (connected)
+        return "Only the built-in microphones have measured so far. " + connected
+          + " is connected and ready: choose it under MICROPHONE, place it where you "
+          + "listen, and calibrate. Both curves then appear here together."
+      return "Only the built-in microphones have measured so far, and no measuring "
+        + "microphone is connected. Plug a USB one in, middle-click the bar icon to "
+        + "pick it up, and calibrate with it placed where you listen."
+    }
     if (!haveInternal)
       return "Only the measuring microphone has measured so far. Measure again with "
         + "the built-in microphones and both curves appear here together."
