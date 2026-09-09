@@ -683,10 +683,13 @@ LOUDNESS_APPROX = 2.0
 # arriving at the limiter is the same as it would be at full volume however
 # far down the contour goes.
 #
-# The floor is only a backstop now, well past where deepening the contour
-# still buys anything: at 50% volume it is worth +4.6 dB of warmth at -30 and
-# +6.1 dB at -42, for four times the gain.
-LOUDNESS_FLOOR_DB = -45.0
+# The floor is where the make-up stops growing, and it has to be a real limit
+# rather than a backstop.  Every decibel of contour is a decibel of make-up
+# handed to the limiter, and the contour's bass lift rides on top of that: at
+# -36 dB the compensator was being given +36 dB of gain, and the limiter
+# audibly caught the bass.  Past -30 the warmth barely moves anyway, +4.6 dB
+# against +6.1 dB at -42, so the depth was buying artefacts rather than sound.
+LOUDNESS_FLOOR_DB = -18.0
 # How much deeper than the volume reading to take the listening level.  The
 # reading understates how quiet it really is, because a laptop speaker at full
 # scale is already well short of the level the contour is calibrated against,

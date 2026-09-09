@@ -113,6 +113,9 @@ Item {
   // fetch: a microphone plugged in since then simply never appeared.  A
   // refresh asked for now happens, even if it has to wait its turn.
   property bool _refreshPending: false
+  // A finished measurement changes the archive, so a comparison already on
+  // screen is out of date the moment it lands.
+  property bool _micsPending: false
   function refresh() {
     if (busy) { _refreshPending = true; return }
     start("devices", ["devices-json"])
@@ -124,7 +127,8 @@ Item {
   function loadCache() { if (!busy) start("cache", ["status-cache-json"]) }
   // The two microphones, side by side.
   function loadMicrophones() {
-    if (!busy) start("mics", ["microphone-comparison-json"])
+    if (busy) { _micsPending = true; return }
+    start("mics", ["microphone-comparison-json"])
   }
   function refreshStatus() { start("status", ["status-json"]) }
   // Measure; with install=true the result is installed and played as soon as
@@ -204,10 +208,16 @@ Item {
 
   // Whatever the run was, if a refresh was asked for while it held the
   // process, do it now.
-  onBusyChanged: if (!busy && _refreshPending) Qt.callLater(function () {
-    if (!root.busy && root._refreshPending) {
+  onBusyChanged: if (!busy && (_refreshPending || _micsPending)) Qt.callLater(function () {
+    if (root.busy) return
+    if (root._refreshPending) {
       root._refreshPending = false
       root.start("devices", ["devices-json"])
+      return
+    }
+    if (root._micsPending) {
+      root._micsPending = false
+      root.start("mics", ["microphone-comparison-json"])
     }
   })
 
@@ -286,6 +296,9 @@ Item {
           if (root.message === "Working…") root.message = ""
         }
         else if (root.phase === "measure" || root.phase === "refit" || root.phase === "refine") {
+          // A measurement is archived per microphone, so whatever comparison
+          // is on screen no longer describes what is stored.
+          if (root.micComparison) root._micsPending = true
           var result = JSON.parse(raw)
           root.proposal = result
           var accepted = result.quality && result.quality.accepted

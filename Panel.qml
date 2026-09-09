@@ -1284,7 +1284,9 @@ Panel {
             fontFamily: root.fontFamily
             onClicked: {
               root.advanced = !root.advanced
-              if (root.advanced && !service.micComparison) service.loadMicrophones()
+              // Every time, not just the first: measuring with another
+              // microphone changes what there is to compare.
+              if (root.advanced) service.loadMicrophones()
             }
           }
 
