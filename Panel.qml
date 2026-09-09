@@ -33,7 +33,13 @@ Panel {
   property int sinkIndex: -1
   property int micIndex: -1
 
-  function open() { root.controller.show(); service.refresh() }
+  function open() {
+    root.controller.show()
+    // Start at the top: reopening halfway down the page loses the reading of
+    // the calibration the panel exists to give.
+    scroller.contentY = 0
+    service.refresh()
+  }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
   function refresh() { service.refresh() }
@@ -719,6 +725,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Flickable {
+        id: scroller
         anchors.fill: parent
         contentWidth: width
         contentHeight: content.implicitHeight
