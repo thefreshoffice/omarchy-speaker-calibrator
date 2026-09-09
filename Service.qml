@@ -153,6 +153,10 @@ Item {
   function refine() { start("refine", ["refine-json", "--install"]) }
   // One button: installs the add-on the first time, switches it after that.
   function deepBass() { start("deepbass", ["deep-bass-toggle"]) }
+  // Measuring needs numpy and scipy, which Omarchy does not ship.
+  function installMeasurementSupport() {
+    start("support", ["install-measurement-support"])
+  }
   function loudnessCompensation() { start("loudness", ["loudness-toggle"]) }
 
   // One plain sentence about the last check.
@@ -240,6 +244,13 @@ Item {
           root.sinks = devices.sinks || []
           root.microphones = devices.microphones || []
           root.message = ""
+          root.phase = ""
+          Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "support") {
+          var support = JSON.parse(raw)
+          root.message = support.message || ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
           return

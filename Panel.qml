@@ -1075,6 +1075,45 @@ Panel {
             width: parent.width
             spacing: Style.space(6)
 
+            // Measuring needs numpy and scipy, which Omarchy does not ship.
+            // Without them everything here works except the one thing the
+            // plugin is for, so it is offered rather than discovered by
+            // pressing Calibrate and getting an error.
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: !!(service.status.measurementSupport
+                && service.status.measurementSupport.available === false)
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: "Measuring needs two packages this machine does not have yet: "
+                  + (service.status.measurementSupport
+                      ? (service.status.measurementSupport.missing || []).join(" and ")
+                      : "")
+                  + ". They come from Omarchy's own packages, not the AUR. Everything "
+                  + "else here works without them; calibrating does not."
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Button {
+                width: parent.width
+                bordered: true
+                iconText: "󰄠"
+                text: "Install measurement support"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.installMeasurementSupport()
+              }
+
+              PanelSeparator { foreground: root.foreground }
+            }
+
             PanelSectionHeader { text: "SPEAKERS"; foreground: root.foreground; fontFamily: root.fontFamily }
             Repeater {
               model: service.sinks

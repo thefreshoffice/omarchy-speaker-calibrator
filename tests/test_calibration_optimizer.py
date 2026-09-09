@@ -1340,6 +1340,50 @@ class LoudnessCompensationTests(unittest.TestCase):
         self.assertEqual(controls["loudcomp:input"], 1.0)
 
 
+class MeasurementSupportTests(unittest.TestCase):
+    """Omarchy ships neither numpy nor scipy, so their absence is a state."""
+
+    def test_it_reports_what_is_missing_and_how_to_get_it(self):
+        support = speaker_calibrate.measurement_support()
+        self.assertEqual(set(support["packages"]), {"python-numpy", "python-scipy"})
+        self.assertTrue(support["command"].startswith("omarchy pkg add"))
+        # Both packages are named in the command, whichever is missing.
+        for package in support["packages"]:
+            self.assertIn(package, support["command"])
+
+    def test_available_matches_what_can_actually_be_imported(self):
+        support = speaker_calibrate.measurement_support()
+        try:
+            import numpy  # noqa: F401
+            import scipy  # noqa: F401
+            importable = True
+        except Exception:
+            importable = False
+        self.assertEqual(support["available"], importable)
+        self.assertEqual(support["missing"] == [], importable)
+
+    def test_measuring_without_it_explains_itself(self):
+        # A press of Calibrate on a fresh machine used to end in an ImportError
+        # traceback; it has to say what is missing and how to get it.
+        saved = speaker_calibrate.measurement_support
+        speaker_calibrate.measurement_support = lambda: {
+            "available": False, "missing": ["python-numpy"],
+            "packages": ["python-numpy", "python-scipy"],
+            "command": "omarchy pkg add python-numpy python-scipy",
+        }
+        had_np = "np" in speaker_calibrate.__dict__
+        np_value = speaker_calibrate.__dict__.pop("np", None)
+        try:
+            with self.assertRaises(SystemExit) as caught:
+                speaker_calibrate.load_dsp()
+            self.assertIn("python-numpy", str(caught.exception))
+            self.assertIn("omarchy pkg add", str(caught.exception))
+        finally:
+            speaker_calibrate.measurement_support = saved
+            if had_np:
+                speaker_calibrate.__dict__["np"] = np_value
+
+
 class MicrophoneComparisonTests(unittest.TestCase):
     """Two microphones, put side by side by shape rather than by level."""
 

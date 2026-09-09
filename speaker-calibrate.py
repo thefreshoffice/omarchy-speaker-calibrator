@@ -39,10 +39,65 @@ OPTIMIZER_NAMES = (
 )
 
 
+# Measuring needs numpy and scipy.  Omarchy does not ship either, so on a
+# fresh machine they are simply absent, and everything except measuring works
+# without them: the panel, the switches, the status.  They are named here so
+# the panel can offer to install them instead of letting a press of Calibrate
+# end in a stack trace.
+MEASUREMENT_PACKAGES = ("python-numpy", "python-scipy")
+
+
+def measurement_support():
+    """Whether this machine can measure yet, and what it needs if not."""
+    missing = []
+    for module, package in zip(("numpy", "scipy"), MEASUREMENT_PACKAGES):
+        try:
+            __import__(module)
+        except Exception:
+            missing.append(package)
+    return {
+        "available": not missing,
+        "missing": missing,
+        "packages": list(MEASUREMENT_PACKAGES),
+        "command": "omarchy pkg add " + " ".join(MEASUREMENT_PACKAGES),
+    }
+
+
+def install_measurement_support():
+    """Install what measuring needs, in a terminal the user can watch."""
+    support = measurement_support()
+    if support["available"]:
+        return {**support, "started": False,
+                "message": "Measurement support is already installed."}
+    started = run(
+        ["omarchy", "launch", "floating", "terminal", "with", "presentation",
+         support["command"]],
+        check=False,
+    ).returncode == 0
+    if not started:
+        raise SystemExit(
+            "Could not open a terminal for the installation. Run this yourself:\n"
+            f"  {support['command']}"
+        )
+    return {
+        **support, "started": True,
+        "message": ("Installing " + " and ".join(support["missing"])
+                    + " from Omarchy's own packages in a terminal window. "
+                    "When it finishes, press Calibrate."),
+    }
+
+
 def load_dsp():
     """Bind the measurement and fitting names; called only when they are used."""
     if "np" in globals():
         return
+    support = measurement_support()
+    if not support["available"]:
+        raise SystemExit(
+            "Measuring needs " + " and ".join(support["missing"])
+            + ", which this machine does not have yet. The panel can install "
+            "them for you, or run:\n  " + support["command"]
+        )
     import numpy
     import calibration_dsp
     import calibration_optimizer
@@ -1962,7 +2017,8 @@ def status_payload():
             "deepBass": (profile or {}).get("deep_bass", "off"),
             "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
             "loudnessTracker": "running" if loudness_running() else "stopped",
-            "microphones": archived_microphones()}
+            "microphones": archived_microphones(),
+            "measurementSupport": measurement_support()}
     try:
         write_atomic(STATUS_CACHE, json.dumps(payload) + "\n")
     except OSError:
@@ -2129,7 +2185,8 @@ def main():
                  "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
-    for name in ("deep-bass-toggle", "install-bass-enhancer", "loudness-toggle"):
+    for name in ("deep-bass-toggle", "install-bass-enhancer",
+                 "install-measurement-support", "loudness-toggle"):
         sub.add_parser(name)
     verify = sub.add_parser("verify-json")
     verify.add_argument("--channel")
@@ -2189,6 +2246,8 @@ def main():
         print(json.dumps(deep_bass_toggle()))
     elif command == "loudness-toggle":
         print(json.dumps(loudness_toggle()))
+    elif command == "install-measurement-support":
+        print(json.dumps(install_measurement_support()))
     elif command == "install-bass-enhancer":
         print(json.dumps(install_bass_enhancer()))
     elif command == "refine-json":

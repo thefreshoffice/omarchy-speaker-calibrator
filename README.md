@@ -126,12 +126,18 @@ functions, and input trim reserves its positive peak plus 1 dB before the limite
 
 ## Usage
 
-Install the required system packages, then add the plugin from its Git repository:
+Add the plugin from its Git repository:
 
 ```bash
-omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
 omarchy plugin add https://github.com/thefreshoffice/omarchy-speaker-calibrator.git --enable
 ```
+
+That is the whole installation. The filter chain uses `lsp-plugins-lv2`, which
+Omarchy already ships. Measuring additionally needs `python-numpy` and
+`python-scipy`, which it does not; the panel notices they are absent and offers
+to install them in one press, from Omarchy's own packages rather than the AUR.
+Nothing else here waits on them, so the panel, the switches and an existing
+calibration all work either way.
 
 Omarchy clones the repository into `~/.config/omarchy/plugins/thefreshoffice.speaker-calibrator/`,
 validates `manifest.json`, and asks where to place the bar widget. Review third-party
@@ -410,17 +416,19 @@ profile, so changing the voicing or the toggles afterwards keeps it.
 The panel intentionally uses Arch's system Python so its DSP environment is
 deterministic even when a user-managed Python is first on `PATH`.
 
-```text
-python-numpy
-python-scipy
-lsp-plugins-lv2
-pipewire
-```
+| Package | Ships with Omarchy | Needed for |
+| --- | --- | --- |
+| `pipewire` | yes | everything |
+| `lsp-plugins-lv2` | yes | the filter chain, the limiter, loudness compensation |
+| `python-numpy` | no | measuring |
+| `python-scipy` | no | measuring |
+| `bankstown` | no, and it is from the AUR | the optional Deep bass switch |
 
-Install missing DSP packages with:
+Only measuring waits on the two that Omarchy does not ship, and the panel
+offers to install them itself. If you would rather do it from a terminal:
 
 ```bash
-omarchy pkg add python-numpy python-scipy lsp-plugins-lv2
+omarchy pkg add python-numpy python-scipy
 ```
 
 ## Safety model
