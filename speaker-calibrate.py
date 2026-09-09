@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 from calibration_dsp import (
     LEVEL_SEARCH_ABORT_STATUSES,
     SweepSpec,
@@ -26,7 +28,7 @@ from calibration_dsp import (
     search_measurement_level,
     write_pcm16_wave,
 )
-from calibration_optimizer import optimize_peq
+from calibration_optimizer import optimize_peq, verification_report
 
 SWEEP_SPEC = SweepSpec()
 RATE = SWEEP_SPEC.rate
@@ -59,6 +61,12 @@ PROPOSAL = DATA / "proposed-profile.json"
 # profile's filters whenever it is activated, so only the profile is kept.
 PREVIOUS_PROFILE = DATA / "previous-profile.json"
 COMPARE_STATE = DATA / "compare-state.json"
+# The verification plays through the corrected output, so its capture must
+# never land on the calibration capture: refitting an already-corrected
+# recording would correct the sound twice.
+VERIFICATION = DATA / "verification.json"
+VERIFICATION_SWEEPS = DATA / "verification-sweeps.wav"
+VERIFICATION_RECORDING = DATA / "verification.wav"
 SERVICE = "omarchy-speaker-tuning.service"
 VIRTUAL_SINK = "omarchy_speaker_tuning"
 
@@ -668,9 +676,9 @@ def playing_applications():
     return names
 
 
-def find_measurement_level(sink_name, mic_name, channel, channels):
+def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
-    default_level = default_sweep_level(sink_name)
+    default_level = default_sweep_level(level_sink or sink_name)
     probe_program = DATA / "level-probe.wav"
     probe_recording = DATA / "level-probe-recording.wav"
 
@@ -710,15 +718,25 @@ def find_measurement_level(sink_name, mic_name, channel, channels):
     return search
 
 
-def capture_measurement(sink_name, mic_name, channel, mic_cal_file=None):
-    """Find a safe level, play the Phase 1 program, capture it, and analyze it."""
+def capture_measurement(
+    sink_name, mic_name, channel, mic_cal_file=None, *,
+    level_sink=None, sweeps=None, recording=None,
+):
+    """Find a safe level, play the Phase 1 program, capture it, and analyze it.
+
+    ``level_sink`` names the output the level default should be taken from,
+    which differs from the played sink when measuring through the calibrated
+    sink that fronts it.
+    """
     channels = next(
         (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
     )
     DATA.mkdir(parents=True, exist_ok=True)
-    level_search = find_measurement_level(sink_name, mic_name, channel, channels)
-    sweeps = DATA / "calibration-sweeps.wav"
-    recording = DATA / "measurement.wav"
+    level_search = find_measurement_level(
+        sink_name, mic_name, channel, channels, level_sink=level_sink
+    )
+    sweeps = sweeps or DATA / "calibration-sweeps.wav"
+    recording = recording or DATA / "measurement.wav"
     measurement_spec = SweepSpec(level_dbfs=level_search["selected_level_dbfs"])
     program, schedule = build_measurement_signal(measurement_spec)
     write_pcm16_wave(sweeps, program, RATE)
@@ -911,6 +929,83 @@ def install_if_accepted(profile):
     return profile
 
 
+def load_verification():
+    """The stored verification, marked stale when the profile has moved on."""
+    try:
+        report = json.loads(VERIFICATION.read_text())
+    except (OSError, ValueError):
+        return None
+    profile = load_profile(PROFILE)
+    created = profile.get("created_at") if profile else None
+    report["stale"] = report.get("profile_created_at") != created
+    return report
+
+
+def verify_calibration(channel_override=None):
+    """Measure through the corrected output and compare it with the fit."""
+    profile = load_profile(PROFILE)
+    if profile is None:
+        raise SystemExit("No calibration is installed, so there is nothing to check.")
+    if not service_active():
+        raise SystemExit("The tuning is not running; switch the calibration on first.")
+    if compare_state()["bypass"]:
+        raise SystemExit(
+            "The calibration is switched off, so a check would measure the plain "
+            "speakers. Switch it on and try again."
+        )
+    if not any(item.get("name") == VIRTUAL_SINK for item in pactl_json("sinks")):
+        raise SystemExit("The calibrated output is not present; switch the calibration on first.")
+
+    mic = profile["microphone"]
+    if not any(item["name"] == mic["name"] for item in microphones()):
+        raise SystemExit(
+            f"The microphone used for this calibration ({label(mic)}) is not connected."
+        )
+    channel = parse_channel_selection(
+        channel_override if channel_override is not None else mic.get("channel", 0)
+    )
+    calibration_file = mic.get("calibration_file")
+    measurement = capture_measurement(
+        VIRTUAL_SINK, mic["name"], channel, calibration_file,
+        # The level default belongs to the real speakers behind the filter.
+        level_sink=profile["speaker"]["name"],
+        sweeps=VERIFICATION_SWEEPS, recording=VERIFICATION_RECORDING,
+    )
+    quality = measurement["quality"]
+    channels = measurement.get("channels", [])
+    snr = (
+        np.min(np.vstack([
+            np.asarray(item["snr_db"], dtype=float) for item in channels if "snr_db" in item
+        ]), axis=0).tolist()
+        if channels and all("snr_db" in item for item in channels) else None
+    )
+    report = verification_report(
+        measurement["frequency_hz"],
+        measurement["level_dbfs"],
+        snr,
+        profile["fit"],
+        profile["measurement"]["frequency_hz"],
+    )
+    report.update({
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "profile_created_at": profile.get("created_at"),
+        "profile_label": profile_summary(PROFILE)["label"] if PROFILE.exists() else None,
+        "plugin_version": plugin_version(),
+        "measurement_quality": quality,
+        "level_search": measurement.get("level_search"),
+        "stale": False,
+    })
+    if not quality["accepted"]:
+        report["verdict"] = "inconclusive"
+        report["notes"] = [
+            "The check itself did not measure cleanly, so it says nothing about the "
+            "calibration."
+        ] + list(quality["failures"])
+    DATA.mkdir(parents=True, exist_ok=True)
+    VERIFICATION.write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
 def status_payload():
     profile = json.loads(PROFILE.read_text()) if PROFILE.exists() else None
     proposal = json.loads(PROPOSAL.read_text()) if PROPOSAL.exists() else None
@@ -921,7 +1016,8 @@ def status_payload():
             "profile": profile, "proposal": proposal,
             "enabled": active == "active" and default == VIRTUAL_SINK,
             "bypass": compare["bypass"],
-            "compare": compare}
+            "compare": compare,
+            "verification": load_verification()}
 
 
 def choose_mic():
@@ -1038,6 +1134,13 @@ def status():
     payload = status_payload()
     profile = payload["profile"]
     print(f"Service: {payload['service']}\nDefault output: {payload['defaultSink']}")
+    check = payload.get("verification")
+    if check:
+        errors = check["target_error_db"]
+        print(f"Last check: {check['verdict'].upper()}"
+              + (" (stale, the profile changed since)" if check.get("stale") else "")
+              + f" · off plan by {check['model_error_db']['rms']:.1f} dB"
+              + f" · target error {errors['before']:.1f} → {errors['measured']:.1f} dB")
     compare = payload["compare"]
     if payload.get("bypass"):
         print("Calibration is switched off (bypassed); run 'bypass-toggle' to switch it on.")
@@ -1073,6 +1176,8 @@ def main():
     for name in ("wizard", "status", "status-json", "devices-json", "install-proposal",
                  "disable", "compare-toggle", "bypass-toggle"):
         sub.add_parser(name)
+    verify = sub.add_parser("verify-json")
+    verify.add_argument("--channel")
     calibrate = sub.add_parser("calibrate-json")
     calibrate.add_argument("--sink", required=True)
     calibrate.add_argument("--mic", required=True)
@@ -1114,6 +1219,8 @@ def main():
         print(json.dumps(compare_toggle()))
     elif command == "bypass-toggle":
         print(json.dumps(bypass_toggle()))
+    elif command == "verify-json":
+        print(json.dumps(verify_calibration(args.channel)))
     else:
         {"wizard": wizard, "status": status, "disable": disable}[command]()
 

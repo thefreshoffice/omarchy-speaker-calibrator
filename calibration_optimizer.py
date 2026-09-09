@@ -233,6 +233,150 @@ def _section_response_db(
     return _peaking_response_db(frequencies, center, q, gain_db, rate)
 
 
+# Bands the verification result is reported in.  Wide enough that one noisy
+# analysis bin cannot swing a band, narrow enough to point at what is wrong.
+VERIFICATION_BANDS_HZ = (
+    ("bass", 80.0, 250.0),
+    ("low mid", 250.0, 800.0),
+    ("mid", 800.0, 2500.0),
+    ("treble", 2500.0, 8000.0),
+    ("air", 8000.0, 16000.0),
+)
+# A correction this far from its prediction means something other than the
+# filters is shaping the sound: the wrong device, a moved microphone, or a
+# level high enough to be working the limiter.
+VERIFICATION_FAIL_DB = 4.0
+VERIFICATION_WARN_DB = 2.0
+# Below this the verification microphone is hearing room noise, not the sweep.
+VERIFICATION_MIN_SNR_DB = 6.0
+# The two curves are measured and smoothed differently, so "no worse than the
+# raw speaker" needs a margin; without one, a correction that changed nothing
+# could be reported as a regression on rounding alone.
+VERIFICATION_REGRESSION_DB = 0.5
+
+
+def _aligned(curve: np.ndarray, frequencies: np.ndarray, usable: np.ndarray) -> np.ndarray:
+    """Curve shifted so its trusted midband median sits at zero."""
+    band = usable & (frequencies >= 250.0) & (frequencies <= 2000.0)
+    if not np.any(band):
+        band = usable if np.any(usable) else np.ones(frequencies.size, dtype=bool)
+    return np.asarray(curve, dtype=float) - float(np.median(np.asarray(curve, dtype=float)[band]))
+
+
+def _band_rms(frequencies: np.ndarray, error: np.ndarray, usable: np.ndarray) -> dict:
+    bands = {}
+    for name, low, high in VERIFICATION_BANDS_HZ:
+        inside = usable & (frequencies >= low) & (frequencies < high)
+        if np.count_nonzero(inside) >= 3:
+            bands[name] = round(float(np.sqrt(np.mean(error[inside] ** 2))), 2)
+    return bands
+
+
+def verification_report(
+    frequencies: np.ndarray,
+    verified_db: np.ndarray,
+    snr_db: np.ndarray | None,
+    fit: dict,
+    fit_frequencies: np.ndarray,
+) -> dict:
+    """Compare a measurement taken through the corrected output with the fit.
+
+    Two questions are answered separately.  Did the filters do what the fit
+    said they would, which tests the model?  And is the result closer to the
+    target than the raw speaker was, which tests whether any of it was worth
+    doing?  Both curves are level-aligned first, because the sweep level and
+    the input trim differ between the two measurements and only shape matters.
+    """
+    frequencies = np.asarray(frequencies, dtype=float)
+    fit_frequencies = np.asarray(fit_frequencies, dtype=float)
+
+    def onto_grid(values):
+        return np.interp(
+            np.log(frequencies), np.log(fit_frequencies), np.asarray(values, dtype=float)
+        )
+
+    predicted = onto_grid(fit["predicted_response_db"])
+    original = onto_grid(fit["measured_smoothed_db"])
+    target = onto_grid(fit["target"]["aligned_db"])
+    verified = gaussian_filter1d(np.asarray(verified_db, dtype=float), sigma=4.0, mode="nearest")
+
+    # The high-passed region is deliberately empty, so it carries no
+    # information about whether the filters landed.
+    highpass = fit.get("highpass") or {}
+    floor_hz = max(160.0, float(highpass.get("frequency_hz", 55.0)))
+    usable = (frequencies >= floor_hz) & (frequencies <= 10_000.0)
+    if snr_db is not None:
+        usable = usable & (np.asarray(snr_db, dtype=float) >= VERIFICATION_MIN_SNR_DB)
+    if np.count_nonzero(usable) < 8:
+        usable = (frequencies >= floor_hz) & (frequencies <= 10_000.0)
+
+    verified_aligned = _aligned(verified, frequencies, usable)
+    predicted_aligned = _aligned(predicted, frequencies, usable)
+    original_aligned = _aligned(original, frequencies, usable)
+    target_aligned = _aligned(target, frequencies, usable)
+
+    model_error = verified_aligned - predicted_aligned
+    worst_index = int(np.argmax(np.abs(np.where(usable, model_error, 0.0))))
+    model_rms = float(np.sqrt(np.mean(model_error[usable] ** 2)))
+
+    def target_rms(curve):
+        return round(float(np.sqrt(np.mean((curve[usable] - target_aligned[usable]) ** 2))), 2)
+
+    before = target_rms(original_aligned)
+    after = target_rms(verified_aligned)
+    expected = target_rms(predicted_aligned)
+
+    notes = []
+    verdict = "pass"
+    if model_rms > VERIFICATION_FAIL_DB:
+        verdict = "fail"
+        notes.append(
+            f"The corrected output is {model_rms:.1f} dB away from what the filters "
+            "should have produced."
+        )
+        notes.append(
+            "Check that the calibrated output is the one being measured, that the "
+            "microphone has not moved, and that nothing else is playing."
+        )
+    elif model_rms > VERIFICATION_WARN_DB:
+        verdict = "warning"
+        notes.append(
+            f"The corrected output differs from the plan by {model_rms:.1f} dB, more "
+            "than measurement noise alone explains."
+        )
+    if after > before + VERIFICATION_REGRESSION_DB:
+        verdict = "fail"
+        notes.append(
+            f"Measured against the target the corrected speaker is worse than the raw "
+            f"one ({before:.1f} dB before, {after:.1f} dB after)."
+        )
+    elif after > expected + VERIFICATION_WARN_DB:
+        if verdict == "pass":
+            verdict = "warning"
+        notes.append(
+            f"The correction improved less than expected ({expected:.1f} dB planned, "
+            f"{after:.1f} dB measured)."
+        )
+    return {
+        "verdict": verdict,
+        "notes": notes,
+        "analysis_band_hz": [round(floor_hz, 1), 10_000.0],
+        "analysed_points": int(np.count_nonzero(usable)),
+        "model_error_db": {
+            "rms": round(model_rms, 2),
+            "worst": round(float(model_error[worst_index]), 2),
+            "worst_hz": round(float(frequencies[worst_index]), 1),
+            "bands": _band_rms(frequencies, model_error, usable),
+        },
+        "target_error_db": {"before": before, "planned": expected, "measured": after},
+        "frequency_hz": np.round(frequencies, 3).tolist(),
+        "verified_db": np.round(verified_aligned, 3).tolist(),
+        "predicted_db": np.round(predicted_aligned, 3).tolist(),
+        "target_db": np.round(target_aligned, 3).tolist(),
+        "original_db": np.round(original_aligned, 3).tolist(),
+    }
+
+
 def estimate_highpass(
     frequencies: np.ndarray, measured_db: np.ndarray, target_db: np.ndarray
 ) -> dict:

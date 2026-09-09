@@ -23,6 +23,7 @@ Item {
       ? "Measuring — a short level check, then six sweeps, about 30 seconds. Keep quiet…"
       : operation === "compare" ? "Switching profiles…"
       : operation === "bypass" ? "Switching…"
+      : operation === "verify" ? "Checking — playing the sweeps through the calibration…"
       : operation === "refit" ? "Applying…" : "Working…"
     _stdout = ""
     _stderr = ""
@@ -101,6 +102,22 @@ Item {
   function disable() { start("disable", ["disable"]) }
   function compare() { start("compare", ["compare-toggle"]) }
   function bypass() { start("bypass", ["bypass-toggle"]) }
+  function verify() { start("verify", ["verify-json"]) }
+
+  // One plain sentence about the last check.
+  function verificationSummary(check) {
+    if (!check) return ""
+    if (check.verdict === "inconclusive")
+      return "The check could not measure cleanly, so it says nothing about the calibration."
+    var errors = check.target_error_db || {}
+    var gained = Number(errors.before || 0) - Number(errors.measured || 0)
+    var off = Number((check.model_error_db || {}).rms || 0).toFixed(1)
+    if (check.verdict === "pass")
+      return "Checked: the sound follows the plan within " + off + " dB, and sits "
+        + gained.toFixed(1) + " dB closer to the target than the plain speakers."
+    return "Check " + String(check.verdict) + ": "
+      + ((check.notes && check.notes.length > 0) ? check.notes[0] : "off plan by " + off + " dB.")
+  }
 
   Process {
     id: process
@@ -165,6 +182,10 @@ Item {
           root.status = Object.assign({}, root.status, { compare: compare, bypass: false })
           root.message = "Now playing: " + (playing && playing.label ? playing.label : compare.active)
             + (compare.method === "restart" ? " · tuning restarted" : " · switched live")
+        } else if (root.phase === "verify") {
+          var check = JSON.parse(raw)
+          root.status = Object.assign({}, root.status, { verification: check })
+          root.message = root.verificationSummary(check)
         } else if (root.phase === "bypass") {
           var bypassPayload = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { compare: bypassPayload, bypass: bypassPayload.bypass })

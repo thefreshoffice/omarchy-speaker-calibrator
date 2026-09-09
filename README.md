@@ -180,6 +180,25 @@ variants can be compared by ear.
 The built-in microphone is useful for a rough first profile. A measurement mic
 placed on-axis at normal listening distance is recommended for final tuning.
 
+### Checking the result
+
+**Check the calibration** in Advanced measures a second time, this time through
+the corrected output, and compares what came out with what the fit predicted.
+It answers two separate questions. Did the filters do what the fit said they
+would, which tests the model rather than the taste? And is the result closer to
+the target than the raw speaker was, which tests whether the correction was
+worth applying at all?
+
+Both curves are level-aligned before comparison, because the sweep level and
+the input trim differ between the two measurements and only shape matters. The
+high-passed region and any band where the check itself sank into the room noise
+are left out, since neither says anything about the filters. A result more than
+4 dB from the plan is reported as a failure, which usually means the wrong
+output was measured, the microphone moved, or something else was playing.
+
+The check writes its own capture files, never the calibration capture, so a
+later refit can never fit an already-corrected recording.
+
 ## Runtime dependencies
 
 The panel intentionally uses Arch's system Python so its DSP environment is

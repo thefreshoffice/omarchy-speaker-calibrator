@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from calibration_optimizer import (  # noqa: E402
     HIGHPASS_BOUNDS_HZ,
+    verification_report,
     MAKEUP_CAP_DB,
     estimate_highpass,
     loudness_makeup_db,
@@ -525,6 +526,95 @@ class BypassTests(unittest.TestCase):
         self.assertEqual(set(controls), set(speaker_calibrate.graph_controls(
             {"filters": [], "input_gain_linear": 1.0}
         )))
+
+
+class VerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.frequencies = np.geomspace(80.0, 16_000.0, 240)
+        # A speaker with one fat resonance at 4 kHz, outside the 250-2000 Hz
+        # band the curves are level-aligned on, so the bump cannot move the
+        # alignment and hide itself.
+        self.bump = 14.0 * np.exp(
+            -0.5 * (np.log2(self.frequencies / 4000.0) / 0.5) ** 2
+        )
+        self.target = np.full(self.frequencies.size, -20.0)
+        self.original = self.target + self.bump
+        self.predicted = self.target.copy()
+
+    def fit(self, highpass_hz=100.0):
+        return {
+            "measured_smoothed_db": self.original.tolist(),
+            "predicted_response_db": self.predicted.tolist(),
+            "target": {"aligned_db": self.target.tolist()},
+            "highpass": {"frequency_hz": highpass_hz, "stages": 1},
+        }
+
+    def report(self, verified, snr=None, frequencies=None):
+        grid = self.frequencies if frequencies is None else frequencies
+        return verification_report(grid, verified, snr, self.fit(), self.frequencies)
+
+    def test_a_correction_that_landed_passes(self):
+        report = self.report(self.predicted)
+        self.assertEqual(report["verdict"], "pass", report["notes"])
+        self.assertLess(report["model_error_db"]["rms"], 0.2)
+        errors = report["target_error_db"]
+        self.assertGreater(errors["before"], 2.0)
+        self.assertLess(errors["measured"], 0.2)
+        self.assertEqual(report["notes"], [])
+
+    def test_filters_that_never_reached_the_speaker_fail(self):
+        # The sweeps went somewhere uncorrected, so the resonance is still there.
+        report = self.report(self.original)
+        self.assertEqual(report["verdict"], "fail")
+        self.assertGreater(report["model_error_db"]["rms"], 4.0)
+        self.assertAlmostEqual(report["model_error_db"]["worst_hz"], 4000.0, delta=400.0)
+        self.assertTrue(any("away from what the filters" in note for note in report["notes"]))
+
+    def test_a_correction_that_made_it_worse_fails(self):
+        report = self.report(self.target + 2.0 * self.bump)
+        self.assertEqual(report["verdict"], "fail")
+        errors = report["target_error_db"]
+        self.assertGreater(errors["measured"], errors["before"])
+        self.assertTrue(any("worse than the raw" in note for note in report["notes"]))
+
+    def test_the_verdict_ignores_playback_level(self):
+        quiet = self.report(self.predicted - 12.0)
+        loud = self.report(self.predicted + 7.0)
+        self.assertEqual(quiet["verdict"], "pass")
+        self.assertEqual(loud["verdict"], "pass")
+        self.assertAlmostEqual(quiet["model_error_db"]["rms"], loud["model_error_db"]["rms"], places=6)
+
+    def test_a_small_miss_is_only_a_warning(self):
+        report = self.report(self.predicted + 0.5 * self.bump)
+        self.assertEqual(report["verdict"], "warning")
+        self.assertTrue(any("differs from the plan" in note for note in report["notes"]))
+
+    def test_the_check_reads_its_own_frequency_grid(self):
+        coarse = np.geomspace(80.0, 16_000.0, 97)
+        verified = np.interp(np.log(coarse), np.log(self.frequencies), self.predicted)
+        report = self.report(verified, frequencies=coarse)
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(len(report["frequency_hz"]), coarse.size)
+
+    def test_noisy_and_high_passed_bands_are_left_out(self):
+        snr = np.full(self.frequencies.size, 30.0)
+        snr[self.frequencies > 2000.0] = 1.0
+        report = self.report(self.original, snr=snr)
+        # The resonance sat entirely in the band the check could not hear, so
+        # what remains agrees with the plan and no verdict is drawn from noise.
+        self.assertEqual(report["verdict"], "pass")
+        self.assertEqual(report["analysis_band_hz"][0], 160.0)
+        self.assertLess(report["analysed_points"], self.frequencies.size)
+        self.assertNotIn("treble", report["model_error_db"]["bands"])
+        self.assertIn("low mid", report["model_error_db"]["bands"])
+
+    def test_the_high_pass_region_is_never_judged(self):
+        report = verification_report(
+            self.frequencies, self.predicted, None,
+            dict(self.fit(), highpass={"frequency_hz": 400.0, "stages": 1}),
+            self.frequencies,
+        )
+        self.assertEqual(report["analysis_band_hz"][0], 400.0)
 
 
 if __name__ == "__main__":

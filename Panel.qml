@@ -257,6 +257,30 @@ Panel {
                root.fmt(highpass.q || 0.707, 2), "–"])
     return rows
   }
+  function verificationRows() {
+    var check = service.status.verification
+    if (!check) return []
+    var model = check.model_error_db || {}
+    var errors = check.target_error_db || {}
+    var rows = [
+      { key: "Checked", value: String(check.checked_at || "").slice(0, 16).replace("T", " ")
+        + (check.profile_label ? "  ·  " + check.profile_label : "") },
+      { key: "Follows the plan", value: "within " + root.fmt(model.rms, 2) + " dB"
+        + "  ·  worst " + root.fmt(model.worst, 1) + " dB at " + root.fmt(model.worst_hz, 0) + " Hz" },
+      { key: "Distance to target", value: root.fmt(errors.before, 2) + " dB raw  →  "
+        + root.fmt(errors.planned, 2) + " dB planned  →  " + root.fmt(errors.measured, 2) + " dB measured" }
+    ]
+    var bands = model.bands || {}
+    var parts = []
+    for (var name in bands) parts.push(name + " " + Number(bands[name]).toFixed(1))
+    if (parts.length > 0) rows.push({ key: "Off plan by band", value: parts.join("  ·  ") + " dB" })
+    if (check.analysis_band_hz)
+      rows.push({ key: "Judged over", value: root.fmt(check.analysis_band_hz[0], 0) + " Hz to "
+        + root.fmt(check.analysis_band_hz[1] / 1000, 0) + " kHz  ·  " + String(check.analysed_points) + " points" })
+    if (check.stale)
+      rows.push({ key: "Note", value: "the calibration changed after this check, so it no longer describes what you hear" })
+    return rows
+  }
   function fitRows() {
     if (!service.proposal || !service.proposal.fit) return []
     var fit = service.proposal.fit
@@ -823,6 +847,21 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          Text {
+            visible: !service.busy && service.status.verification !== undefined
+              && service.status.verification !== null
+            width: parent.width
+            text: service.status.verification && service.status.verification.stale
+              ? "The calibration has changed since it was last checked."
+              : service.verificationSummary(service.status.verification)
+            color: service.status.verification && !service.status.verification.stale
+              && service.status.verification.verdict === "fail"
+              ? (bar ? bar.urgent : Color.urgent) : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
           Column {
             visible: service.status.profile !== null && service.status.profile !== undefined
               && service.status.profile.fit !== null && service.status.profile.fit !== undefined
@@ -986,6 +1025,16 @@ Panel {
                       ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
                 enabled: !service.busy
                 onClicked: service.install()
+              }
+              ActionRow {
+                visible: service.status.enabled && !service.status.bypass
+                  && service.status.profile !== null && service.status.profile !== undefined
+                width: parent.width
+                icon: "󰄾"
+                label: service.busy && service.phase === "verify" ? "Checking…" : "Check the calibration"
+                description: "Measure again through the corrected output and compare it with the plan"
+                enabled: !service.busy
+                onClicked: service.verify()
               }
               ActionRow {
                 visible: service.status.enabled && service.status.compare !== undefined
@@ -1317,6 +1366,48 @@ Panel {
                 Repeater {
                   model: root.fitRows()
                   DetailRow { width: parent.width; key: modelData.key; value: modelData.value }
+                }
+              }
+            }
+
+            // ---------------------------------------------------------- check
+            Column {
+              visible: service.status.verification !== undefined
+                && service.status.verification !== null
+              width: parent.width
+              spacing: Style.space(7)
+
+              PanelSeparator { foreground: root.foreground }
+              PanelSectionHeader {
+                text: "LAST CHECK  ·  " + String((service.status.verification || {}).verdict || "").toUpperCase()
+                  + ((service.status.verification || {}).stale ? "  ·  STALE" : "")
+                foreground: (service.status.verification || {}).verdict === "fail"
+                  ? (bar ? bar.urgent : Color.urgent) : root.foreground
+                fontFamily: root.fontFamily
+              }
+              Column {
+                width: parent.width
+                spacing: Style.space(3)
+                Repeater {
+                  model: root.verificationRows()
+                  DetailRow { width: parent.width; key: modelData.key; value: modelData.value }
+                }
+              }
+              Column {
+                visible: ((service.status.verification || {}).notes || []).length > 0
+                width: parent.width
+                spacing: Style.space(2)
+                Repeater {
+                  model: (service.status.verification || {}).notes || []
+                  Text {
+                    width: parent.width
+                    text: "•  " + modelData
+                    color: (service.status.verification || {}).verdict === "fail"
+                      ? (bar ? bar.urgent : Color.urgent) : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
                 }
               }
             }
