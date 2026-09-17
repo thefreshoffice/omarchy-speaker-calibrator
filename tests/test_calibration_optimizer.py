@@ -344,7 +344,8 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertIn('name = ls_r label = bq_lowshelf', graph)
         self.assertIn('name = hs_r label = bq_highshelf', graph)
         self.assertIn('{ output = "hs_r:Out" input = "bal_r:In" }', graph)
-        self.assertIn('{ output = "bal_r:Out" input = "limiter:in_r" }', graph)
+        self.assertIn('{ output = "bal_r:Out" input = "dly_r:In" }', graph)
+        self.assertIn('{ output = "dly_r:Out" input = "limiter:in_r" }', graph)
         self.assertIn('name = bal_l label = linear control = { "Mult" = 1 "Add" = 0 }', graph)
 
     def test_graph_controls_fill_every_fixed_slot(self):
@@ -357,9 +358,14 @@ class CalibrationOptimizerTests(unittest.TestCase):
         controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
         slots = speaker_calibrate.PEAKING_SLOTS
         # Per channel: two high-passes, three shelves, the parametric slots,
-        # and the balance trim's two controls; plus the limiter's input gain
-        # and the compensator's six, which are not per channel.
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6)
+        # the balance trim's two controls, and the arrival delay; plus the
+        # limiter's input gain and the compensator's six, which are not per
+        # channel.
+        self.assertEqual(
+            len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2 + 1) + 1 + 6
+        )
+        self.assertAlmostEqual(controls["dly_l:Delay (s)"], 0.0, delta=1e-9)
+        self.assertAlmostEqual(controls["dly_r:Delay (s)"], 0.0, delta=1e-9)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Add"], 0.0)

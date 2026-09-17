@@ -36,6 +36,21 @@ from calibration_levels import (  # noqa: E402,F401
 )
 
 
+QUICK_CALIBRATION = "quick-calibration"
+ROOM_CORRECTION = "room-correction"
+MODES = (QUICK_CALIBRATION, ROOM_CORRECTION)
+# Room correction fits a finer curve with more sections.  Room modes are
+# narrower than the ear's critical band in the bass, so the smoothing window
+# is capped; the held-out repeat keeps the extra detail from being fitted as
+# noise.
+ROOM_MAXIMUM_FILTERS = 20
+ROOM_SMOOTHING_OCTAVES = 1.0 / 12.0
+ROOM_Q_BOUNDS = (0.4, 8.0)
+ROOM_FREQUENCY_RANGE_HZ = (20.0, 16_000.0)
+# A room mode is narrow by nature, so a narrow cut below this is not
+# penalised as fitting noise.
+ROOM_MODE_CEILING_HZ = 300.0
+
 DIAGNOSTIC_CENTERS = np.asarray(
     [160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0,
      2500.0, 4000.0, 6300.0, 10000.0]
@@ -98,6 +113,9 @@ CHANNEL_TRIM_BAND_HZ = (250.0, 4000.0)
 # frequency that may sit two octaves below the real limit.
 HIGHPASS_Q = 0.707
 HIGHPASS_BOUNDS_HZ = (50.0, 200.0)
+# Room correction serves speakers that play below 50 Hz, so the corner may
+# follow the knee down to the bottom of the sweep.
+ROOM_HIGHPASS_BOUNDS_HZ = (20.0, 200.0)
 HIGHPASS_SEARCH_CEILING_HZ = 400.0
 # How far short of the target the speaker must fall to count as finished.
 KNEE_SHORTFALL_DB = 15.0
@@ -576,8 +594,22 @@ def estimate_channel_trim(
     return result
 
 
+def arrival_delays_ms(seat: dict) -> dict:
+    """Per-channel delay that makes both speakers arrive with the later one."""
+    # Captures analysed before arrival times were recorded carry none.
+    arrivals = {
+        channel["output_channel"]: float(channel.get("arrival_ms", 0.0))
+        for channel in seat.get("channels", [])
+    }
+    latest = max(arrivals.values(), default=0.0)
+    return {
+        side: round(latest - arrivals.get(side, latest), 4) for side in ("left", "right")
+    }
+
+
 def estimate_highpass(
-    frequencies: np.ndarray, measured_db: np.ndarray, target_db: np.ndarray
+    frequencies: np.ndarray, measured_db: np.ndarray, target_db: np.ndarray,
+    bounds_hz: tuple[float, float] = HIGHPASS_BOUNDS_HZ,
 ) -> dict:
     """Corner and stage count for the protective high-pass.
 
@@ -594,14 +626,14 @@ def estimate_highpass(
     shortfall = np.asarray(target_db, dtype=float) - np.asarray(measured_db, dtype=float)
     failing = (frequencies <= HIGHPASS_SEARCH_CEILING_HZ) & (shortfall >= KNEE_SHORTFALL_DB)
     knee = float(np.max(frequencies[failing])) if np.any(failing) else 0.0
-    corner = float(np.clip(knee, HIGHPASS_BOUNDS_HZ[0], HIGHPASS_BOUNDS_HZ[1]))
+    corner = float(np.clip(knee, bounds_hz[0], bounds_hz[1]))
     return {
         "frequency_hz": round(corner, 1),
         "q": HIGHPASS_Q,
         "stages": 2 if corner <= HIGHPASS_TWO_STAGE_BELOW_HZ else 1,
         "knee_hz": round(knee, 1) if knee > 0.0 else None,
         "shortfall_db": KNEE_SHORTFALL_DB,
-        "bounds_hz": list(HIGHPASS_BOUNDS_HZ),
+        "bounds_hz": list(bounds_hz),
     }
 
 
@@ -743,15 +775,16 @@ def _window_boost_limit(
 
 
 def _safe_boost_floor(
-    frequencies: np.ndarray, measured: np.ndarray, confidence: np.ndarray
+    frequencies: np.ndarray, measured: np.ndarray, confidence: np.ndarray,
+    *, search_from_hz: float = 140.0, lowest_hz: float = 160.0,
 ) -> float:
     mid = (frequencies >= 300.0) & (frequencies <= 1600.0)
     mid_reference = float(np.percentile(measured[mid], 65))
     candidates = np.where(
-        (frequencies >= 140.0) & (frequencies <= 1000.0)
+        (frequencies >= search_from_hz) & (frequencies <= 1000.0)
         & (measured >= mid_reference - 10.0) & (confidence >= 0.55)
     )[0]
-    return float(max(160.0, frequencies[candidates[0]])) if candidates.size else 1000.0
+    return float(max(lowest_hz, frequencies[candidates[0]])) if candidates.size else 1000.0
 
 
 def _cut_limit_at(center: float, internal_mic: bool) -> float:
@@ -813,26 +846,35 @@ def _boost_decision(
 
 
 def _smooth_and_level_align(
-    curve: np.ndarray, reference: np.ndarray, frequencies: np.ndarray
+    curve: np.ndarray, reference: np.ndarray, frequencies: np.ndarray,
+    smoothing_cap: float | None = None,
 ) -> np.ndarray:
-    smoothed = perceptual_smooth(frequencies, curve)
+    smoothed = perceptual_smooth(frequencies, curve, max_octaves=smoothing_cap)
     band = (frequencies >= 250.0) & (frequencies <= 2000.0)
     smoothed += float(np.median(reference[band] - smoothed[band]))
     return smoothed
 
 
 def _validation_data(
-    measurement: dict, measured_smooth: np.ndarray, frequencies: np.ndarray
+    measurement: dict, measured_smooth: np.ndarray, frequencies: np.ndarray,
+    smoothing_cap: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], dict]:
-    """Build a training curve and a genuinely held-out repeat when available."""
+    """Build a training curve and a genuinely held-out group when available.
+
+    Curves from a spatial average are grouped by measurement position, so the
+    last position is held out whole and a filter must hold across positions.
+    """
+    curves = measurement.get("validation_curves", [])
+    by_position = any("position" in item for item in curves)
+    group_key, group_label = ("position", "positions") if by_position else ("repeat", "repeats")
     repeat_groups: dict[int, list[np.ndarray]] = {}
-    for item in measurement.get("validation_curves", []):
+    for item in curves:
         curve = np.asarray(item.get("response_db", []), dtype=float)
         if curve.size != frequencies.size:
             continue
-        repeat = int(item.get("repeat", 0))
+        repeat = int(item.get(group_key, 0))
         repeat_groups.setdefault(repeat, []).append(
-            _smooth_and_level_align(curve, measured_smooth, frequencies)
+            _smooth_and_level_align(curve, measured_smooth, frequencies, smoothing_cap)
         )
     grouped = [
         np.median(np.vstack(repeat_groups[key]), axis=0)
@@ -844,10 +886,10 @@ def _validation_data(
         training = np.median(np.vstack(grouped[:-1]), axis=0)
         holdout = grouped[-1]
         return training, holdout, grouped, {
-            "mode": "repeat-holdout",
+            "mode": f"{group_key}-holdout",
             "groups": len(grouped),
-            "training_repeats": group_names[:-1],
-            "held_out_repeats": group_names[-1:],
+            f"training_{group_label}": group_names[:-1],
+            f"held_out_{group_label}": group_names[-1:],
             "curves": sum(len(items) for items in repeat_groups.values()),
         }
 
@@ -857,7 +899,7 @@ def _validation_data(
         curve = np.asarray(channel.get("response_db", []), dtype=float)
         if curve.size == frequencies.size:
             channel_folds.append(
-                _smooth_and_level_align(curve, measured_smooth, frequencies)
+                _smooth_and_level_align(curve, measured_smooth, frequencies, smoothing_cap)
             )
             channel_names.append(str(channel.get("output_channel", len(channel_names))))
     if len(channel_folds) >= 2:
@@ -1026,11 +1068,15 @@ def _new_filter(
     internal_mic: bool,
     maximum_boost: float,
     highpass_hz: float,
+    boost_floor_hz: float,
+    narrow_q_threshold: float,
 ) -> dict:
     center = float(frequencies[index])
     need = np.maximum(residual, 0.0) if kind == "cut" else np.maximum(-residual, 0.0)
     q = _estimate_q(need, index, frequencies, q_bounds)
     low_frequency = max(frequency_range[0], center / (2.0 ** 0.48))
+    if kind == "boost":
+        low_frequency = max(low_frequency, boost_floor_hz)
     high_frequency = min(frequency_range[1], center * (2.0 ** 0.48))
     if kind == "cut":
         # The least-negative limit anywhere in the search window is used so a
@@ -1055,7 +1101,7 @@ def _new_filter(
         "frequency_bounds": (low_frequency, high_frequency),
         "q_bounds": q_bounds,
         "gain_bounds": gain_bounds,
-        "narrow_q_threshold": 1.4 if internal_mic else 2.25,
+        "narrow_q_threshold": narrow_q_threshold,
     }
 
 
@@ -1066,6 +1112,7 @@ def _shelf_candidates(
     valid: np.ndarray,
     internal_mic: bool,
     existing: list[dict],
+    narrow_q_threshold: float,
 ) -> list[dict]:
     """Cut-only shelf proposals where the residual stays high toward an edge."""
     candidates: list[dict] = []
@@ -1106,7 +1153,7 @@ def _shelf_candidates(
                 "frequency_bounds": (max(low_edge, corner / 1.5), min(high_edge, corner * 1.5)),
                 "q_bounds": SHELF_Q_BOUNDS,
                 "gain_bounds": (limit, 0.0),
-                "narrow_q_threshold": 1.4 if internal_mic else 2.25,
+                "narrow_q_threshold": narrow_q_threshold,
             })
     return candidates
 
@@ -1119,20 +1166,33 @@ def optimize_peq(
     loudness: str = "protected",
     bass: str = "normal",
     channel_trim: str = "off",
+    mode: str = QUICK_CALIBRATION,
 ) -> dict:
+    if mode not in MODES:
+        raise ValueError(f"Unknown calibration mode {mode!r}; expected one of {MODES}.")
+    room = mode == ROOM_CORRECTION
+    seat = measurement.get("seat", measurement)
+    smoothing_cap = ROOM_SMOOTHING_OCTAVES if room else None
     frequencies = np.asarray(measurement["frequency_hz"], dtype=float)
     measured = np.asarray(measurement["level_dbfs"], dtype=float)
     # Fitted to what the ear can resolve, not to every bin of the measurement.
-    measured_smooth = perceptual_smooth(frequencies, measured)
+    measured_smooth = perceptual_smooth(frequencies, measured, max_octaves=smoothing_cap)
     confidence, uncertainty = _measurement_confidence(measurement)
     training, holdout, validation_groups, validation_info = _validation_data(
-        measurement, measured_smooth, frequencies
+        measurement, measured_smooth, frequencies, smoothing_cap
     )
 
     calibrated_external = bool(
         not internal_mic and measurement.get("microphone_calibration")
     )
-    if internal_mic:
+    if room and internal_mic:
+        raise ValueError("Room correction needs an external microphone.")
+    if room:
+        maximum_boost = 3.0
+        maximum_filters = ROOM_MAXIMUM_FILTERS
+        q_bounds = ROOM_Q_BOUNDS
+        frequency_range = ROOM_FREQUENCY_RANGE_HZ
+    elif internal_mic:
         maximum_boost = 1.5
         maximum_filters = 6
         q_bounds = (0.5, 2.0)
@@ -1164,8 +1224,12 @@ def optimize_peq(
     # resonance, so it reads a plain average.  A peak-weighted one lifts a
     # steep roll-off and would place the corner lower than the speaker earns.
     highpass = estimate_highpass(
-        frequencies, perceptual_smooth(frequencies, measured, peak_weighted=False),
+        frequencies,
+        perceptual_smooth(
+            frequencies, measured, peak_weighted=False, max_octaves=smoothing_cap
+        ),
         aligned_target,
+        ROOM_HIGHPASS_BOUNDS_HZ if room else HIGHPASS_BOUNDS_HZ,
     )
     safety_highpass = highpass["stages"] * _highpass_response_db(
         frequencies, highpass["frequency_hz"], highpass["q"], measurement["rate_hz"]
@@ -1178,7 +1242,22 @@ def optimize_peq(
     aligned_target = aligned_target + safety_highpass
     total_cut_limit = _total_cut_limit(frequencies, internal_mic)
     desired = np.clip(aligned_target - training - safety_highpass, -16.0, 4.0)
-    safe_boost_floor = _safe_boost_floor(frequencies, training, confidence)
+    if room:
+        # Boosts stop at the knee; below it only cuts are allowed.
+        corner = highpass["frequency_hz"]
+        safe_boost_floor = _safe_boost_floor(
+            frequencies, training, confidence, search_from_hz=corner, lowest_hz=corner
+        )
+        boost_floor = safe_boost_floor
+    else:
+        safe_boost_floor = _safe_boost_floor(frequencies, training, confidence)
+        boost_floor = frequency_range[0]
+    base_narrow_q = 1.4 if internal_mic else 2.25
+
+    def narrow_q_threshold(center: float) -> float:
+        if room and center < ROOM_MODE_CEILING_HZ:
+            return q_bounds[1]
+        return base_narrow_q
 
     weights = confidence.copy()
     weights[~valid] *= 0.1
@@ -1240,7 +1319,7 @@ def optimize_peq(
             candidate_specs.append(_new_filter(
                 "cut", index, residual, frequencies, q_bounds,
                 frequency_range, internal_mic, maximum_boost,
-                highpass["frequency_hz"],
+                highpass["frequency_hz"], boost_floor, narrow_q_threshold(center),
             ))
         for index in _candidate_indices(boost_score, valid, 4):
             center = float(frequencies[index])
@@ -1254,10 +1333,11 @@ def optimize_peq(
             candidate_specs.append(_new_filter(
                 "boost", index, residual, frequencies, q_bounds,
                 frequency_range, internal_mic, maximum_boost,
-                highpass["frequency_hz"],
+                highpass["frequency_hz"], boost_floor, narrow_q_threshold(center),
             ))
         candidate_specs.extend(_shelf_candidates(
-            residual, frequencies, confidence, valid, internal_mic, filters
+            residual, frequencies, confidence, valid, internal_mic, filters,
+            base_narrow_q,
         ))
 
         best = None
@@ -1443,6 +1523,7 @@ def optimize_peq(
 
     return {
         "algorithm": "adaptive-cross-validated-peq-v2",
+        "mode": mode,
         "filter_strategy": "adaptive frequency, bandwidth, gain, and count",
         "filter_count": len(filters_payload),
         "maximum_filter_count": maximum_filters,
@@ -1474,9 +1555,14 @@ def optimize_peq(
         "highpass_stages": highpass["stages"],
         "bass_mode": bass,
         "bass_shelf": shelf,
+        # Room correction aligns the speakers at the seat, level included.
         "channel_trim": estimate_channel_trim(
+            seat, internal_mic=internal_mic, mode="auto"
+        ) if room else estimate_channel_trim(
             measurement, internal_mic=internal_mic, mode=channel_trim
         ),
+        "channel_delay_ms": arrival_delays_ms(seat) if room
+        else {"left": 0.0, "right": 0.0},
         "loudness_mode": loudness,
         "loudness_loss_db": round(loudness_loss_db, 2),
         "makeup_db": makeup_db,
@@ -1503,7 +1589,9 @@ def optimize_peq(
         "smoothing": {
             "method": "critical-band, peak-weighted",
             "exponent": PEAK_WEIGHT_EXPONENT,
-            "octaves": np.round(erb_octaves(frequencies), 3).tolist(),
+            "octaves": np.round(
+                np.minimum(erb_octaves(frequencies), smoothing_cap or np.inf), 3
+            ).tolist(),
         },
         "measured_smoothed_db": np.round(measured_smooth, 3).tolist(),
         "predicted_response_db": np.round(predicted, 3).tolist(),

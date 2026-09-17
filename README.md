@@ -53,6 +53,27 @@ Everything else lives under **Advanced**: voicing, the three loudness levels,
 channel balance, loudness compensation, the measurement details, and a
 comparison of what each microphone measured.
 
+### Room correction for external speakers
+
+With an external speaker output (USB, or HDMI and S/PDIF, such as speakers on
+a monitor) and an external USB microphone, the panel offers **Room
+correction** below the calibrate button. A measurement microphone's
+calibration file, entered under **Advanced > MIC CAL FILE**, makes the result
+more accurate. Without one, the run still installs, with a warning that the
+correction also evens out the microphone's own sound.
+
+1. Choose 1 to 9 measurement positions (5 by default) and press **Start room
+   correction**.
+2. Place the microphone at your seat and press **Measure**. The seat position
+   also sets the timing between the two speakers.
+3. Move the microphone to the next measurement position when asked, and press
+   **Measure** again. Each position takes about 30 seconds.
+4. If a position fails its quality checks, retake it or skip it.
+
+After the last position the panel fits one correction to the average of the
+positions that passed and says how many it used. The profile installs only when
+the seat position passed and at least half of all positions passed.
+
 ## Deep bass needs one optional package
 
 Everything above runs on what Omarchy ships. **Deep bass** is the exception.
