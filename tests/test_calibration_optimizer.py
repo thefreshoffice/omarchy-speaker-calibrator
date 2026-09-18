@@ -2178,5 +2178,61 @@ class TrackerRampTests(unittest.TestCase):
         self.assertEqual(followed, [True])
 
 
+
+class MicrophoneArchiveIdentityTests(unittest.TestCase):
+    """One record is kept per kind; the panel must know which device made it."""
+
+    def test_the_summary_carries_the_device_name_when_the_record_has_it(self):
+        directory = Path(tempfile.mkdtemp())
+        (directory / "external.json").write_text(json.dumps({
+            "kind": "external", "created_at": "2026-09-16T20:55:00+00:00",
+            "microphone": "Usb Microphone Mono",
+            "microphone_name": "alsa_input.usb-Usb_Microphone-00.mono-fallback",
+            "calibration_file": None, "verdict": "warning",
+        }))
+        (directory / "internal.json").write_text(json.dumps({
+            "kind": "internal", "created_at": "2026-09-09T20:26:00+00:00",
+            "microphone": "Built-in Audio Analog Stereo", "calibration_file": None, "verdict": "pass",
+        }))
+        saved = speaker_calibrate.MICROPHONE_ARCHIVE
+        speaker_calibrate.MICROPHONE_ARCHIVE = directory
+        try:
+            found = speaker_calibrate.archived_microphones()
+        finally:
+            speaker_calibrate.MICROPHONE_ARCHIVE = saved
+        self.assertEqual(found["external"]["name"], "alsa_input.usb-Usb_Microphone-00.mono-fallback")
+        self.assertEqual(found["external"]["microphone"], "Usb Microphone Mono")
+        # A record from before the name was kept: the panel falls back to the label.
+        self.assertEqual(found["internal"]["name"], "")
+        self.assertEqual(found["internal"]["warnings"], [])
+
+    def test_the_summary_carries_the_reasons_for_a_warning(self):
+        directory = Path(tempfile.mkdtemp())
+        (directory / "external.json").write_text(json.dumps({
+            "kind": "external", "created_at": "2026-09-16T20:45:00+00:00", "microphone": "m",
+            "microphone_name": "n", "calibration_file": None, "verdict": "warning",
+            "warnings": ["The accepted test signal peaked at only -21.5 dBFS.", "<b>x</b>", 7],
+        }))
+        saved = speaker_calibrate.MICROPHONE_ARCHIVE
+        speaker_calibrate.MICROPHONE_ARCHIVE = directory
+        try:
+            found = speaker_calibrate.archived_microphones()
+        finally:
+            speaker_calibrate.MICROPHONE_ARCHIVE = saved
+        reasons = found["external"]["warnings"]
+        self.assertEqual(reasons[0], "The accepted test signal peaked at only -21.5 dBFS.")
+        self.assertEqual(len(reasons), 2)
+        self.assertNotIn("<", reasons[1])
+
+    def test_the_panel_matches_a_row_to_its_own_record_only(self):
+        source = (Path(speaker_calibrate.__file__).parent / "Panel.qml").read_text()
+        note = source[source.index("function microphoneNote"):source.index("function calibrationMicrophone")]
+        self.assertIn("record.name === entry.name", note)
+        self.assertIn("record.microphone === entry.description", note)
+        self.assertIn("active.name === entry.name", note)
+        self.assertNotIn("active.internal === entry.internal", note)
+        self.assertIn("record.warnings", note)
+
+
 if __name__ == "__main__":
     unittest.main()

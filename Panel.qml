@@ -134,14 +134,24 @@ Panel {
   function microphoneNote(entry) {
     var archive = (service.status.microphones || {})
     var record = entry.internal ? archive.internal : archive.external
+    // One record is kept per kind, so with several external microphones
+    // connected it belongs to one of them: the device it names, or for a
+    // record from before the device was kept, the one with its label.
     if (!record) return "Never measured"
+    var ownRecord = record.name ? record.name === entry.name
+                                : record.microphone === entry.description
+    if (!ownRecord) return "Never measured"
     // One short line that fits: a date, whether this is the calibration
     // playing, and a word about its quality only when there is one to say.
     var when = Qt.formatDate(new Date(record.created_at), "d MMM yyyy")
     var active = ((service.status.profile || {}).microphone || {})
     var parts = ["Measured " + when]
-    if (active.internal === entry.internal) parts.push("the calibration in use")
-    if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
+    if (active.name === entry.name) parts.push("the calibration in use")
+    // The verdict with its reasons, so "warning" is never left unexplained;
+    // an older record kept only the word.
+    var reasons = (record.warnings || []).filter(function (text) { return text })
+    if (reasons.length) parts.push("warning: " + reasons.join(" ").replace(/\.\s+/g, "; ").replace(/\.$/, ""))
+    else if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
     return parts.join("  ·  ")
   }
   // A check is only a check when it is made with the microphone the
@@ -1354,7 +1364,9 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+                  // The reasons for a warning need the room; a caption that
+                  // ends in "..." explains nothing.
+                  wrapMode: Text.WordWrap
                 }
               }
             }

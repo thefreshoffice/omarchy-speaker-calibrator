@@ -1728,12 +1728,19 @@ def archive_measurement(profile):
         "kind": microphone_kind(profile),
         "created_at": profile.get("created_at"),
         "microphone": short_label(mic.get("description")),
+        # The device itself, so the panel can tell which of several
+        # microphones of this kind made the record.
+        "microphone_name": short_label(mic.get("name"), 200),
         "calibration_file": bool(mic.get("calibration_file")),
         "frequency_hz": [round(float(value), 2) for value in grid],
         "response_db": [round(float(value), 3) for value in combined],
         "uncertainty_db": ([round(float(value), 3) for value in uncertainty]
                            if uncertainty is not None else None),
         "verdict": safe_verdict((profile.get("quality") or {}).get("verdict")),
+        # Why the verdict is what it is, so a row can say so.
+        "warnings": [short_label(text, 200) or "" for text in
+                     list((profile.get("quality") or {}).get("warnings") or [])[:6]
+                     if isinstance(text, str)],
         "speaker": short_label((profile.get("speaker") or {}).get("description")),
     }
     try:
@@ -2272,8 +2279,13 @@ def archived_microphones():
             continue
         found[kind] = {
             "microphone": short_label(record.get("microphone")),
+            # Empty for a record from before the name was kept; the panel
+            # then falls back to the label.
+            "name": short_label(record.get("microphone_name") or "", 200) or "",
             "created_at": short_label(record.get("created_at"), 40),
             "verdict": safe_verdict(record.get("verdict")),
+            "warnings": [short_label(text, 200) or "" for text in
+                         list(record.get("warnings") or [])[:4] if isinstance(text, str)],
             "calibrated": bool(record.get("calibration_file")),
         }
     return found
@@ -3335,6 +3347,8 @@ def preview_discard():
             pass
     write_compare_state({"active": "current", "bypass": False})
     method = reinstall_profile(held)
+    # The archive follows the calibration that plays, not the last measured.
+    archive_measurement(held)
     _forget_held()
     return {"previewing": False, "profile": held, "method": method,
             "message": "Kept the previous calibration. The new measurement stays as the last "

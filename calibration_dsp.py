@@ -621,12 +621,16 @@ def _quality_summary(
             "corrections shrink where the noise floor is close."
         )
         guidance.append("Reduce background noise or raise the level, then measure again.")
+    # Neither of these is a defect in the measurement, and each would hold
+    # for every measurement made this way, so a verdict that carried them
+    # could never say "pass" and would hide the warnings that do vary.
+    # They are advice, and go where advice goes.
     if internal_mic:
-        warnings.append(
-            "Built-in microphone mode is a relative estimate; chassis coupling and unknown mic response remain."
+        guidance.append(
+            "Built-in microphone mode is a relative estimate; chassis coupling and the unknown "
+            "microphone response remain. An external measuring microphone is more reliable."
         )
     elif calibration is None:
-        warnings.append("No microphone calibration file was supplied.")
         guidance.append("For final tuning, load the serial-number calibration file for this microphone.")
     if background_dbfs > -35.0:
         warnings.append(f"Recorded background level is high ({background_dbfs:.1f} dBFS).")
