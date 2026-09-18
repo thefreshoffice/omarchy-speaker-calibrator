@@ -1278,8 +1278,8 @@ def analyse_level_probe(
     prominences = [dbfs(loud[index]) - dbfs(noise[index]) for index in range(channels)]
     best = int(np.argmax(prominences))
 
-    crest_db = 20.0 * np.log10(region_peak / np.maximum(region_rms, 1e-12))
-    tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
+    crest_db = 20.0 * np.log10(np.maximum(region_peak, 1e-12) / np.maximum(region_rms, 1e-12))
+    tonal = (region_peak > 0.0) & (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
     tonal_peak = float(np.max(region_peak[tonal])) if np.any(tonal) else 0.0
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
     loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]
