@@ -2226,7 +2226,7 @@ class MicrophoneArchiveIdentityTests(unittest.TestCase):
 
     def test_the_panel_matches_a_row_to_its_own_record_only(self):
         source = (Path(speaker_calibrate.__file__).parent / "Panel.qml").read_text()
-        note = source[source.index("function microphoneNote"):source.index("function calibrationMicrophone")]
+        note = source[source.index("function microphoneRecord"):source.index("function calibrationMicrophone")]
         self.assertIn("record.name === entry.name", note)
         self.assertIn("record.microphone === entry.description", note)
         self.assertIn("active.name === entry.name", note)

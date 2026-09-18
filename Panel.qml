@@ -131,28 +131,42 @@ Panel {
   // "Recalibrate" says nothing about which microphone did the one in use.
   // Each row now carries its own history: whether it has measured at all,
   // when, and whether that measurement is the calibration playing right now.
-  function microphoneNote(entry) {
+  // One record is kept per kind, so with several external microphones
+  // connected it belongs to one of them: the device it names, or for a
+  // record from before the device was kept, the one with its label.
+  function microphoneRecord(entry) {
     var archive = (service.status.microphones || {})
     var record = entry.internal ? archive.internal : archive.external
-    // One record is kept per kind, so with several external microphones
-    // connected it belongs to one of them: the device it names, or for a
-    // record from before the device was kept, the one with its label.
-    if (!record) return "Never measured"
+    if (!record) return null
     var ownRecord = record.name ? record.name === entry.name
                                 : record.microphone === entry.description
-    if (!ownRecord) return "Never measured"
-    // One short line that fits: a date, whether this is the calibration
-    // playing, and a word about its quality only when there is one to say.
+    return ownRecord ? record : null
+  }
+  function microphoneNote(entry) {
+    var record = microphoneRecord(entry)
+    if (!record) return "Never measured"
+    // One short line that fits: a date and whether this is the calibration
+    // playing.  The verdict follows as its own word, because it is a button.
     var when = Qt.formatDate(new Date(record.created_at), "d MMM yyyy")
     var active = ((service.status.profile || {}).microphone || {})
     var parts = ["Measured " + when]
     if (active.name === entry.name) parts.push("the calibration in use")
-    // The verdict with its reasons, so "warning" is never left unexplained;
-    // an older record kept only the word.
-    var reasons = (record.warnings || []).filter(function (text) { return text })
-    if (reasons.length) parts.push("warning: " + reasons.join(" ").replace(/\.\s+/g, "; ").replace(/\.$/, ""))
-    else if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
     return parts.join("  ·  ")
+  }
+  // A verdict other than pass, as one word; its reasons wait behind a click
+  // on it, so the caption stays one line until someone asks.
+  function microphoneVerdict(entry) {
+    var record = microphoneRecord(entry)
+    if (!record || !record.verdict || record.verdict === "pass") return ""
+    return record.verdict
+  }
+  function microphoneReasons(entry) {
+    var record = microphoneRecord(entry)
+    if (!record) return ""
+    var reasons = (record.warnings || []).filter(function (text) { return text })
+    // An older record kept only the word.
+    if (!reasons.length) return "No reasons were kept for this measurement; measure again to see them."
+    return reasons.join("\n")
   }
   // A check is only a check when it is made with the microphone the
   // calibration was made with, on the same channels: another microphone
@@ -1333,8 +1347,11 @@ Panel {
               // measured belongs under it, the way every other labelled
               // control in this panel is built, not crammed into the label.
               Column {
+                id: microphoneRow
                 width: parent.width
                 spacing: Style.space(2)
+                // The reasons for a verdict are shown on request only.
+                property bool reasonsShown: false
 
                 Button {
                   width: parent.width
@@ -1352,20 +1369,52 @@ Panel {
                   onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
                 }
 
+                // Flush with every other line in the section, so the panel
+                // has one left edge rather than several.  It reads as this
+                // device's caption because it sits tight under it: the gap
+                // inside a row is a third of the gap between rows.
+                Flow {
+                  width: parent.width
+                  spacing: 0
+
+                  Text {
+                    textFormat: Text.PlainText
+                    bottomPadding: microphoneRow.reasonsShown ? 0 : Style.space(3)
+                    text: root.microphoneNote(modelData)
+                      + (root.microphoneVerdict(modelData) !== "" ? "  ·  " : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  // The verdict is the handle: click it for the reasons.
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: root.microphoneVerdict(modelData) !== ""
+                    bottomPadding: microphoneRow.reasonsShown ? 0 : Style.space(3)
+                    text: root.microphoneVerdict(modelData)
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.underline: true
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: microphoneRow.reasonsShown = !microphoneRow.reasonsShown
+                    }
+                  }
+                }
+
                 Text {
                   textFormat: Text.PlainText
+                  visible: microphoneRow.reasonsShown && root.microphoneVerdict(modelData) !== ""
                   width: parent.width
-                  // Flush with every other line in the section, so the panel
-                  // has one left edge rather than several.  It reads as this
-                  // device's caption because it sits tight under it: the gap
-                  // inside a row is a third of the gap between rows.
                   bottomPadding: Style.space(3)
-                  text: root.microphoneNote(modelData)
+                  text: root.microphoneReasons(modelData)
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  // The reasons for a warning need the room; a caption that
-                  // ends in "..." explains nothing.
                   wrapMode: Text.WordWrap
                 }
               }
