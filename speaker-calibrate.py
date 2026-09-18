@@ -721,6 +721,50 @@ def loudness_controls(sink_volume_db, enabled, input_gain_linear=1.0):
     }
 
 
+# A volume change lands in the graph as steps: the limiter takes a new input
+# gain at once and the compensator recomputes its contour, so one write for a
+# change of a few decibels is heard as a tick, and a held volume key as a
+# crackle. The tracker spreads a change over writes no larger than this.
+LOUDNESS_RAMP_STEP_DB = 0.5
+LOUDNESS_RAMP_MAX_WRITES = 16
+
+
+def loudness_ramp(start, target):
+    """The writes that take the compensator from one level to the next.
+
+    Both moving controls advance together, in equal decibel steps of at most
+    ``LOUDNESS_RAMP_STEP_DB``, so the make-up and the contour never get ahead
+    of each other; the final write is the whole target, so nothing is left to
+    rounding. A change too large for the write limit takes bigger steps
+    rather than longer: it is a slider being dragged, and must not lag.
+    """
+    moving = ("loudcomp:volume", "limiter:g_in")
+
+    def as_db(name, controls):
+        value = float(controls[name])
+        if name == "limiter:g_in":
+            return 20.0 * math.log10(max(value, 1e-6))
+        return value
+
+    def from_db(name, value):
+        if name == "limiter:g_in":
+            return round(10.0 ** (value / 20.0), 6)
+        return round(value, 3)
+
+    present = [name for name in moving if name in start and name in target]
+    span = max((abs(as_db(name, target) - as_db(name, start)) for name in present), default=0.0)
+    writes = max(1, min(LOUDNESS_RAMP_MAX_WRITES, math.ceil(span / LOUDNESS_RAMP_STEP_DB)))
+    ramp = []
+    for index in range(1, writes):
+        fraction = index / writes
+        ramp.append({
+            name: from_db(name, as_db(name, start) + fraction * (as_db(name, target) - as_db(name, start)))
+            for name in present
+        })
+    ramp.append(dict(target))
+    return ramp
+
+
 def np_free_clip(value, low, high):
     """A clamp that costs no import; the fast paths must stay light."""
     return max(low, min(high, value))

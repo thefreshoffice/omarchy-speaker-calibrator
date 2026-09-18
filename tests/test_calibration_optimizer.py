@@ -2067,5 +2067,116 @@ class RecorderCleanupTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 143)
 
 
+
+def load_tracker():
+    path = Path(speaker_calibrate.__file__).parent / "loudness-tracker.py"
+    spec = importlib.util.spec_from_file_location("loudness_tracker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class LoudnessRampTests(unittest.TestCase):
+    """A volume change reaches the graph as a short ramp, not one jump."""
+
+    def test_a_small_change_is_one_write_of_the_whole_target(self):
+        start = speaker_calibrate.loudness_controls(-20.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(-20.3, True, 1.0)
+        self.assertEqual(speaker_calibrate.loudness_ramp(start, target), [target])
+
+    def test_a_volume_step_is_walked_in_half_decibel_writes(self):
+        # Levels above the compensator's floor, where a step still moves it;
+        # in this range the contour level moves twice as far as the volume.
+        start = speaker_calibrate.loudness_controls(-8.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(-7.25, True, 1.0)
+        ramp = speaker_calibrate.loudness_ramp(start, target)
+        self.assertEqual(len(ramp), 3)
+        self.assertEqual(ramp[-1], target)
+        for write in ramp[:-1]:
+            self.assertEqual(set(write), {"loudcomp:volume", "limiter:g_in"})
+        volumes = [start["loudcomp:volume"]] + [w["loudcomp:volume"] for w in ramp]
+        gains = [start["limiter:g_in"]] + [w["limiter:g_in"] for w in ramp]
+        for before, after in zip(volumes, volumes[1:]):
+            self.assertAlmostEqual(after - before, 0.5, places=2)
+        # The make-up walks in decibels too, so the two never drift apart.
+        for before, after in zip(gains, gains[1:]):
+            self.assertAlmostEqual(20 * np.log10(after / before), 20 * np.log10(target["limiter:g_in"] / start["limiter:g_in"]) / 3, places=3)
+
+    def test_a_large_jump_takes_bigger_steps_instead_of_lagging(self):
+        start = speaker_calibrate.loudness_controls(-15.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(0.0, True, 1.0)
+        ramp = speaker_calibrate.loudness_ramp(start, target)
+        self.assertEqual(len(ramp), speaker_calibrate.LOUDNESS_RAMP_MAX_WRITES)
+        self.assertEqual(ramp[-1], target)
+
+
+class FakeTrackerHelper:
+    """The slice of the helper the tracker touches, with writes recorded."""
+
+    def __init__(self):
+        self.writes = []
+        self.loudness_controls = speaker_calibrate.loudness_controls
+        self.loudness_ramp = speaker_calibrate.loudness_ramp
+
+    def tuning_node_id(self):
+        return 7
+
+    def write_controls(self, node, controls):
+        self.writes.append((node, dict(controls)))
+        return True
+
+
+class TrackerRampTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_tracker()
+        self.helper = FakeTrackerHelper()
+        self.tracker = self.module.Tracker(self.helper)
+        self.tracker.node = 7
+        self.tracker.input_gain = 1.0
+
+    def test_the_first_level_is_applied_in_one_write(self):
+        with mock.patch.object(self.module.time, "sleep"):
+            self.assertTrue(self.tracker.apply(-20.0))
+        self.assertEqual(len(self.helper.writes), 1)
+        self.assertEqual(self.tracker.applied_db, -20.0)
+
+    def test_a_later_level_is_ramped_from_the_applied_one(self):
+        self.tracker.applied_db = -8.0
+        with mock.patch.object(self.module.time, "sleep") as sleep:
+            self.assertTrue(self.tracker.apply(-6.5))
+        expected = speaker_calibrate.loudness_ramp(
+            speaker_calibrate.loudness_controls(-8.0, True, 1.0),
+            speaker_calibrate.loudness_controls(-6.5, True, 1.0))
+        self.assertGreater(len(expected), 1)
+        self.assertEqual([w for _, w in self.helper.writes], expected)
+        self.assertEqual(sleep.call_count, len(expected) - 1)
+        self.assertEqual(self.tracker.applied_db, -6.5)
+
+    def test_switching_off_is_immediate(self):
+        self.tracker.applied_db = -20.0
+        with mock.patch.object(self.module.time, "sleep"):
+            self.assertTrue(self.tracker.apply(0.0, enabled=False))
+        self.assertEqual(len(self.helper.writes), 1)
+        self.assertIsNone(self.tracker.applied_db)
+
+    def test_a_burst_of_volume_events_is_applied_once(self):
+        import os
+        read_end, write_end = os.pipe()
+        os.write(write_end, b"Event 'change' on sink #59\n" * 5)
+        os.close(write_end)
+
+        class FakeSubscription:
+            stdout = os.fdopen(read_end, "rb", buffering=0)
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+            def kill(self): pass
+
+        followed = []
+        self.tracker.follow_volume = lambda: followed.append(True) or True
+        with mock.patch.object(self.module.subprocess, "Popen", return_value=FakeSubscription()):
+            self.assertFalse(self.tracker.watch())  # the subscription ended
+        self.assertEqual(followed, [True])
+
+
 if __name__ == "__main__":
     unittest.main()
