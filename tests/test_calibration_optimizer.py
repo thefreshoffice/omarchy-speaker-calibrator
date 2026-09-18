@@ -368,8 +368,8 @@ class CalibrationOptimizerTests(unittest.TestCase):
         # Per channel: two high-passes, three shelves, the parametric slots,
         # and the balance trim's two controls; plus the limiter's input gain
         # and the compensator's six, which are not per channel.
-        # ... plus the deep-bass path: three corners and one gain per channel.
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6 + 8)
+        # ... plus the deep-bass path: three corners, a gain and its offset per channel.
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6 + 10)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Add"], 0.0)
@@ -753,6 +753,7 @@ class RawMeasurementTests(unittest.TestCase):
         running = {
             "hp1_l:Freq": 195.8, "p1_l:Gain": -7.0, "limiter:g_in": 1.66,
             "hb_out_l:Mult": 2.830895, "hb_out_r:Mult": 2.830895, "hb_lp_l:Freq": 195.8,
+            "hb_out_l:Add": -1.415448, "hb_out_r:Add": -1.415448,
             "loudcomp:enabled": 0.0,
         }
         applied = []
@@ -772,7 +773,8 @@ class RawMeasurementTests(unittest.TestCase):
         # Only the deep-bass gain is touched: the filters under test stay as they are.
         self.assertNotIn("p1_l:Gain", applied[0])
         self.assertNotIn("limiter:g_in", applied[0])
-        self.assertEqual(applied[1], {"hb_out_l:Mult": 2.830895, "hb_out_r:Mult": 2.830895})
+        self.assertEqual(applied[1], {"hb_out_l:Mult": 2.830895, "hb_out_r:Mult": 2.830895,
+                                      "hb_out_l:Add": -1.415448, "hb_out_r:Add": -1.415448})
 
     def test_nothing_is_muted_when_nothing_is_inventing_sound(self):
         module = speaker_calibrate
@@ -784,7 +786,8 @@ class RawMeasurementTests(unittest.TestCase):
             module.service_active = lambda: True
             module.tuning_node_id = lambda: 7
             module.live_controls = lambda node_id: {
-                "hb_out_l:Mult": 0.0, "hb_out_r:Mult": 0.0, "loudcomp:enabled": 0.0,
+                "hb_out_l:Mult": 0.0, "hb_out_r:Mult": 0.0,
+                "hb_out_l:Add": 0.0, "hb_out_r:Add": 0.0, "loudcomp:enabled": 0.0,
             }
             module.apply_controls_live = lambda controls: touched.append(controls) or True
             with module.added_sound_silenced() as muted:
@@ -1798,15 +1801,21 @@ class VendorTuningTests(SharedCalibrationTests):
                        '{ output = "hb_mix_l:Out" input = "s0_l:In" }', "own recipe, in built-in nodes"):
             self.assertIn(needle, chain, needle)
         scale = speaker_calibrate.HARMONIC_SCALE * speaker_calibrate.HARMONIC_AMOUNT
-        self.assertIn(f'"Mult" = {2 * scale:.6f} "Add" = 0', chain)
+        self.assertIn(f'"Mult" = {2 * scale:.6f} "Add" = {-scale:.6f}', chain)
         # No negative multiplier anywhere: PipeWire's linear node drops the sign.
         for line in chain.splitlines():
             if "label = linear" in line:
                 self.assertNotIn('"Mult" = -', line, line)
-        # The node chain's arithmetic is a tanh plus a constant: 2 s - 1 == tanh(u).
+        # The node chain's arithmetic is a tanh with no constant left over: the
+        # last stage computes 2 s - 1 == tanh(u), so silence in is silence out
+        # and a graph that starts from zero state has nothing to step through.
         u = np.linspace(-17.0, 17.0, 2001)
         s = np.exp(-np.log(1.0 + np.exp(-2.0 * u)))
         self.assertLess(float(np.max(np.abs(2.0 * s - 1.0 - np.tanh(u)))), 1e-6)
+        controls = speaker_calibrate.harmonic_controls(190.0, True)
+        self.assertAlmostEqual(controls["hb_out_l:Add"], -0.5 * controls["hb_out_l:Mult"], places=5)
+        off = speaker_calibrate.harmonic_controls(190.0, False)
+        self.assertEqual((off["hb_out_l:Mult"], off["hb_out_l:Add"]), (0.0, 0.0))
         tuning = (Path(result["directory"]) / "tuning.conf").read_text()
         self.assertIn("Deep bass is included", tuning)
 

@@ -745,6 +745,11 @@ def harmonic_controls(corner_hz, deep_bass):
         controls[f"hb_fh_{side}:Freq"] = h["final_hp_hz"]
         controls[f"hb_fl_{side}:Freq"] = round(3.0 * h["ceil_hz"], 3)
         controls[f"hb_out_{side}:Mult"] = round(mult, 6)
+        # The stage before this one is a sigmoid, so the output carries half the
+        # multiplier as a constant. Subtract it here rather than leaving it to
+        # the high-pass: that filter starts from zero whenever the graph starts
+        # or resumes, and the constant then steps through it as a loud thump.
+        controls[f"hb_out_{side}:Add"] = round(-0.5 * mult, 6)
     return controls
 
 
@@ -770,7 +775,7 @@ def harmonic_nodes(side, settings, mult):
         ("hb_p1", "linear", '"Mult" = 1 "Add" = 1'),
         ("hb_ln", "log", f'"Base" = {NATURAL_BASE:.9f} "M1" = 1 "M2" = 1'),
         ("hb_e2", "exp", f'"Base" = {INVERSE_BASE:.9f}'),
-        ("hb_out", "linear", f'"Mult" = {float(mult):.6f} "Add" = 0'),
+        ("hb_out", "linear", f'"Mult" = {float(mult):.6f} "Add" = {-0.5 * float(mult):.6f}'),
         ("hb_fh", "bq_highpass", f'"Freq" = {_plain(h["final_hp_hz"])} "Q" = 0.707'),
         ("hb_fl", "bq_lowpass", f'"Freq" = {_plain(3.0 * h["ceil_hz"])} "Q" = 0.707'),
         ("hb_mix", "mixer", '"Gain 1" = 1 "Gain 2" = 1'),
@@ -1176,8 +1181,8 @@ def added_sound_silenced():
     running, quiet = {}, {}
 
     harmonics = {name: value for name, value in live.items()
-                 if name.startswith("hb_out_") and name.endswith(":Mult")}
-    if any(float(value) > 0.0 for value in harmonics.values()):
+                 if name.startswith("hb_out_")}
+    if any(name.endswith(":Mult") and float(value) > 0.0 for name, value in harmonics.items()):
         running.update(harmonics)
         quiet.update({name: 0.0 for name in harmonics})
 
