@@ -1223,6 +1223,65 @@ def activate_profile(profile):
     return "restart"
 
 
+_AGC_CONTROL_NAME = re.compile(r"Capture.*DRC switch$")
+
+
+def _sound_card_indices():
+    return sorted(
+        int(match.group(1))
+        for entry in Path("/proc/asound").glob("card*")
+        for match in [re.match(r"card(\d+)$", entry.name)]
+        if entry.is_dir() and match
+    )
+
+
+def _amixer_control_names(card_index):
+    proc = run(["amixer", "-c", str(card_index), "controls"], check=False, capture=True)
+    if proc.returncode != 0:
+        return []
+    return re.findall(r"name='([^']+)'", proc.stdout)
+
+
+def _amixer_get_bool(card_index, name):
+    proc = run(["amixer", "-c", str(card_index), "cget", f"name={name}"],
+               check=False, capture=True)
+    match = re.search(r"values=(on|off)", proc.stdout) if proc.returncode == 0 else None
+    return match.group(1) if match else None
+
+
+def _amixer_set_bool(card_index, name, value):
+    run(["amixer", "-c", str(card_index), "cset", f"name={name}", value],
+        check=False, capture=True)
+
+
+@contextlib.contextmanager
+def microphone_agc_suspended():
+    """Turn off any hardware capture-side compressor while a probe records.
+
+    A mic's automatic gain control (exposed on some codecs as a "Capture DRC
+    switch") pushes quiet input up and loud input down so a call sounds
+    steady regardless of distance from the mic. That is exactly what breaks
+    a level probe: the probe plays several volumes on purpose and expects
+    the recording to track them, and a compressor flattens that on purpose.
+    Every match found "on" is turned off for the probe and put back after,
+    whether the probe passed or not, so normal mic behavior is unaffected
+    outside of measurement.
+    """
+    found = []
+    for card_index in _sound_card_indices():
+        for name in _amixer_control_names(card_index):
+            if _AGC_CONTROL_NAME.search(name) and _amixer_get_bool(card_index, name) == "on":
+                found.append((card_index, name))
+
+    for card_index, name in found:
+        _amixer_set_bool(card_index, name, "off")
+    try:
+        yield bool(found)
+    finally:
+        for card_index, name in found:
+            _amixer_set_bool(card_index, name, "on")
+
+
 @contextlib.contextmanager
 def added_sound_silenced():
     """Mute everything that invents sound while the filters are measured.
@@ -1950,9 +2009,10 @@ def calibrate_noninteractive(
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
     try:
-        return build_profile(
-            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
-        )
+        with microphone_agc_suspended():
+            return build_profile(
+                sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
+            )
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
@@ -2100,7 +2160,7 @@ def verify_calibration():
     calibration_file = mic.get("calibration_file")
     # The one measurement that is deliberately made through the correction,
     # but never through the add-on that invents frequencies.
-    with added_sound_silenced() as muted:
+    with added_sound_silenced() as muted, microphone_agc_suspended():
         measurement = capture_measurement(
             VIRTUAL_SINK, mic["name"], channel, calibration_file,
             # The level default belongs to the real speakers behind the filter.
