@@ -44,7 +44,7 @@ Item {
     // Keep mise/user-site packages from shadowing Arch's matched NumPy/SciPy
     // pair.  -s disables only the user site; /usr/lib Python packages remain.
     process.command = ["/usr/bin/env", "-u", "PYTHONHOME", "-u", "PYTHONPATH",
-                       "/usr/bin/python3", "-s", helperPath].concat(arguments)
+                       "/usr/bin/python3", "-B", "-s", helperPath].concat(arguments)
     process.running = true
   }
 
