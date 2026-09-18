@@ -299,7 +299,7 @@ PartOf=omarchy-speaker-tuning.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -s {tracker}
+ExecStart=/usr/bin/python3 -B -s {tracker}
 Restart=on-failure
 RestartSec=2
 
