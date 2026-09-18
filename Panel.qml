@@ -2148,6 +2148,7 @@ Panel {
                 value: (service.status.deepBass === "on" ? "on" : "off")
                   + "; built into the chain: what lies below the high-pass corner is saturated and its "
                   + "harmonics between the corner and three times it are added back ahead of the EQ"
+              }
             }
           }
         }
