@@ -117,6 +117,17 @@ speakers is mostly the bass. Clock drift between playback and recording is
 estimated and corrected. Clipping, sweep prominence, alignment, repeatability,
 microphone gain stability and harmonic residuals are all checked.
 
+A capture-side compressor defeats that last check on purpose: some codecs
+expose one as a "Capture DRC switch," and it pushes quiet input up and loud
+input down so a call sounds steady regardless of distance from the mic,
+which is exactly what a level probe cannot tolerate since it plays several
+volumes and expects the recording to track them. Any such control found on
+is turned off for the probe and restored right after, pass or fail, so
+normal microphone behavior outside of measurement is untouched. Not every
+codec exposes this as a named ALSA control, so a probe can still fail this
+check on hardware this does not recognise; the on-screen guidance for that
+failure still applies.
+
 When a built-in microphone array offers two or more channels, every channel is
 analyzed independently and their raw recordings are never mixed. The responses
 are combined with a robust median, and disagreement between microphones is
