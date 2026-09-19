@@ -1934,12 +1934,38 @@ def parse_channel_selection(value):
         raise SystemExit("Microphone channel must be a zero-based number or 'all'.") from error
 
 
+# The level search's way of saying the microphone heard nothing at all.  A
+# jack microphone with nothing plugged in, or a capture path muted below
+# PipeWire, fails exactly like this, and on machines with several internal
+# capture devices the panel cannot know which of them is live until a probe
+# is played.  Matched on a phrase, not the whole sentence, so a wording tweak
+# in calibration_dsp does not silently disable the fallback.
+NO_SIGNAL_PHRASE = "did not pick up the level probe"
+
+
+def channel_for_microphone(channel, mic):
+    """The channel selection applied to a specific microphone, or None.
+
+    The panel validates against the microphone it offered, but the fallback
+    below may continue on a different one: 'all' only makes sense on a
+    built-in array, and a channel number past the device's count means the
+    first channel.
+    """
+    channels = channel_count(mic)
+    if channel == "all":
+        return "all" if mic["name"].startswith("alsa_input.pci-") else None
+    if 0 <= channel < channels:
+        return channel
+    return 0
+
+
 def calibrate_noninteractive(
     sink_name, mic_name, channel, voicing, mic_cal_file=None, loudness="protected",
     bass="normal", channel_trim="off",
 ):
     sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
-    mic = next((item for item in microphones() if item["name"] == mic_name), None)
+    available = microphones()
+    mic = next((item for item in available if item["name"] == mic_name), None)
     if sink is None or mic is None:
         raise SystemExit("Selected audio device is no longer available.")
     channel = parse_channel_selection(channel)
@@ -1949,12 +1975,43 @@ def calibrate_noninteractive(
         raise SystemExit("All-channel mode is available only for built-in microphone arrays.")
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
-    try:
-        return build_profile(
-            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
-        )
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+    # A selected microphone that hears nothing is not always a silent room:
+    # on machines with several capture devices one of them is often a jack
+    # with nothing plugged in, and only playing a probe can tell.  Rather
+    # than failing the whole measurement on that guess, fall through the
+    # remaining microphones and let the first live one answer.
+    candidates = [mic] + [item for item in available if item["name"] != mic_name]
+    deaf = []
+    for candidate in candidates:
+        resolved = channel if candidate is mic else channel_for_microphone(channel, candidate)
+        if resolved is None:
+            continue
+        try:
+            profile = build_profile(
+                sink, candidate, resolved, voicing,
+                # A microphone calibration file describes one microphone, so
+                # it does not follow the measurement to a different one.
+                mic_cal_file if candidate is mic else None,
+                loudness, bass, channel_trim,
+            )
+        except ValueError as error:
+            if NO_SIGNAL_PHRASE in str(error):
+                deaf.append(label(candidate))
+                continue
+            raise SystemExit(str(error)) from error
+        if candidate is not mic:
+            profile["microphone_fallback"] = {
+                "requested": mic_name,
+                "used": candidate["name"],
+                "reason": "no-signal",
+            }
+        return profile
+    raise SystemExit(
+        "The microphone did not pick up the level probe even at the loudest "
+        "allowed sweep level. None of the available microphones heard it ("
+        + ", ".join(deaf) + "). Check that the selected speaker is unmuted "
+        "and raise the hardware volume, then measure again."
+    )
 
 
 def install_proposal():
