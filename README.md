@@ -24,6 +24,12 @@ package list, so it is already there. Measuring additionally needs
 notices they are absent and installs them in one press, again from Omarchy's
 own packages rather than the AUR. Nothing here needs a terminal.
 
+### MacBook10,1 audio setup
+
+On the 12-inch MacBook (2017), the stock audio driver can list the speakers and
+microphone while routing them incorrectly. See the [tested internal-audio
+setup](docs/macbook10-internal-audio.md) before calibrating this model.
+
 ## Using it
 
 1. **Click the speaker icon** in the bar.
