@@ -547,6 +547,33 @@ def sink_volume_db(name):
     return parse_sink_volume_db(result.stdout)
 
 
+def parse_source_volume_fraction(text):
+    """The loudest channel's capture volume as a fraction of full scale.
+
+    Same layout as the sink reading ("front-left: 65536 / 100% / 0.00 dB"),
+    and the percentage is the form set-source-volume takes back.
+    """
+    percents = [
+        float(value[:-1])
+        for value in text.split()
+        if value.endswith("%") and _is_number(value[:-1])
+    ]
+    return max(percents) / 100.0 if percents else None
+
+
+def source_volume_fraction(name):
+    """The capture device's volume as a fraction, None when it cannot be read."""
+    result = run(["pactl", "get-source-volume", name], check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    return parse_source_volume_fraction(result.stdout)
+
+
+def set_source_volume_fraction(name, fraction):
+    percent = max(0, min(100, round(fraction * 100)))
+    run(["pactl", "set-source-volume", name, f"{percent}%"], check=False, capture=True)
+
+
 def is_physical_sink(name):
     """True for a real output device, never the calibrated sink in front of one."""
     return str(name).startswith("alsa_output.") and str(name) != VIRTUAL_SINK
@@ -1546,6 +1573,14 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
     return search
 
 
+# Matched on a phrase from the level search's background advice rather than
+# the whole sentence, so a wording tweak in calibration_dsp does not
+# silently disable the trim.  The gain steps multiply the user's own
+# setting, so the microphone is never raised past where they left it.
+BACKGROUND_TOO_LOUD_PHRASE = "too loud for a measurement"
+MIC_GAIN_STEPS = (1.0, 0.5, 0.25, 0.12)
+
+
 def capture_measurement(
     sink_name, mic_name, channel, mic_cal_file=None, *,
     level_sink=None, sweeps=None, recording=None,
@@ -1561,42 +1596,73 @@ def capture_measurement(
         (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
     )
     secure_directory(DATA, repair_contents=True)
-    level_search = find_measurement_level(
-        sink_name, mic_name, channel, channels, level_sink=level_sink
-    )
-    sweeps = sweeps or DATA / "calibration-sweeps.wav"
-    recording = recording or DATA / "measurement.wav"
-    calibration = parse_mic_calibration(mic_cal_file)
-    level = level_search["selected_level_dbfs"]
-    # The probe is a fraction of the length of the real sweep, so a resonance
-    # has less time to ring up during it.  If the full capture clips anyway,
-    # one quieter retry costs less than a rejected measurement.
-    for attempt in range(2):
-        measurement_spec = SweepSpec(level_dbfs=level)
-        program, schedule = build_measurement_signal(measurement_spec)
-        write_pcm16_wave(sweeps, program, RATE)
-        record_while_playing(
-            sink_name, mic_name, channels, sweeps, recording, RECORD_LEAD_SECONDS, 0.75
-        )
-        measurement = analyze_recording(
-            recording,
-            channel,
-            schedule,
-            measurement_spec,
-            internal_mic=mic_name.startswith("alsa_input.pci-"),
-            calibration=calibration,
-        )
-        metrics = measurement["quality"]["metrics"]
-        if metrics["clipped_samples"] == 0 or attempt == 1:
+    # The background-noise gate is absolute: room sound past -30 dBFS RMS
+    # refuses the measurement, however quiet the room actually is.  Sensitive
+    # digital microphone arrays trip it in ordinary rooms, and the only cure
+    # is less capture gain — which the user should never have to apply by
+    # hand for a thirty-second measurement.  Trim the microphone's own
+    # volume in steps until the probe passes, and always put it back.  The
+    # microphone is never muted, only turned down, and never past where the
+    # user left it.
+    saved_gain = source_volume_fraction(mic_name)
+    try:
+        level_search = None
+        last_error = None
+        for gain_step in MIC_GAIN_STEPS:
+            if saved_gain is not None:
+                set_source_volume_fraction(mic_name, saved_gain * gain_step)
+            try:
+                level_search = find_measurement_level(
+                    sink_name, mic_name, channel, channels, level_sink=level_sink
+                )
+            except ValueError as error:
+                last_error = error
+                if BACKGROUND_TOO_LOUD_PHRASE not in str(error):
+                    raise
+                continue
+            if gain_step != 1.0:
+                level_search["microphone_gain_fraction"] = round(
+                    saved_gain * gain_step, 3
+                )
             break
-        retry = level_after_clipping(
-            level, metrics["maximum_accepted_peak_dbfs"], level_search["level_bounds_dbfs"][0]
-        )
-        if retry >= level:
-            break
-        level_search = dict(level_search, selected_level_dbfs=round(retry, 2),
-                            status="retried-after-clipping", confirmed=False)
-        level = retry
+        if level_search is None:
+            raise last_error
+        sweeps = sweeps or DATA / "calibration-sweeps.wav"
+        recording = recording or DATA / "measurement.wav"
+        calibration = parse_mic_calibration(mic_cal_file)
+        level = level_search["selected_level_dbfs"]
+        # The probe is a fraction of the length of the real sweep, so a resonance
+        # has less time to ring up during it.  If the full capture clips anyway,
+        # one quieter retry costs less than a rejected measurement.
+        for attempt in range(2):
+            measurement_spec = SweepSpec(level_dbfs=level)
+            program, schedule = build_measurement_signal(measurement_spec)
+            write_pcm16_wave(sweeps, program, RATE)
+            record_while_playing(
+                sink_name, mic_name, channels, sweeps, recording, RECORD_LEAD_SECONDS, 0.75
+            )
+            measurement = analyze_recording(
+                recording,
+                channel,
+                schedule,
+                measurement_spec,
+                internal_mic=mic_name.startswith("alsa_input.pci-"),
+                calibration=calibration,
+            )
+            metrics = measurement["quality"]["metrics"]
+            if metrics["clipped_samples"] == 0 or attempt == 1:
+                break
+            retry = level_after_clipping(
+                level, metrics["maximum_accepted_peak_dbfs"], level_search["level_bounds_dbfs"][0]
+            )
+            if retry >= level:
+                break
+            level_search = dict(level_search, selected_level_dbfs=round(retry, 2),
+                                status="retried-after-clipping", confirmed=False)
+            level = retry
+    finally:
+        if saved_gain is not None:
+            set_source_volume_fraction(mic_name, saved_gain)
     attach_level_search(measurement, level_search)
     return measurement
 
