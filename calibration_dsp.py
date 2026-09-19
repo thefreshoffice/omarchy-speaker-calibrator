@@ -1233,13 +1233,18 @@ def analyse_level_probe(
     rate: int,
     *,
     background_seconds: float = 0.3,
+    settle_seconds: float = 0.1,
     block_seconds: float = 0.05,
 ) -> dict:
     """Summarize a short level-probe recording without relying on timing.
 
     The recorder starts ``background_seconds`` or more before the probe plays,
     so the opening of the recording is room sound alone and is reported as
-    background.  Everything after it is the probe region.  Noise and
+    background.  Everything after it is the probe region.  The first
+    ``settle_seconds`` are left out of the background: a capture stream that
+    wakes from suspend opens with a pop from the DSP or DMIC pipeline lasting
+    a few tens of milliseconds and sitting 20 dB or more above the room, and
+    that pop would otherwise fail a quiet room as too loud.  Noise and
     prominence come from short RMS blocks, so a late recorder start or an
     early stop cannot masquerade as a quiet speaker.
 
@@ -1268,8 +1273,9 @@ def analyse_level_probe(
     block_peak = np.max(np.abs(blocks), axis=1)
     count = blocks.shape[0]
     background_blocks = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
-    background_rms = np.sqrt(np.mean(block_rms[:background_blocks] ** 2, axis=0))
-    background_peak = np.max(block_peak[:background_blocks], axis=0)
+    settle_blocks = int(np.clip(round(settle_seconds * rate / block), 0, background_blocks - 1))
+    background_rms = np.sqrt(np.mean(block_rms[settle_blocks:background_blocks] ** 2, axis=0))
+    background_peak = np.max(block_peak[settle_blocks:background_blocks], axis=0)
 
     region_rms = block_rms[background_blocks:]
     region_peak = block_peak[background_blocks:]

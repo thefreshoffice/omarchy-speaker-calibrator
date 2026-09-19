@@ -410,6 +410,21 @@ class LevelSearchTests(unittest.TestCase):
         probe = analyse_level_probe(self.probe_capture(0.3, background=0.05), self.rate)
         self.assertAlmostEqual(probe["background_rms_dbfs"], -26.0, delta=1.0)
 
+    def test_probe_ignores_the_stream_start_pop_in_the_background(self):
+        """A capture stream waking from suspend opens with a short pop.
+
+        Measured on a SoundWire DMIC array: about 30 ms at -12 dBFS, then a
+        -34 dBFS room.  Averaged into a 0.3 s window it reads as -25 dBFS,
+        which is louder than the room ever was.
+        """
+        capture = self.probe_capture(0.3, background=0.02)
+        rng = np.random.default_rng(11)
+        pop = slice(int(0.01 * self.rate), int(0.04 * self.rate))
+        capture[pop, 0] += rng.normal(0.0, 0.25, pop.stop - pop.start)
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertAlmostEqual(probe["background_rms_dbfs"], -34.0, delta=1.0)
+        self.assertLess(probe["background_peak_dbfs"], -20.0)
+
     def test_silence_has_no_prominence(self):
         probe = analyse_level_probe(self.probe_capture(0.0), self.rate)
         self.assertLess(probe["prominence_db"], 3.0)
