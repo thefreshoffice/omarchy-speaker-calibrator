@@ -32,6 +32,11 @@ Panel {
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
   property int micIndex: -1
+  // The devices picked by hand, by name.  A row index means nothing once the
+  // list is fetched again, and it is fetched every time the panel opens.
+  property string chosenSink: ""
+  property string chosenMic: ""
+  property int chosenChannel: 0
 
   function open() {
     root.controller.show()
@@ -79,16 +84,41 @@ Panel {
     var mic = service.microphones[root.micIndex]
     return mic ? mic.internal === true : true
   }
-  // Zero-knowledge default: the laptop's own speakers and microphones.
-  function selectInternalDevices() {
-    var sink = -1
-    for (var sinkIndex = 0; sinkIndex < service.sinks.length; sinkIndex++)
-      if (service.sinks[sinkIndex].internal === true) { sink = sinkIndex; break }
-    root.sinkIndex = sink >= 0 ? sink : (service.sinks.length > 0 ? 0 : -1)
-    var mic = -1
-    for (var micIndex = 0; micIndex < service.microphones.length; micIndex++)
-      if (service.microphones[micIndex].internal === true) { mic = micIndex; break }
-    root.micIndex = mic >= 0 ? mic : (service.microphones.length > 0 ? 0 : -1)
+  function deviceIndex(list, name) {
+    if (!name) return -1
+    for (var index = 0; index < list.length; index++)
+      if (list[index].name === name) return index
+    return -1
+  }
+  function firstInternal(list) {
+    for (var index = 0; index < list.length; index++)
+      if (list[index].internal === true) return index
+    return list.length > 0 ? 0 : -1
+  }
+  // Which rows are selected, decided afresh whenever the lists or the status
+  // arrive: the device picked by hand while it is connected, else the one the
+  // calibration in use was made with, else the laptop's own.  Re-selecting
+  // the built-in devices on every refresh forgot the choice each time the
+  // panel was opened.
+  function selectDevices() {
+    var profile = service.status.profile || {}
+    var sink = deviceIndex(service.sinks, root.chosenSink)
+    if (sink < 0) sink = deviceIndex(service.sinks, (profile.speaker || {}).name)
+    if (sink < 0) sink = firstInternal(service.sinks)
+    root.sinkIndex = sink
+    var mic = deviceIndex(service.microphones, root.chosenMic)
+    if (mic < 0) mic = deviceIndex(service.microphones, (profile.microphone || {}).name)
+    if (mic < 0) mic = firstInternal(service.microphones)
+    var before = root.micIndex >= 0 && service.microphones[root.micIndex]
+      ? service.microphones[root.micIndex].name : ""
+    var after = mic >= 0 ? service.microphones[mic].name : ""
+    root.micIndex = mic
+    // A different microphone has different channels; the same one keeps its
+    // channel, which the refreshed list would otherwise reset.
+    if (before !== "" && before !== after) root.chosenChannel = 0
+    Qt.callLater(function () {
+      channelBox.currentIndex = Math.max(0, Math.min(root.chosenChannel, channelBox.count - 1))
+    })
   }
 
   // ---- options -------------------------------------------------------------
@@ -920,14 +950,16 @@ Panel {
         root.adoptOptions(service.status.profile)
         root._optionsAdopted = true
       }
+      // The calibration's own devices are a default only once it is known.
+      root.selectDevices()
       eqCanvas.requestPaint()
       microphoneCanvas.requestPaint()
     }
     // New curves land in a canvas that is already showing, and a canvas in a
     // window that was closed and opened again comes back empty: paint on both.
     function onMicComparisonChanged() { microphoneCanvas.requestPaint() }
-    function onSinksChanged() { root.selectInternalDevices() }
-    function onMicrophonesChanged() { root.selectInternalDevices(); channelBox.currentIndex = 0 }
+    function onSinksChanged() { root.selectDevices() }
+    function onMicrophonesChanged() { root.selectDevices() }
     function onProposalChanged() { responseCanvas.requestPaint() }
   }
 
@@ -1308,7 +1340,7 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
-                onClicked: root.sinkIndex = index
+                onClicked: { root.sinkIndex = index; root.chosenSink = modelData.name }
               }
             }
             Text {
@@ -1366,7 +1398,12 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !service.busy
-                  onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                  onClicked: {
+                    root.micIndex = index
+                    root.chosenMic = modelData.name
+                    root.chosenChannel = 0
+                    channelBox.currentIndex = 0
+                  }
                 }
 
                 // Flush with every other line in the section, so the panel
@@ -1537,6 +1574,7 @@ Panel {
                 Layout.fillWidth: true
                 model: root.channelOptions()
                 enabled: !service.busy
+                onActivated: root.chosenChannel = currentIndex
               }
 
               Text {

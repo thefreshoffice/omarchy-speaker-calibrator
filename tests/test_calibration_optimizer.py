@@ -2234,5 +2234,37 @@ class MicrophoneArchiveIdentityTests(unittest.TestCase):
         self.assertIn("record.warnings", note)
 
 
+
+class DeviceSelectionTests(unittest.TestCase):
+    """The panel must not forget a hand-picked device when its lists refresh."""
+
+    def setUp(self):
+        self.source = (Path(speaker_calibrate.__file__).parent / "Panel.qml").read_text()
+        start = self.source.index("function selectDevices()")
+        self.select = self.source[start:self.source.index("\n  }\n", start)]
+
+    def test_a_refresh_no_longer_reselects_the_built_in_devices(self):
+        self.assertNotIn("selectInternalDevices", self.source)
+        self.assertIn("function onMicrophonesChanged() { root.selectDevices() }", self.source)
+        self.assertIn("function onSinksChanged() { root.selectDevices() }", self.source)
+
+    def test_the_order_is_hand_pick_then_the_calibration_then_built_in(self):
+        chosen = self.select.index("deviceIndex(service.microphones, root.chosenMic)")
+        calibrated = self.select.index("(profile.microphone || {}).name")
+        builtin = self.select.index("firstInternal(service.microphones)")
+        self.assertLess(chosen, calibrated)
+        self.assertLess(calibrated, builtin)
+        chosen = self.select.index("deviceIndex(service.sinks, root.chosenSink)")
+        calibrated = self.select.index("(profile.speaker || {}).name")
+        builtin = self.select.index("firstInternal(service.sinks)")
+        self.assertLess(chosen, calibrated)
+        self.assertLess(calibrated, builtin)
+
+    def test_a_click_is_remembered_by_name(self):
+        self.assertIn("root.chosenMic = modelData.name", self.source)
+        self.assertIn("root.chosenSink = modelData.name", self.source)
+        self.assertIn("onActivated: root.chosenChannel = currentIndex", self.source)
+
+
 if __name__ == "__main__":
     unittest.main()

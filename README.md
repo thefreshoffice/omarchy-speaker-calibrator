@@ -28,7 +28,9 @@ own packages rather than the AUR. Nothing here needs a terminal.
 
 1. **Click the speaker icon** in the bar.
 2. **Press Calibrate speakers.** Your built-in speakers and microphones are
-   already selected.
+   already selected. Pick another microphone and the panel keeps that choice;
+   once a calibration is installed it starts from the devices that one was
+   made with, whenever they are connected.
 3. **Be quiet for about thirty seconds.** You will hear six sweeps: three per
    speaker.
 4. **Listen, then decide.** If the measurement passes its quality checks it
