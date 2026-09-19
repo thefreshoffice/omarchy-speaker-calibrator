@@ -1383,6 +1383,41 @@ class MicrophoneCandidateTests(unittest.TestCase):
         self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.80_C3_BA_81_E7_90.1"))
         self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
 
+    def test_asahi_devices_default_to_protected_speakers_and_internal_array(self):
+        devices = {
+            "sinks": [
+                {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+                {"name": "audio_effect.j413-convolver", "sample_specification": "float32le 2ch 48000Hz"},
+                {"name": "alsa_output.platform-sound.RawSpeakers"},
+                {"name": "audio_effect.unrelated"},
+                {"name": "omarchy_speaker_tuning"},
+            ],
+            "sources": [
+                {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"},
+                {"name": "alsa_input.platform-sound.HiFi__Headset__source"},
+                {"name": "omarchy_speaker_tuning.monitor"},
+            ],
+        }
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=devices.__getitem__):
+            payload = speaker_calibrate.devices_payload()
+        self.assertEqual([d["name"] for d in payload["sinks"]], [
+            "alsa_output.platform-sound.HiFi__Headphones__sink", "audio_effect.j413-convolver",
+        ])
+        self.assertEqual([d["internal"] for d in payload["sinks"]], [False, True])
+        self.assertEqual([(d["internal"], d["channels"]) for d in payload["microphones"]], [
+            (True, 3), (False, 1),
+        ])
+
+    def test_asahi_array_can_measure_all_channels(self):
+        sink = {"name": "audio_effect.j413-convolver"}
+        mic = {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"}
+        with mock.patch.object(speaker_calibrate, "physical_sinks", return_value=[sink]), \
+             mock.patch.object(speaker_calibrate, "microphones", return_value=[mic]), \
+             mock.patch.object(speaker_calibrate, "build_profile", return_value={"measured": True}) as measure:
+            result = speaker_calibrate.calibrate_noninteractive(sink["name"], mic["name"], "all", "neutral")
+        self.assertEqual(result, {"measured": True})
+        measure.assert_called_once_with(sink, mic, "all", "neutral", None, "protected", "normal", "off")
+
 
 class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""

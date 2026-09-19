@@ -24,6 +24,30 @@ package list, so it is already there. Measuring additionally needs
 notices they are absent and installs them in one press, again from Omarchy's
 own packages rather than the AUR. Nothing here needs a terminal.
 
+### Apple Silicon (Asahi)
+
+asahi-audio plays the speakers through a software DSP and puts the raw
+microphone array behind one of its own. The speaker side is handled by this
+plugin. To calibrate from the built-in array, expose it once:
+
+```bash
+cp /usr/share/wireplumber/wireplumber.conf.d/99-asahi.conf \
+   ~/.config/wireplumber/wireplumber.conf.d/99-asahi.conf
+```
+
+In the copy, find the `node.software-dsp.rules` entry for
+`~hw:AppleJ[0-9][0-9][0-9]HPAI,0`, which is the microphone, and set
+`hide-parent = false`. Leave the speaker entry hidden. Then apply it:
+
+```bash
+systemctl --user restart wireplumber
+```
+
+The array then appears as `alsa_input.platform-sound.RawMics`, and the panel
+offers it as the built-in microphone with one channel per microphone. The copy
+shadows Asahi's packaged file, so repeat the one-line change after an
+asahi-audio update replaces it.
+
 ## Using it
 
 1. **Click the speaker icon** in the bar.

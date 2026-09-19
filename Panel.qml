@@ -1306,10 +1306,9 @@ Panel {
               width: parent.width
               text: (service.status.unusableMicrophones || []).join(", ")
                 + ((service.status.unusableMicrophones || []).length > 1
-                    ? " are connected but cannot measure. A Bluetooth headset microphone is mono, "
-                    : " is connected but cannot measure. A Bluetooth headset microphone is mono, ")
-                + "narrowband, and processed inside the headset, so it describes the headset "
-                + "rather than your speakers."
+                    ? " are not supported as measurement inputs. "
+                    : " is not supported as a measurement input. ")
+                + "Select a raw built-in microphone array or a wired/USB microphone."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

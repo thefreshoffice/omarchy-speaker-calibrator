@@ -549,7 +549,23 @@ def sink_volume_db(name):
 
 def is_physical_sink(name):
     """True for a real output device, never the calibrated sink in front of one."""
-    return str(name).startswith("alsa_output.") and str(name) != VIRTUAL_SINK
+    name = str(name)
+    if name in (VIRTUAL_SINK, "alsa_output.platform-sound.RawSpeakers"):
+        return False
+    # Asahi's DSP sink preserves the hardware-specific speaker protection.
+    return name.startswith("alsa_output.") or is_asahi_speaker(name)
+
+
+def is_asahi_speaker(name):
+    return re.fullmatch(r"audio_effect\.j[0-9]+-convolver", str(name)) is not None
+
+
+def is_internal_speaker(name):
+    return str(name).startswith("alsa_output.pci-") or is_asahi_speaker(name)
+
+
+def is_internal_microphone(name):
+    return str(name).startswith("alsa_input.pci-") or name == "alsa_input.platform-sound.RawMics"
 
 
 def listening_sink(profile=None):
@@ -614,7 +630,7 @@ def devices_payload():
             "description": short_label(label(item)) or label(item),
             "channels": channel_count(item),
             "kind": kind,
-            "internal": name.startswith(("alsa_input.pci-", "alsa_output.pci-")),
+            "internal": is_internal_speaker(name) if kind == "speaker" else is_internal_microphone(name),
         }
     return {
         "sinks": [public(item, "speaker") for item in physical_sinks()],
@@ -1422,9 +1438,13 @@ def compare_toggle():
 
 
 def analyze_recording(
-    recording, channel, schedule, measurement_spec, *, internal_mic, calibration
+    recording, channel, schedule, measurement_spec, *, internal_mic, calibration,
+    full_response=False,
 ):
     load_dsp()
+    # A short direct-sound gate truncates Asahi's FIR speaker response. Retain
+    # that response in both the calibration and its verification measurement.
+    gate_options = {"gate_cycles": None} if full_response else {}
     captures = read_pcm16_wave_channels(recording, measurement_spec.rate)
     recorded_channels = captures.shape[1]
     if channel == "all":
@@ -1439,6 +1459,7 @@ def analyze_recording(
                 record_lead_seconds=RECORD_LEAD_SECONDS,
                 internal_mic=True,
                 calibration=None,
+                **gate_options,
             )
             for input_channel in input_channels
         ]
@@ -1455,6 +1476,7 @@ def analyze_recording(
             record_lead_seconds=RECORD_LEAD_SECONDS,
             internal_mic=internal_mic,
             calibration=calibration,
+            **gate_options,
         )
         for curve in measurement.get("validation_curves", []):
             curve["input_channel"] = channel
@@ -1465,7 +1487,7 @@ def analyze_recording(
 
 def default_sweep_level(sink_name):
     """Built-in speakers get a louder sweep than external outputs."""
-    if sink_name.startswith("alsa_output.pci-"):
+    if is_internal_speaker(sink_name):
         return INTERNAL_SPEAKER_LEVEL_DBFS
     return EXTERNAL_SPEAKER_LEVEL_DBFS
 
@@ -1474,9 +1496,13 @@ def record_while_playing(
     sink_name, mic_name, channels, program, recording, lead_seconds, tail_seconds
 ):
     """Record the microphone while a program plays on the selected sink."""
-    recorder = subprocess.Popen([
+    command = [
         "pw-record", f"--target={mic_name}", f"--rate={RATE}",
-        f"--channels={channels}", "--format=s16", str(recording)])
+        f"--channels={channels}", "--format=s16"]
+    if mic_name == "alsa_input.platform-sound.RawMics":
+        # PipeWire otherwise chooses FL,FR,LFE for a three-channel recording.
+        command.append("--channel-map=" + ",".join(f"AUX{i}" for i in range(channels)))
+    recorder = subprocess.Popen(command + [str(recording)])
     try:
         time.sleep(lead_seconds)
         run(["pw-play", f"--target={sink_name}", str(program)])
@@ -1583,8 +1609,9 @@ def capture_measurement(
             channel,
             schedule,
             measurement_spec,
-            internal_mic=mic_name.startswith("alsa_input.pci-"),
+            internal_mic=is_internal_microphone(mic_name),
             calibration=calibration,
+            full_response=is_asahi_speaker(level_sink or sink_name),
         )
         metrics = measurement["quality"]["metrics"]
         if metrics["clipped_samples"] == 0 or attempt == 1:
@@ -1626,7 +1653,7 @@ def profile_from_measurement(
 ):
     load_dsp()
     quality = measurement["quality"]
-    internal_mic = mic["name"].startswith("alsa_input.pci-")
+    internal_mic = is_internal_microphone(mic["name"])
     fit_payload = None
     if quality["accepted"]:
         fit_payload = optimize_peq(
@@ -1900,8 +1927,9 @@ def reanalyze_saved_capture(
         channel,
         schedule,
         measurement_spec,
-        internal_mic=mic["name"].startswith("alsa_input.pci-"),
+        internal_mic=is_internal_microphone(mic["name"]),
         calibration=calibration,
+        full_response=is_asahi_speaker(sink["name"]),
     )
     attach_level_search(measurement, previous_measurement.get("level_search"))
     # A refit re-reads the raw capture, so anything learned from a check has to
@@ -1944,7 +1972,7 @@ def calibrate_noninteractive(
         raise SystemExit("Selected audio device is no longer available.")
     channel = parse_channel_selection(channel)
     channels = channel_count(mic)
-    internal_mic = mic["name"].startswith("alsa_input.pci-")
+    internal_mic = is_internal_microphone(mic["name"])
     if channel == "all" and not internal_mic:
         raise SystemExit("All-channel mode is available only for built-in microphone arrays.")
     if channel != "all" and (channel < 0 or channel >= channels):
@@ -2224,7 +2252,7 @@ def choose_mic():
     print("\nMicrophone type:\n  1. Built-in microphone\n  2. External/USB calibration microphone\n  3. Show all microphones")
     kind = input("Select 1-3: ").strip()
     if kind == "1":
-        predicate = lambda item: item["name"].startswith("alsa_input.pci-")
+        predicate = lambda item: is_internal_microphone(item["name"])
     elif kind == "2":
         predicate = lambda item: item["name"].startswith("alsa_input.usb-")
     else:
@@ -2240,7 +2268,7 @@ def wizard():
     channels = channel_count(mic)
     channel = 0
     if channels > 1:
-        if mic["name"].startswith("alsa_input.pci-"):
+        if is_internal_microphone(mic["name"]):
             answer = input(
                 f"Use [a]ll {channels} built-in microphones (recommended), "
                 f"or choose 1-{channels}? [a]: "
@@ -2269,10 +2297,10 @@ def wizard():
         "balanced" if answer.startswith("b") else "protected"
     )
     mic_cal_file = None
-    if not mic["name"].startswith("alsa_input.pci-"):
+    if not is_internal_microphone(mic["name"]):
         mic_cal_file = input("Microphone calibration file (optional): ").strip() or None
     print("\nPlacement:")
-    if mic["name"].startswith("alsa_input.pci-"):
+    if is_internal_microphone(mic["name"]):
         print("  Leave the laptop open on a hard surface and do not move it.")
     else:
         print("  Place the mic on-axis at normal listening distance, centered between speakers.")
