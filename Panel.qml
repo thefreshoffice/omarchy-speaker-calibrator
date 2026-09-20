@@ -1834,6 +1834,87 @@ Panel {
 
             // ---------------------------------------------------------- actions
             PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              ActionRow {
+                visible: root.hasMeasurement()
+                width: parent.width
+                icon: "󰑓"
+                label: service.busy && service.phase === "refit" ? "Refitting…" : "Refit and play"
+                description: "Apply " + service.optionsLabel(root.options()) + " to the last measurement and play it"
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), true)
+              }
+              ActionRow {
+                visible: root.hasMeasurement()
+                width: parent.width
+                icon: "󰑓"
+                label: "Refit only"
+                description: "Compute with the settings above, keep playing what is playing now"
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), false)
+              }
+              ActionRow {
+                visible: service.proposal !== null && service.proposal !== undefined
+                  && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
+                  && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
+                width: parent.width
+                icon: "󰄬"
+                label: service.busy && service.phase === "install" ? "Installing…" : "Install last measurement"
+                description: service.optionsLabel(service.proposal)
+                  + (service.proposal && service.proposal.created_at
+                      ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
+                enabled: !service.busy
+                onClicked: service.install()
+              }
+              ActionRow {
+                visible: service.status.enabled && !service.status.bypass
+                  && service.status.profile !== null && service.status.profile !== undefined
+                width: parent.width
+                icon: "󰄾"
+                label: service.busy && service.phase === "verify" ? "Checking…" : "Check the calibration"
+                description: root.checkDescription()
+                enabled: !service.busy && root.calibrationMicrophoneConnected()
+                onClicked: service.verify()
+              }
+              ActionRow {
+                visible: service.status.verification !== undefined
+                  && service.status.verification !== null
+                  && service.status.verification.stale === false
+                  && service.status.enabled && !service.status.bypass
+                width: parent.width
+                icon: "󰁨"
+                label: service.busy && service.phase === "refine" ? "Improving…" : "Improve from the check"
+                description: "Feed what the check measured back in, fit again, and play the result"
+                enabled: !service.busy
+                onClicked: service.refine()
+              }
+              ActionRow {
+                visible: service.status.enabled && service.status.compare !== undefined
+                  && service.status.compare.available === true
+                width: parent.width
+                icon: "󰓦"
+                label: service.busy && service.phase === "compare" ? "Switching…" : "Switch profile"
+                description: "Play the other stored profile: " + service.otherLabel()
+                enabled: !service.busy
+                onClicked: service.compare()
+              }
+              ActionRow {
+                visible: service.status.enabled
+                width: parent.width
+                icon: "󰅖"
+                label: "Stop calibration"
+                description: "Remove it from the output; the profiles stay saved"
+                enabled: !service.busy
+                onClicked: service.disable()
+              }
+            }
+
+            // ---------------------------------------------------------- microphones
             PanelSeparator { foreground: root.foreground }
             PanelSectionHeader {
               text: "MICROPHONES — WHAT EACH ONE MEASURED"
@@ -2029,88 +2110,6 @@ Panel {
               description: "The list disappears and the registry is not asked again"
               enabled: !service.busy
               onClicked: service.registryAnswer("declined")
-            }
-
-            PanelSeparator { foreground: root.foreground }
-            PanelSeparator { foreground: root.foreground }
-            PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
-
-            Column {
-              width: parent.width
-              spacing: Style.space(6)
-
-              ActionRow {
-                visible: root.hasMeasurement()
-                width: parent.width
-                icon: "󰑓"
-                label: service.busy && service.phase === "refit" ? "Refitting…" : "Refit and play"
-                description: "Apply " + service.optionsLabel(root.options()) + " to the last measurement and play it"
-                enabled: !service.busy
-                onClicked: service.refit(root.options(), true)
-              }
-              ActionRow {
-                visible: root.hasMeasurement()
-                width: parent.width
-                icon: "󰑓"
-                label: "Refit only"
-                description: "Compute with the settings above, keep playing what is playing now"
-                enabled: !service.busy
-                onClicked: service.refit(root.options(), false)
-              }
-              ActionRow {
-                visible: service.proposal !== null && service.proposal !== undefined
-                  && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
-                  && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
-                width: parent.width
-                icon: "󰄬"
-                label: service.busy && service.phase === "install" ? "Installing…" : "Install last measurement"
-                description: service.optionsLabel(service.proposal)
-                  + (service.proposal && service.proposal.created_at
-                      ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
-                enabled: !service.busy
-                onClicked: service.install()
-              }
-              ActionRow {
-                visible: service.status.enabled && !service.status.bypass
-                  && service.status.profile !== null && service.status.profile !== undefined
-                width: parent.width
-                icon: "󰄾"
-                label: service.busy && service.phase === "verify" ? "Checking…" : "Check the calibration"
-                description: root.checkDescription()
-                enabled: !service.busy && root.calibrationMicrophoneConnected()
-                onClicked: service.verify()
-              }
-              ActionRow {
-                visible: service.status.verification !== undefined
-                  && service.status.verification !== null
-                  && service.status.verification.stale === false
-                  && service.status.enabled && !service.status.bypass
-                width: parent.width
-                icon: "󰁨"
-                label: service.busy && service.phase === "refine" ? "Improving…" : "Improve from the check"
-                description: "Feed what the check measured back in, fit again, and play the result"
-                enabled: !service.busy
-                onClicked: service.refine()
-              }
-              ActionRow {
-                visible: service.status.enabled && service.status.compare !== undefined
-                  && service.status.compare.available === true
-                width: parent.width
-                icon: "󰓦"
-                label: service.busy && service.phase === "compare" ? "Switching…" : "Switch profile"
-                description: "Play the other stored profile: " + service.otherLabel()
-                enabled: !service.busy
-                onClicked: service.compare()
-              }
-              ActionRow {
-                visible: service.status.enabled
-                width: parent.width
-                icon: "󰅖"
-                label: "Stop calibration"
-                description: "Remove it from the output; the profiles stay saved"
-                enabled: !service.busy
-                onClicked: service.disable()
-              }
             }
 
             DetailRow {
