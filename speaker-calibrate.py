@@ -3231,7 +3231,8 @@ def share_press(confirmed=False):
     one_press = gh_signed_in()
     if not state.get("share_explained") and not confirmed:
         return {"state": "confirm", "one_press": one_press, "id": identifier, "name": public["name"],
-                "score": share.objective_score(public)}
+                "score": share.objective_score(public), "words": share.score_words(public),
+                "checked": (public["public"].get("verification") or {}).get("verdict")}
     if one_press:
         return {"state": "uploaded", **share_upload()}
     return {"state": "browser", **share_for_browser()}
@@ -4369,10 +4370,15 @@ def status_registry():
         found = registry_cached()
     except Exception:            # the status must never fail over a cache file
         return {"consent": None, "profiles": []}
-    found["shared_url"] = None
+    found.update(shared_url=None, share_score=None, share_checked=None, share_replaces=False)
     try:
-        if found.get("uploads") and load_profile(PROFILE) is not None:
-            found["shared_url"] = found["uploads"].get(public_profile()[1])
+        if load_profile(PROFILE) is not None:
+            public, identifier, _ = public_profile()
+            found["shared_url"] = (found.get("uploads") or {}).get(identifier)
+            found["share_score"] = share.objective_score(public)
+            found["share_checked"] = (public["public"].get("verification") or {}).get("verdict")
+            # A check made after sharing makes it a different profile: sharing again replaces the earlier one.
+            found["share_replaces"] = bool(found.get("uploads")) and found["shared_url"] is None
     except (SystemExit, Exception):
         pass
     return found

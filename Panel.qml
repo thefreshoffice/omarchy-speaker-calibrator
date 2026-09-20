@@ -1650,11 +1650,14 @@ Panel {
                 : sharedUrl !== "" ? "Shared with everyone  ·  open its page"
                 : asking ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
                 : "Share this calibration with everyone"
+              readonly property var reg: service.registry || ({})
               description: sharedUrl !== ""
                 ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
-                : asking ? "It would score " + Number(service.shareStatus.score || 0) + " of 100 in the registry"
-                : "For everyone with " + String((service.status.hardware || {}).label || "this machine")
-                  + ": it shows up in their panel, with its graph and a score"
+                : (reg.share_score !== null && reg.share_score !== undefined
+                    ? "It would score " + Number(reg.share_score) + " of 100"
+                      + (reg.share_checked ? "" : "; check the calibration first and it scores higher")
+                    : "For everyone with " + String((service.status.hardware || {}).label || "this machine"))
+                  + (reg.share_replaces === true ? "  ·  replaces your earlier upload" : "")
               enabled: !service.busy
               onClicked: {
                 if (sharedUrl !== "") service.openRegistryPage(sharedUrl)

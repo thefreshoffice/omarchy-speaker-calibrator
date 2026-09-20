@@ -178,12 +178,19 @@ def public_payload(shared, verification=None):
 
     public = {"microphone_kind": microphone_kind(profile["microphone"])}
     if isinstance(verification, dict) and verification.get("usable") is not False:
+        # As the plugin writes a check: the distance from the target before,
+        # as planned, and as measured through the correction; the model error
+        # as a small table.  A public profile carries it flattened, and reading
+        # that flat form back has to give the same again.
         error = verification.get("target_error_db") if isinstance(verification.get("target_error_db"), dict) else {}
+        after = error.get("measured") if _finite(error.get("measured")) else error.get("after")
+        model = verification.get("model_error_db")
+        model = model.get("rms") if isinstance(model, dict) else model
         checked = {
             "verdict": verification.get("verdict") if verification.get("verdict") in ("pass", "warning", "fail") else None,
             "target_error_before_db": error.get("before") if _finite(error.get("before")) else None,
-            "target_error_after_db": error.get("after") if _finite(error.get("after")) else None,
-            "model_error_db": verification.get("model_error_db") if _finite(verification.get("model_error_db")) else None,
+            "target_error_after_db": after if _finite(after) else None,
+            "model_error_db": model if _finite(model) else None,
         }
         if checked["verdict"]:
             public["verification"] = checked
@@ -270,35 +277,55 @@ def _until_break(lines):
         yield stripped
 
 
-def objective_score(payload, votes=0):
-    """0 to 100: how much a stranger should trust this calibration, from the file alone plus votes.
+SCORE_MICROPHONE = {"calibrated measuring microphone": 40.0, "external microphone": 32.0,
+                    "built-in microphone": 18.0}
 
-    The microphone matters most, because a built-in one measures its own
-    position; then whether the result was checked and how close it came; then
-    how repeatable the measurement was.  Votes add a little and cannot carry a
-    weak measurement past a good one.
+
+def score_parts(payload, votes=0):
+    """What a profile's score is made of, part by part, so that it can be shown and argued with.
+
+    A measurement has to be able to score decently on its own merits: a clean,
+    repeatable one that predicts a large improvement is a good calibration
+    before anyone has checked it, and a check then adds what only a check can,
+    proof.  The microphone still matters most, because a built-in one measures
+    its own position rather than the listener's.
     """
     public = payload.get("public") or {}
     profile = payload.get("profile") or {}
-    score = {"calibrated measuring microphone": 40.0, "external microphone": 30.0,
-             "built-in microphone": 15.0}.get(public.get("microphone_kind"), 0.0)
+    fit = profile.get("fit") or {}
+    quality = profile.get("quality") or {}
+    parts = {"microphone": SCORE_MICROPHONE.get(public.get("microphone_kind"), 0.0)}
+    repeat = (quality.get("metrics") or {}).get("worst_repeatability_db")
+    parts["repeatability"] = (15.0 if repeat <= 0.5 else 10.0 if repeat <= 1.0 else 5.0 if repeat <= 2.0 else 0.0) \
+        if _finite(repeat) else 0.0
+    before, after = fit.get("weighted_rmse_before_db"), fit.get("weighted_rmse_after_db")
+    parts["predicted_improvement"] = 15.0 * min(1.0, max(0.0, (before - after) / before)) \
+        if _finite(before) and _finite(after) and before > 0 else 0.0
     checked = public.get("verification") or {}
-    score += {"pass": 25.0, "warning": 12.0}.get(checked.get("verdict"), 0.0)
+    parts["checked"] = {"pass": 20.0, "warning": 10.0}.get(checked.get("verdict"), 0.0)
     before, after = checked.get("target_error_before_db"), checked.get("target_error_after_db")
-    if _finite(before) and _finite(after) and before > 0:
-        score += 15.0 * min(1.0, max(0.0, (before - after) / before))
-    else:
-        fit = profile.get("fit") or {}
-        before, after = fit.get("weighted_rmse_before_db"), fit.get("weighted_rmse_after_db")
-        if _finite(before) and _finite(after) and before > 0:
-            score += 8.0 * min(1.0, max(0.0, (before - after) / before))
-    metrics = (profile.get("quality") or {}).get("metrics") or {}
-    repeat = metrics.get("worst_repeatability_db")
-    if _finite(repeat):
-        score += 10.0 if repeat <= 0.5 else 6.0 if repeat <= 1.0 else 3.0 if repeat <= 2.0 else 0.0
-    score -= min(10.0, 2.0 * float((profile.get("quality") or {}).get("warning_count") or 0))
-    score += min(10.0, 2.0 * max(0, int(votes or 0)))
-    return int(round(min(100.0, max(0.0, score))))
+    parts["measured_improvement"] = 8.0 * min(1.0, max(0.0, (before - after) / before)) \
+        if parts["checked"] and _finite(before) and _finite(after) and before > 0 else 0.0
+    parts["warnings"] = -min(8.0, 2.0 * float(quality.get("warning_count") or 0))
+    parts["votes"] = min(10.0, 2.0 * max(0, int(votes or 0)))
+    return parts
+
+
+def objective_score(payload, votes=0):
+    """0 to 100: how much a stranger should trust this calibration, from the file alone plus votes."""
+    return int(round(min(100.0, max(0.0, sum(score_parts(payload, votes).values())))))
+
+
+def score_words(payload):
+    """The score's two main facts in words, because a number alone reads as a verdict."""
+    parts = score_parts(payload)
+    quality = (payload.get("profile") or {}).get("quality") or {}
+    measurement = ("clean measurement" if parts["repeatability"] >= 15.0 and (quality.get("warning_count") or 0) <= 1
+                   else "good measurement" if parts["repeatability"] >= 10.0 else "usable measurement")
+    verdict = ((payload.get("public") or {}).get("verification") or {}).get("verdict")
+    check = {"pass": "checked and passed", "warning": "checked, passed with warnings",
+             "fail": "checked and did not pass"}.get(verdict, "not checked yet")
+    return f"{measurement}, {check}"
 
 
 def index_entry(payload, *, identifier, path, issue=None, submitted_by=None, votes=0):
@@ -316,6 +343,7 @@ def index_entry(payload, *, identifier, path, issue=None, submitted_by=None, vot
         "error_before_db": fit.get("weighted_rmse_before_db"),
         "error_after_db": fit.get("weighted_rmse_after_db"),
         "score": objective_score(payload, votes), "votes": int(votes or 0),
+        "score_parts": {key: round(value, 1) for key, value in score_parts(payload, votes).items()},
         "issue": issue, "submitted_by": submitted_by,
     }
 

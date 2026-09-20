@@ -64,8 +64,11 @@ def shared(**profile_changes):
             "profile": profile}
 
 
-VERIFIED = {"usable": True, "verdict": "pass", "model_error_db": 0.8,
-            "target_error_db": {"before": 5.5, "after": 1.8}}
+# A check as the plugin writes it: a mask of usable points, three distances from
+# the target, and the model error as a small table.
+VERIFIED = {"usable": [False] * 8 + [True] * 120, "verdict": "pass", "stale": False,
+            "model_error_db": {"rms": 0.8, "worst": -2.1, "worst_hz": 439.7, "bands": {"bass": 1.2}},
+            "target_error_db": {"before": 5.5, "planned": 1.5, "measured": 1.8}}
 
 
 def strings_in(value, found=None):
@@ -200,6 +203,32 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(tier(dict(self.OURS, sys_vendor="Dell Inc."), self.OURS), 0)
         self.assertEqual(tier({}, self.OURS), 0)
         self.assertEqual(tier("nonsense", None), 0)
+
+    def test_a_clean_unchecked_measurement_scores_decently_and_a_check_adds_proof(self):
+        def scored(internal, calibrated, verification, votes=0):
+            profile = shared()
+            profile["profile"]["microphone"].update(internal=internal, calibration_file="/x" if calibrated else None)
+            return share.objective_score(share.public_payload(profile, verification), votes)
+        unchecked = scored(False, False, None)
+        self.assertGreaterEqual(unchecked, 50)              # external, 0.4 dB repeatable, two thirds of the error gone
+        self.assertGreaterEqual(scored(False, False, VERIFIED) - unchecked, 20)
+        self.assertGreaterEqual(scored(False, True, VERIFIED), 85)
+        passed_with_warnings = dict(VERIFIED, verdict="warning")
+        self.assertLess(scored(False, False, passed_with_warnings), scored(False, False, VERIFIED))
+        self.assertGreater(scored(False, False, passed_with_warnings), unchecked)
+        failed = dict(VERIFIED, verdict="fail")
+        self.assertEqual(scored(False, False, failed), unchecked)      # a failed check proves nothing, and says so in words
+
+    def test_the_parts_add_up_and_can_be_shown(self):
+        public = share.public_payload(shared(), VERIFIED)
+        parts = share.score_parts(public, votes=2)
+        self.assertEqual(sorted(parts), ["checked", "measured_improvement", "microphone", "predicted_improvement",
+                                         "repeatability", "votes", "warnings"])
+        self.assertEqual(parts["microphone"], 40.0)
+        self.assertEqual(parts["warnings"], -4.0)
+        self.assertEqual(share.objective_score(public, 2), min(100, round(sum(parts.values()))))
+        self.assertEqual(share.score_words(public), "good measurement, checked and passed")
+        self.assertEqual(share.score_words(share.public_payload(shared())), "good measurement, not checked yet")
 
     def test_the_score_ranks_a_checked_measuring_microphone_over_a_built_in_one(self):
         def scored(internal, calibrated, verification, votes=0):
