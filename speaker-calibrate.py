@@ -557,6 +557,24 @@ def is_built_in(name):
     return is_internal_speaker(name) or is_internal_microphone(name)
 
 
+def source_plugged_in(item):
+    """False only when PipeWire says the source's jack has nothing plugged in.
+
+    A laptop lists its headset jack as a microphone whether or not anything is
+    in it, and on some machines as a built-in one.  PipeWire reports each
+    port's jack state, so the dead one can be told apart without playing a
+    sound.  Codecs without jack detection report "unknown", and unknown counts
+    as present: this only ever rules a source out on a positive report.
+    """
+    ports = [port for port in item.get("ports") or [] if isinstance(port, dict)]
+    if not ports:
+        return True
+    active = item.get("active_port")
+    chosen = [port for port in ports if port.get("name") == active] or ports
+    return not all(str(port.get("availability", "")).strip().lower() == "not available"
+                   for port in chosen)
+
+
 def devices_payload():
     default_source = run(
         ["pactl", "get-default-source"], check=False, capture=True
@@ -575,6 +593,9 @@ def devices_payload():
             # its real built-in digital array.  Let the panel select the source
             # WirePlumber chose instead of whichever pactl happened to list first.
             "default": kind == "microphone" and name == default_source,
+            # Not for speakers: headphones that are not plugged in are not a
+            # reason to hide the speakers that share their device.
+            "available": source_plugged_in(item) if kind == "microphone" else True,
         }
     return {
         "sinks": [public(item, "speaker") for item in physical_sinks()],
@@ -1582,6 +1603,14 @@ def playing_applications():
     return names
 
 
+class NoSignal(ValueError):
+    """The microphone heard nothing of the probe, even at the loudest level.
+
+    The one measurement failure that another microphone can cure, so it has a
+    type of its own instead of being recognised by its wording.
+    """
+
+
 def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
     load_dsp()
@@ -1621,7 +1650,8 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
         playing = playing_applications()
         if playing:
             guidance.append("Currently playing audio: " + ", ".join(playing) + ".")
-        raise ValueError(" ".join(warnings + guidance))
+        failure = NoSignal if search["status"] == "no-signal" else ValueError
+        raise failure(" ".join(warnings + guidance))
     return search
 
 
@@ -2022,15 +2052,6 @@ def parse_channel_selection(value):
         raise SystemExit("Microphone channel must be a zero-based number or 'all'.") from error
 
 
-# The level search's way of saying the microphone heard nothing at all.  A
-# jack microphone with nothing plugged in, or a capture path muted below
-# PipeWire, fails exactly like this, and on machines with several internal
-# capture devices the panel cannot know which of them is live until a probe
-# is played.  Matched on a phrase, not the whole sentence, so a wording tweak
-# in calibration_dsp does not silently disable the fallback.
-NO_SIGNAL_PHRASE = "did not pick up the level probe"
-
-
 def channel_for_microphone(channel, mic):
     """The channel selection applied to a specific microphone, or None.
 
@@ -2041,7 +2062,7 @@ def channel_for_microphone(channel, mic):
     """
     channels = channel_count(mic)
     if channel == "all":
-        return "all" if mic["name"].startswith("alsa_input.pci-") else None
+        return "all" if is_internal_microphone(mic["name"]) else None
     if 0 <= channel < channels:
         return channel
     return 0
@@ -2065,11 +2086,23 @@ def calibrate_noninteractive(
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
     # A selected microphone that hears nothing is not always a silent room:
     # on machines with several capture devices one of them is often a jack
-    # with nothing plugged in, and only playing a probe can tell.  Rather
-    # than failing the whole measurement on that guess, fall through the
-    # remaining microphones and let the first live one answer.
-    candidates = [mic] + [item for item in available if item["name"] != mic_name]
-    deaf = []
+    # with nothing plugged in.  Rather than failing the whole measurement on
+    # that guess, fall through to the laptop's other built-in microphones and
+    # let the first live one answer.
+    #
+    # Only built-in ones, and only for a built-in choice.  A webcam across the
+    # desk or a headset is a different kind of measurement with different
+    # limits, and someone who picked an external microphone meant that one.
+    others = [
+        item for item in available
+        if item["name"] != mic_name and is_internal_microphone(item["name"]) and source_plugged_in(item)
+    ] if internal_mic else []
+    # A jack PipeWire reports empty is not probed when another microphone can
+    # answer: the probe for a deaf one climbs to the loudest level allowed.
+    skipped = bool(others) and not source_plugged_in(mic)
+    candidates = ([] if skipped else [mic]) + others
+    deaf = [label(mic)] if skipped else []
+    unheard = None
     for candidate in candidates:
         resolved = channel if candidate is mic else channel_for_microphone(channel, candidate)
         if resolved is None:
@@ -2082,23 +2115,36 @@ def calibrate_noninteractive(
                 mic_cal_file if candidate is mic else None,
                 loudness, bass, channel_trim,
             )
+        except NoSignal as error:
+            deaf.append(label(candidate))
+            unheard = error
+            continue
         except ValueError as error:
-            if NO_SIGNAL_PHRASE in str(error):
-                deaf.append(label(candidate))
-                continue
             raise SystemExit(str(error)) from error
         if candidate is not mic:
             profile["microphone_fallback"] = {
                 "requested": mic_name,
                 "used": candidate["name"],
-                "reason": "no-signal",
+                "reason": "not-plugged-in" if skipped else "no-signal",
             }
+            # Said where the panel shows it, because a calibration made with
+            # another microphone than the one picked must not be a surprise.
+            quality = profile.get("quality")
+            if isinstance(quality, dict):
+                why = ("has nothing plugged in" if skipped
+                       else "did not pick up the level probe")
+                note = (f"{short_label(label(mic))} {why}, so this was measured with "
+                        f"{short_label(label(candidate))}, the laptop's other built-in microphone.")
+                quality["guidance"] = list(dict.fromkeys(list(quality.get("guidance") or []) + [note]))
         return profile
+    if len(deaf) < 2:
+        # One microphone, one answer: the level search's own words, which also
+        # say what else is playing.
+        raise SystemExit(str(unheard) if unheard else "The selected microphone has nothing plugged in.")
     raise SystemExit(
-        "The microphone did not pick up the level probe even at the loudest "
-        "allowed sweep level. None of the available microphones heard it ("
-        + ", ".join(deaf) + "). Check that the selected speaker is unmuted "
-        "and raise the hardware volume, then measure again."
+        "None of the built-in microphones picked up the level probe, even at the loudest "
+        "allowed sweep level (" + ", ".join(short_label(name) for name in deaf) + "). Check "
+        "that the speakers are unmuted and raise the hardware volume, then measure again."
     )
 
 

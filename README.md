@@ -192,6 +192,15 @@ applied inside the headset. It cannot describe a loudspeaker, and a
 calibration fitted to one would be correcting for the headset. Those are named
 in the panel as connected but unusable rather than quietly dropped.
 
+A laptop also lists its headset jack as a microphone whether or not anything
+is in it, and on some machines as a built-in one next to the real array.
+PipeWire reports when a jack is empty, so such a source is marked **nothing
+plugged in** and is never the automatic choice. Where the hardware cannot
+tell, the measurement finds out: a built-in microphone that hears nothing of
+the level probe hands over to the laptop's other built-in microphone, and the
+result says that it did. It never hands over to an external microphone, and an
+external microphone you picked is never replaced.
+
 ### Comparing the two microphones
 
 Advanced keeps the last measurement from each kind of microphone and draws

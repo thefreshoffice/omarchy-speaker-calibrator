@@ -90,9 +90,14 @@ Panel {
       if (list[index].name === name) return index
     return -1
   }
+  // A headset jack is listed as a microphone whether or not anything is in
+  // it, on some laptops as a built-in one.  PipeWire says when a jack is
+  // empty, and an empty one is never the automatic choice.
   function firstInternal(list) {
     for (var index = 0; index < list.length; index++)
-      if (list[index].internal === true) return index
+      if (list[index].internal === true && list[index].available !== false) return index
+    for (var any = 0; any < list.length; any++)
+      if (list[any].internal === true) return any
     return list.length > 0 ? 0 : -1
   }
   // A laptop can expose an unplugged analog jack beside its real microphone
@@ -101,7 +106,8 @@ Panel {
   // left to be picked by hand.
   function defaultInternal(list) {
     for (var index = 0; index < list.length; index++)
-      if (list[index].default === true && list[index].internal === true) return index
+      if (list[index].default === true && list[index].internal === true
+          && list[index].available !== false) return index
     return -1
   }
   // Which rows are selected, decided afresh whenever the lists or the status
@@ -1406,6 +1412,7 @@ Panel {
                     + (modelData.internal
                         ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
                         : "  ·  external")
+                    + (modelData.available === false ? "  ·  nothing plugged in" : "")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !service.busy
