@@ -862,6 +862,41 @@ def highpass_settings(fit_payload):
     return corner, q, max(1, min(2, stages))
 
 
+# The limiter is a safety net, and on its own timing it is an audible one.  LSP
+# ships it with 5 ms of lookahead, attack and release; one cycle of 60 Hz lasts
+# 17 ms, so whenever it has to work on bass its gain follows the waveform
+# itself and everything playing with the bass is modulated by it.  That was
+# heard as clipping with a player set to 120 %: the stream arrives 4.8 dB over
+# full scale, which is all the headroom the chain has left once the loudness
+# contour has lifted the bass, and the output sits on the limiter's ceiling at
+# every volume.  No sample clips; the limiter distorts.
+#
+# Measured as the products around a 1 kHz tone played over a full-scale bass
+# tone, in dB below the 1 kHz tone, at the chain's output and, in brackets,
+# by a measuring microphone in front of the speakers:
+#
+#   bass tone   limiter idle    120 %, 5 ms     120 %, 10 ms    120 %, 15 ms
+#     60 Hz     -41 (-34)       -28 (-22)       -40 (-34)       -44 (-36)
+#     80 Hz     -40 (-31)       -23 (-13)                       -42 (-32)
+#    100 Hz     -37 (-28)       -26 (-18)       -26 (-22)       -35 (-29)
+#    150 Hz     -37 (-21)       -19 (-14)                       -39 (-29)
+#
+# Ten milliseconds cures 60 Hz and does nothing for 100 Hz; fifteen brings
+# every one back to what the speakers do with the limiter idle, and twenty
+# buys nothing more.  Lookahead and attack go together: either alone changes
+# nothing, since the attack cannot outrun the lookahead.  A longer release
+# changes nothing, oversampling changes nothing, and the plugin's slow level
+# regulation cleans it up too but turns everything down by 6 to 7 dB.  The
+# price is 10 ms more latency.
+LIMITER_LOOKAHEAD_MS = 15.0
+LIMITER_ATTACK_MS = 15.0
+
+
+def limiter_timing_controls():
+    """The limiter's timing, as live controls: also how a running graph gets it."""
+    return {"limiter:lk": LIMITER_LOOKAHEAD_MS, "limiter:at": LIMITER_ATTACK_MS}
+
+
 def loudness_level_db(sink_volume_db):
     """The listening level the contour is chosen for, in dB below full volume.
 
@@ -1043,6 +1078,7 @@ def graph_controls(fit_payload, *, deep_bass=False,
         controls[f"bal_{side}:Mult"] = round(10.0 ** (gain_db / 20.0), 6)
         controls[f"bal_{side}:Add"] = 0.0
     controls.update(harmonic_controls(corner, deep_bass))
+    controls.update(limiter_timing_controls())
     # Last, because the compensation's make-up rides on the limiter's input
     # gain and needs the calibrated value to build on.
     controls.update(loudness_controls(
@@ -1109,7 +1145,7 @@ def filter_config(sink, fit_payload, *, deep_bass=False,
     input_gain = controls["limiter:g_in"]
     nodes.append(f'''{{ type = lv2 name = limiter
       plugin = "http://lsp-plug.in/plugins/lv2/limiter_stereo"
-      control = {{ "alr" = 0 "boost" = 0 "g_in" = {input_gain:.6f} "th" = 0.891 }}
+      control = {{ "alr" = 0 "boost" = 0 "g_in" = {input_gain:.6f} "th" = 0.891 "lk" = {LIMITER_LOOKAHEAD_MS:.1f} "at" = {LIMITER_ATTACK_MS:.1f} }}
     }}''')
     indented_nodes = "\n          ".join(nodes)
     indented_links = "\n          ".join(links)
@@ -3586,6 +3622,10 @@ def vendor_chain(sections, trim_db, input_gain, header, harmonics=None):
               "boost" = 0
               "g_in"  = {float(input_gain):.4f}
               "th"    = 0.891
+              # On its default 5 ms the limiter's gain follows a bass cycle
+              # and modulates everything played with it; at 15 ms it does not.
+              "lk"    = {LIMITER_LOOKAHEAD_MS:.1f}
+              "at"    = {LIMITER_ATTACK_MS:.1f}
             }}
           }}''')
     joined_nodes = "\n          ".join(nodes).rstrip()

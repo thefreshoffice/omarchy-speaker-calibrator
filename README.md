@@ -322,6 +322,14 @@ sound worse than it started.
   margin, so no band is ever driven more than 5 dB harder than the uncorrected
   speaker at the same volume setting. The limiter ceiling stays at -1 dBFS,
   with auto-level and boost disabled.
+- The limiter looks 15 ms ahead and attacks over 15 ms. On the plugin's default
+  of 5 ms its gain follows each cycle of a bass note and modulates everything
+  played with it, which is heard as clipping the moment it has to work: a
+  player turned up to 120 % is enough, because that uses up the headroom the
+  loudness contour's bass lift has left. At 15 ms the distortion it adds,
+  measured with a microphone in front of the speakers for bass notes from 60
+  to 150 Hz, is back at what the speakers do with the limiter idle. It costs
+  10 ms of latency.
 - Switching the calibration off level-matches the plain speakers to the
   loudness the correction plays at, so the comparison is about tone rather
   than volume. It only ever turns the plain sound down, never up.
