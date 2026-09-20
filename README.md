@@ -119,6 +119,14 @@ speakers is mostly the bass. Clock drift between playback and recording is
 estimated and corrected. Clipping, sweep prominence, alignment, repeatability,
 microphone gain stability and harmonic residuals are all checked.
 
+Before the first probe the plugin listens to what the speakers are playing,
+at their output, as samples, for a good second. Anything there, however quiet,
+stops the measurement with a message before a sound is made: music under the
+sweeps would be measured as if it were the speakers. It does not go by the list
+of open audio streams, because a player that is paused without closing its
+stream looks the same as one that plays, and it does not leave it to the
+microphone, which cannot tell quiet music from a fan.
+
 Setting levels is the plugin's job, the microphone's as much as the speakers'.
 A built-in microphone is often left at full input gain, where the
 preamplifier's own hiss and the rumble below the measured band read as a loud

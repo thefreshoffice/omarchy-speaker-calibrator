@@ -1845,10 +1845,86 @@ def hot_microphone_reason(search, default_level):
     return None
 
 
+# Whether the speakers are already playing something is not a guess to make
+# from the microphone: their output can be read directly, as samples, and
+# silence there is exact silence.  A list of open streams does not say it
+# either, since a player that is paused without corking its stream, or a
+# dictation tool that holds one open, looks the same as music.
+SPEAKERS_PLAYING_LISTEN_SECONDS = 1.2
+SPEAKERS_PLAYING_SETTLE_SECONDS = 0.3
+SPEAKERS_PLAYING_THRESHOLD_DBFS = -70.0
+SPEAKERS_PLAYING_BLOCK_SHARE = 0.2
+
+
+class SpeakersPlaying(ValueError):
+    """Sound is already coming out of the speakers; nothing was played."""
+
+
+def speakers_output_levels(sink_name):
+    """Block levels, in dBFS, of what the sink is playing right now, or None.
+
+    Recorded from the sink's own monitor, so it is the mix of every stream
+    after their volumes.  None when it cannot be read: the check then steps
+    aside rather than blocking a measurement.
+    """
+    recording = DATA / "speaker-output-check.wav"
+    try:
+        recorder = subprocess.Popen([
+            "pw-record", f"--target={checked_sink_name(sink_name)}", "-P", "stream.capture.sink=true",
+            f"--rate={RATE}", "--channels=2", "--format=s16", str(recording)],
+            preexec_fn=die_with_parent, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    try:
+        time.sleep(SPEAKERS_PLAYING_LISTEN_SECONDS)
+    finally:
+        stop_recorder(recorder)
+    try:
+        captured = read_pcm16_wave_channels(recording, RATE)
+    except (OSError, ValueError, EOFError):
+        return None
+    finally:
+        try:
+            recording.unlink()
+        except OSError:
+            pass
+    import numpy as np
+    block = int(0.05 * RATE)
+    # The monitor's own start is not sound from any player.
+    captured = captured[int(SPEAKERS_PLAYING_SETTLE_SECONDS * RATE):]
+    usable = (captured.shape[0] // block) * block
+    if usable < 4 * block:
+        return None
+    blocks = captured[:usable].reshape(-1, block, captured.shape[1])
+    rms = np.sqrt(np.mean(blocks * blocks, axis=1)).max(axis=1)
+    return [float(20.0 * np.log10(max(value, 1e-9))) for value in rms]
+
+
+def refuse_playing_speakers(sink_names):
+    """Stop before the first probe when the speakers are already playing something."""
+    for name in dict.fromkeys(name for name in sink_names if name):
+        levels = speakers_output_levels(name)
+        if not levels:
+            continue
+        loud = [level for level in levels if level > SPEAKERS_PLAYING_THRESHOLD_DBFS]
+        if len(loud) >= max(1, round(SPEAKERS_PLAYING_BLOCK_SHARE * len(levels))):
+            playing = playing_applications()
+            raise SpeakersPlaying(
+                f"Sound is playing through the speakers (up to {max(loud):.0f} dBFS at their output), "
+                "so nothing was measured. Pause it, then measure again."
+                # Open is all that can be said of a stream: one that is paused
+                # without being corked looks the same as one that plays.
+                + (" Audio streams open right now: " + ", ".join(playing) + "." if playing else ""))
+
+
 def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None, gain=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
     refuse_silenced_devices([sink_name, level_sink], mic_name)
     load_dsp()
+    # The real speakers, which is where every stream ends up whether it plays
+    # to them directly or through the calibrated sink in front of them.
+    refuse_playing_speakers([level_sink or sink_name])
     default_level = default_sweep_level(level_sink or sink_name)
     probe_program = DATA / "level-probe.wav"
     probe_recording = DATA / "level-probe-recording.wav"
