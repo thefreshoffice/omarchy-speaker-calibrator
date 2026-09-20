@@ -1230,6 +1230,26 @@ class LevelSearchPolicy:
     # less than half as much, something else sets the peak: automatic gain
     # control, an overloaded microphone, or other audio.
     level_follow_step_db: float = 3.0
+    # Dynamics processing in the path (a microphone's compression, automatic
+    # gain or noise gate, a speaker amplifier's protection) moves the recorded
+    # level by less, or more, than the played level.  A swept-sine measurement
+    # assumes it moves one-for-one: a compressor flattens exactly the peaks and
+    # dips being measured, so the correction comes out too weak.  Two clean
+    # probes this far apart give a slope worth judging.  A noisy room leaves
+    # little room between a probe that clips and one the room buries, so the
+    # step is small, and a verdict also needs the recorded change to miss the
+    # played one by more than the scatter between two probes (a few tenths of
+    # a decibel each).
+    linearity_step_db: float = 3.0
+    linearity_minimum_error_db: float = 1.5
+    linearity_probe_step_db: float = 8.0
+    linearity_minimum_prominence_db: float = 8.0
+    linearity_compressed_slope: float = 0.8
+    linearity_expanded_slope: float = 1.25
+
+
+# How many of a probe's loudest 50 ms blocks stand for its level.
+LOUD_BLOCKS = 4
 
 
 def analyse_level_probe(
@@ -1292,12 +1312,24 @@ def analyse_level_probe(
     tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
     tonal_peak = float(np.max(region_peak[tonal])) if np.any(tonal) else 0.0
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
+    # The level of the probe itself, for comparing probes with each other: the
+    # loudest tonal blocks of the best channel, with the noise power taken out
+    # so that a quiet probe is not flattered by the room.  The same few blocks
+    # are the loudest at every level, which a recorder that starts a little
+    # early or late does not change.
+    tonal_power = np.sort(region_rms[tonal[:, best], best] ** 2)[::-1][:LOUD_BLOCKS]
+    if tonal_power.size >= LOUD_BLOCKS:
+        loud_power = float(np.mean(tonal_power)) - float(noise[best]) ** 2
+        loud_rms = float(np.sqrt(max(loud_power, 1e-24)))
+    else:
+        loud_rms = 0.0
     loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]
     peak = float(loudest_blocks[1] if loudest_blocks.size >= 4 else loudest_blocks[0])
     region = values[background_end * block:usable]
     return {
         "peak_dbfs": round(dbfs(peak), 3),
         "tonal_peak_dbfs": round(dbfs(tonal_peak), 3),
+        "loud_rms_dbfs": round(dbfs(loud_rms), 3),
         "noise_dbfs": round(dbfs(float(noise[best])), 3),
         "prominence_db": round(float(prominences[best]), 3),
         "clipped_samples": int(np.count_nonzero(np.abs(region) >= 0.999)),
@@ -1432,6 +1464,113 @@ def search_measurement_level(
     }
 
 
+def _linearity_candidates(attempts, policy: LevelSearchPolicy) -> list[dict]:
+    return [
+        item for item in attempts or []
+        if item.get("clipped_samples", 1) == 0
+        and float(item.get("prominence_db", 0.0)) >= policy.linearity_minimum_prominence_db
+        and float(item.get("loud_rms_dbfs", -200.0)) > -119.0
+    ]
+
+
+def level_linearity(attempts, policy: LevelSearchPolicy = LevelSearchPolicy()) -> dict | None:
+    """How the recorded level followed the played level between two probes.
+
+    Takes the loudest clean probe, because the long sweeps play at about that
+    level and a compressor works hardest there, and the clean probe furthest
+    below it.  Returns None when no two clean probes are far enough apart to
+    say anything.
+    """
+    clean = sorted(_linearity_candidates(attempts, policy), key=lambda item: item["level_dbfs"])
+    if len(clean) < 2:
+        return None
+    quiet, loud = clean[0], clean[-1]
+    level_change = float(loud["level_dbfs"]) - float(quiet["level_dbfs"])
+    if level_change < policy.linearity_step_db:
+        return None
+    recorded_change = float(loud["loud_rms_dbfs"]) - float(quiet["loud_rms_dbfs"])
+    slope = recorded_change / level_change
+    error = recorded_change - level_change
+    if slope < policy.linearity_compressed_slope and error <= -policy.linearity_minimum_error_db:
+        verdict = "compressed"
+    elif slope > policy.linearity_expanded_slope and error >= policy.linearity_minimum_error_db:
+        verdict = "expanded"
+    else:
+        verdict = "linear"
+    return {
+        "quiet_level_dbfs": round(float(quiet["level_dbfs"]), 2),
+        "loud_level_dbfs": round(float(loud["level_dbfs"]), 2),
+        "level_change_db": round(level_change, 2),
+        "recorded_change_db": round(recorded_change, 2),
+        "slope": round(slope, 3),
+        "verdict": verdict,
+    }
+
+
+def linearity_probe_level(
+    search: dict, policy: LevelSearchPolicy = LevelSearchPolicy()
+) -> float | None:
+    """The level of one more probe that would make the search's linearity known.
+
+    None when the search already has its answer or no clean probe to compare
+    with, or when the allowed levels leave no room below the loudest clean one.
+    Always quieter than something already played, never louder.
+    """
+    attempts = search.get("attempts") or []
+    if level_linearity(attempts, policy) is not None:
+        return None
+    clean = _linearity_candidates(attempts, policy)
+    if not clean:
+        return None
+    loudest = max(float(item["level_dbfs"]) for item in clean)
+    low = float((search.get("level_bounds_dbfs") or [loudest])[0])
+    level = max(low, loudest - policy.linearity_probe_step_db)
+    if loudest - level < policy.linearity_step_db:
+        return None
+    return round(level, 2)
+
+
+def linearity_advice(search: dict) -> tuple[list[str], list[str]]:
+    """Return (warnings, guidance) for dynamics processing found by the probes."""
+    linearity = search.get("linearity") or {}
+    verdict = linearity.get("verdict")
+    if verdict not in ("compressed", "expanded"):
+        return [], []
+    level = float(linearity.get("level_change_db", 0.0))
+    recorded = float(linearity.get("recorded_change_db", 0.0))
+    if verdict == "compressed":
+        warnings = [
+            f"The recorded level rose only {recorded:.1f} dB for a {level:.1f} dB louder probe, "
+            "so something in the path compresses the sound and the correction will come out "
+            "weaker than the speakers need."
+        ]
+    else:
+        warnings = [
+            f"The recorded level rose {recorded:.1f} dB for a {level:.1f} dB louder probe, "
+            "so something in the path gates or expands the sound and the measured response "
+            "is exaggerated."
+        ]
+    switches = [
+        item for item in search.get("microphone_processing") or []
+        if isinstance(item, dict) and item.get("on") is True
+    ]
+    if switches:
+        names = ", ".join(f"'{item.get('name')}'" for item in switches)
+        first = switches[0]
+        guidance = [
+            f"These processing switches are on for this microphone: {names}. Turn them off, "
+            f"for example with: amixer -c {first.get('card')} cset name='{first.get('name')}' off, "
+            "then measure again."
+        ]
+    else:
+        guidance = [
+            "Turn off microphone processing such as automatic gain, dynamic range compression "
+            "or noise suppression, or lower the speaker volume if its amplifier is limiting, "
+            "then measure again."
+        ]
+    return warnings, guidance
+
+
 # A search that ends in one of these states cannot produce a usable
 # measurement at any level, so the caller should stop and show the advice.
 LEVEL_SEARCH_ABORT_STATUSES = ("no-signal", "background-too-loud", "level-independent")
@@ -1454,6 +1593,13 @@ def level_after_clipping(
 
 
 def level_search_advice(search: dict) -> tuple[list[str], list[str]]:
+    """Return (warnings, guidance) for a level search: its status and its linearity."""
+    warnings, guidance = _level_status_advice(search)
+    more_warnings, more_guidance = linearity_advice(search)
+    return list(warnings) + more_warnings, list(guidance) + more_guidance
+
+
+def _level_status_advice(search: dict) -> tuple[list[str], list[str]]:
     """Return (warnings, guidance) for a level search that could not settle."""
     status = search.get("status", "")
     level = float(search.get("selected_level_dbfs", 0.0))

@@ -168,6 +168,35 @@ applied inside the headset. It cannot describe a loudspeaker, and a
 calibration fitted to one would be correcting for the headset. Those are named
 in the panel as connected but unusable rather than quietly dropped.
 
+### When the microphone is processed
+
+Laptops with a digital microphone array often run it through a pipeline inside
+the sound firmware: dynamic range compression, automatic gain, noise
+suppression. A sweep cannot be measured through that. A compressor turns the
+level down exactly where the speakers are loud and up where they are weak, so
+the measured curve comes out flatter than the speakers are and the correction
+too weak. PipeWire only sees what comes out of the firmware, and recording from
+the ALSA device directly reads the same point, so there is no raw stream to ask
+for; the mixer switches the firmware exposes are the only handle.
+
+The level probes before every measurement therefore also check that the
+recorded level follows the played level one-for-one. When it does not, the
+result carries a warning, and names the processing switches that are on for
+that microphone together with the `amixer` command that turns one off.
+
+To check a machine without calibrating anything, a few quiet chirps and no
+sweeps:
+
+```console
+python3 speaker-calibrate.py devices-json          # the speaker and microphone names
+python3 speaker-calibrate.py microphone-linearity-json --sink <speaker> --mic <microphone>
+```
+
+With `--bypass` it probes a second time with those switches off and puts them
+back afterwards. The switches are recorded before they are touched, so a run
+that is killed halfway is repaired the next time the helper starts. Calibration
+itself never changes a mixer switch.
+
 ### Comparing the two microphones
 
 Advanced keeps the last measurement from each kind of microphone and draws
