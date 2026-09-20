@@ -1275,6 +1275,37 @@ class MicrophoneCandidateTests(unittest.TestCase):
         self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.80_C3_BA_81_E7_90.1"))
         self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
 
+    def test_monitor_and_spdif_outputs_are_not_the_laptop_s_speakers(self):
+        names = {
+            "alsa_output.pci-0000_00_1f.3.analog-stereo": True,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo": False,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo-extra1": False,
+            "alsa_output.pci-0000_00_1f.3.iec958-stereo": False,
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI1__sink": False,
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink": True,
+            "alsa_output.usb-Sennheiser_BTD_700-02.analog-stereo": False,
+        }
+        sinks = [{"name": name, "description": name, "sample_specification": "s32le 2ch 48000Hz"}
+                 for name in names]
+
+        def pactl(kind):
+            return sinks if kind == "sinks" else []
+
+        default = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=pactl), \
+             mock.patch.object(speaker_calibrate, "run", return_value=default):
+            listed = {item["name"]: item["internal"]
+                      for item in speaker_calibrate.devices_payload()["sinks"]}
+        self.assertEqual(listed, names)
+        # A monitor's speakers start as quietly as any other external output.
+        for name, built_in in names.items():
+            self.assertAlmostEqual(
+                speaker_calibrate.default_sweep_level(name),
+                speaker_calibrate.INTERNAL_SPEAKER_LEVEL_DBFS if built_in
+                else speaker_calibrate.EXTERNAL_SPEAKER_LEVEL_DBFS)
+        self.assertTrue(speaker_calibrate.is_built_in("alsa_input.pci-0000_00_1f.3.analog-stereo"))
+        self.assertFalse(speaker_calibrate.is_built_in("alsa_input.usb-Usb_Microphone-00.mono-fallback"))
+
     def test_devices_identify_pipewire_s_default_microphone(self):
         sources = [
             {"name": "alsa_input.pci-card.HiFi__Mic2__source",

@@ -504,6 +504,22 @@ def channel_count(item):
     return int(found.group(1)) if found else 1
 
 
+# Digital outputs on the machine's own sound card carry sound out of it, to a
+# monitor or an amplifier, so they are not the laptop's speakers however the
+# card is attached.  Treating them as built in started their sweep 15 dB
+# louder than any other external output and let the panel choose a monitor as
+# "the laptop's speakers".
+EXTERNAL_PCI_OUTPUTS = ("hdmi", "iec958", "spdif")
+
+
+def is_built_in(name):
+    """True for the machine's own speakers and microphones."""
+    name = str(name)
+    if name.startswith("alsa_output.pci-"):
+        return not any(kind in name.lower() for kind in EXTERNAL_PCI_OUTPUTS)
+    return name.startswith("alsa_input.pci-")
+
+
 def devices_payload():
     default_source = run(
         ["pactl", "get-default-source"], check=False, capture=True
@@ -517,7 +533,7 @@ def devices_payload():
             "description": short_label(label(item)) or label(item),
             "channels": channel_count(item),
             "kind": kind,
-            "internal": name.startswith(("alsa_input.pci-", "alsa_output.pci-")),
+            "internal": is_built_in(name),
             # A laptop can expose both an unplugged analog microphone jack and
             # its real built-in digital array.  Let the panel select the source
             # WirePlumber chose instead of whichever pactl happened to list first.
@@ -1456,7 +1472,7 @@ def analyze_recording(
 
 def default_sweep_level(sink_name):
     """Built-in speakers get a louder sweep than external outputs."""
-    if sink_name.startswith("alsa_output.pci-"):
+    if is_built_in(sink_name):
         return INTERNAL_SPEAKER_LEVEL_DBFS
     return EXTERNAL_SPEAKER_LEVEL_DBFS
 
