@@ -213,6 +213,46 @@ class FetchTests(ClientTestCase):
         self.assertLess(time.monotonic() - started, 3.0)
 
 
+class CredentialTests(ClientTestCase):
+    TOKEN = "gho_" + "A1b2C3d4" * 5
+
+    def test_the_plugin_never_asks_for_a_token_or_reads_where_one_is_kept(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in ("speaker-calibrate.py", "calibration_share.py", "calibration_io.py", "loudness-tracker.py",
+                     "Panel.qml", "Service.qml", "BarWidget.qml"):
+            source = (root / name).read_text()
+            for forbidden in ("auth token", "show-token", "hosts.yml", "oauth_token", "secret-tool", "GITHUB_TOKEN"):
+                self.assertNotIn(forbidden, source, (name, forbidden))
+        helper = (root / "speaker-calibrate.py").read_text()
+        # The tool is started in two places, both through the runner with the environment of its own.
+        self.assertEqual(helper.count("[GH, "), 2)
+        self.assertEqual(helper.count("env=gh_environment()"), 2)
+
+    def test_a_token_in_what_the_tool_says_never_reaches_the_panel(self):
+        ShareTests.install(self)        # a calibration to share, as the sharing tests set one up
+        said = f"HTTP 401: Bad credentials (token {self.TOKEN}) Authorization: Bearer {self.TOKEN}"
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
+             mock.patch.object(speaker_calibrate, "run_bounded", return_value=(1, "", said)):
+            with self.assertRaises(SystemExit) as stop:
+                speaker_calibrate.share_upload()
+        self.assertIn("did not accept", str(stop.exception))
+        self.assertNotIn(self.TOKEN, str(stop.exception))
+        self.assertNotIn("A1b2C3d4", str(stop.exception))
+        for shaped in (self.TOKEN, "ghp_" + "x" * 36, "github_pat_" + "y" * 40, "Bearer " + "z" * 30):
+            self.assertNotIn(shaped[-12:], speaker_calibrate.without_credentials(f"error: {shaped} end"))
+        self.assertEqual(speaker_calibrate.without_credentials("HTTP 403: forbidden"), "HTTP 403: forbidden")
+
+    def test_a_profile_that_holds_something_shaped_like_a_credential_is_not_sent(self):
+        ShareTests.install(self)        # a calibration to share, as the sharing tests set one up
+        tainted = (dict(speaker_calibrate.public_profile()[0], name=self.TOKEN), "2026-09-20-external-0123456789", "x")
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
+             mock.patch.object(speaker_calibrate, "public_profile", return_value=tainted), \
+             mock.patch.object(speaker_calibrate, "run_bounded") as ran:
+            with self.assertRaisesRegex(SystemExit, "shaped like a credential"):
+                speaker_calibrate.share_upload()
+        ran.assert_not_called()
+
+
 class PanelPageTests(unittest.TestCase):
     """The panel opens two kinds of page and no other; the shapes are in Service.qml, checked here as they stand."""
 

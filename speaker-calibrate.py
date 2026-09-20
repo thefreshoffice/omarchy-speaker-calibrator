@@ -3428,6 +3428,18 @@ GH_OUTPUT_LIMIT_BYTES = 65536
 GH_ENVIRONMENT_KEPT = ("HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG")
 
 
+# The plugin never asks the GitHub tool for its token and the tool does not
+# print it.  This is for the day a version of it, a debug setting or an error
+# from a server does: whatever the tool said is shown in the panel and ends up
+# in the journal, so anything shaped like a GitHub credential is blanked first.
+CREDENTIAL_SHAPES = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?i:bearer|token|authorization:?)\s+[A-Za-z0-9._~+/=-]{20,}")
+
+
+def without_credentials(text):
+    return CREDENTIAL_SHAPES.sub("[credential removed]", str(text or ""))
+
+
 class ToolFailed(Exception):
     pass
 
@@ -3565,6 +3577,10 @@ def share_upload():
     if not gh_signed_in():
         raise SystemExit("The GitHub tool is not signed in here; use Share via the browser instead.")
     body = ("Shared from the Omarchy Speaker Calibrator panel.\n\n### Profile\n\n```text\n" + text + "\n```\n")
+    # What is published is numbers and a handful of fixed words.  Should anything
+    # shaped like a credential ever be in it, nothing is sent.
+    if CREDENTIAL_SHAPES.search(json.dumps(public)):
+        raise SystemExit("This calibration holds something shaped like a credential, so it was not sent.")
     try:
         # The host is part of the repository's name here, so no setting of the tool's can send it elsewhere.
         returncode, stdout, stderr = run_bounded(
@@ -3576,7 +3592,8 @@ def share_upload():
         raise SystemExit(f"The upload did not finish: {error}.")
     found = ISSUE_URL.search(stdout[-2000:])
     if returncode != 0 or not found:
-        raise SystemExit("GitHub did not accept the upload: " + (short_label(stderr[-300:], 300) or "no reason given"))
+        raise SystemExit("GitHub did not accept the upload: "
+                         + (short_label(without_credentials(stderr[-600:])[-300:], 300) or "no reason given"))
     uploads = dict(list(state.get("uploads", {}).items())[-19:])
     uploads[identifier] = found.group(0)
     write_registry_state(uploads=uploads, share_explained=True)
