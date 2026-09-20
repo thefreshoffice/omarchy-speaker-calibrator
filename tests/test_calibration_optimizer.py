@@ -1328,6 +1328,69 @@ class MicrophoneCandidateTests(unittest.TestCase):
             ["Digital Microphone"],
         )
 
+    def test_asahi_devices_default_to_protected_speakers_and_internal_array(self):
+        devices = {
+            "sinks": [
+                {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+                {"name": "audio_effect.j413-convolver", "sample_specification": "float32le 2ch 48000Hz"},
+                {"name": "alsa_output.platform-sound.RawSpeakers"},
+                {"name": "audio_effect.unrelated"},
+                {"name": "omarchy_speaker_tuning"},
+            ],
+            "sources": [
+                {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"},
+                {"name": "alsa_input.platform-sound.HiFi__Headset__source"},
+                {"name": "omarchy_speaker_tuning.monitor"},
+            ],
+        }
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=devices.__getitem__):
+            payload = speaker_calibrate.devices_payload()
+        self.assertEqual([d["name"] for d in payload["sinks"]], [
+            "alsa_output.platform-sound.HiFi__Headphones__sink", "audio_effect.j413-convolver",
+        ])
+        self.assertEqual([d["internal"] for d in payload["sinks"]], [False, True])
+        self.assertEqual([(d["internal"], d["channels"]) for d in payload["microphones"]], [
+            (True, 3), (False, 1),
+        ])
+
+    def test_a_shared_calibration_never_lands_on_asahi_s_raw_speakers(self):
+        # The raw device sits behind the sink that carries the speaker
+        # protection; an import on a machine without a profile picks a speaker
+        # by itself and must pick from the same list the panel offers.
+        sinks = [
+            {"name": "alsa_output.platform-sound.RawSpeakers"},
+            {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+            {"name": "omarchy_speaker_tuning"},
+            {"name": "audio_effect.j413-convolver", "description": "MacBook Air J413 Speakers"},
+        ]
+        with mock.patch.object(speaker_calibrate, "load_profile", return_value=None), \
+             mock.patch.object(speaker_calibrate, "pactl_json", return_value=sinks):
+            self.assertEqual(speaker_calibrate.local_speaker()["name"], "audio_effect.j413-convolver")
+
+    def test_built_in_means_the_same_on_every_kind_of_machine(self):
+        for name, built_in in {
+            "audio_effect.j413-convolver": True,
+            "alsa_input.platform-sound.RawMics": True,
+            "alsa_output.platform-sound.RawSpeakers": False,
+            "alsa_output.platform-sound.HiFi__Headphones__sink": False,
+            "alsa_input.platform-sound.HiFi__Headset__source": False,
+            "effect_output.j413-mic": False,
+            "alsa_output.pci-0000_00_1f.3.analog-stereo": True,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo": False,
+            "alsa_input.pci-0000_00_1f.3.analog-stereo": True,
+        }.items():
+            self.assertEqual(speaker_calibrate.is_built_in(name), built_in, name)
+
+    def test_asahi_array_can_measure_all_channels(self):
+        sink = {"name": "audio_effect.j413-convolver"}
+        mic = {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"}
+        with mock.patch.object(speaker_calibrate, "physical_sinks", return_value=[sink]), \
+             mock.patch.object(speaker_calibrate, "microphones", return_value=[mic]), \
+             mock.patch.object(speaker_calibrate, "build_profile", return_value={"measured": True}) as measure:
+            result = speaker_calibrate.calibrate_noninteractive(sink["name"], mic["name"], "all", "neutral")
+        self.assertEqual(result, {"measured": True})
+        measure.assert_called_once_with(sink, mic, "all", "neutral", None, "protected", "normal", "off")
+
 
 class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""
@@ -1711,6 +1774,112 @@ class SharedCalibrationTests(unittest.TestCase):
             valid(rejected)
         with self.assertRaisesRegex(ValueError, "not a shared"):
             valid({"format": "something-else/1"})
+
+    INJECTION = 'x" } } } ] context.exec = [ { path = "/usr/bin/sh" args = "-c id" } ] j = [ { a = { b = { c = "'
+
+    def test_a_speaker_name_inside_the_file_never_reaches_the_configuration(self):
+        # The file claims this machine's speakers in its hardware record, which
+        # is what the import compares, and hides another name in the profile,
+        # which is what used to be installed.
+        hostile = self.shared()
+        hostile["hardware"]["speaker"] = "alsa_output.pci-test.analog-stereo"
+        hostile["profile"]["speaker"] = {"name": self.INJECTION, "description": "Built-in Audio"}
+        self.write_shared("hostile.speaker-calibration.json", hostile)
+        result = speaker_calibrate.import_profile(name="hostile.speaker-calibration.json")
+        self.assertTrue(result["matches"]["speakers"])
+        self.assertEqual(result["proposal"]["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
+        self.assertNotIn("context.exec", (self.data / "proposed-profile.json").read_text())
+
+    def test_no_writer_of_configuration_accepts_a_name_pipewire_would_not_give(self):
+        fit = self.profile()["fit"]
+        for name in (self.INJECTION, "-rf", "", "a b", "sink'$(id)", None, 7):
+            with self.assertRaises(SystemExit, msg=repr(name)):
+                speaker_calibrate.filter_config(name, fit)
+            with self.assertRaises(SystemExit, msg=repr(name)):
+                speaker_calibrate.trial_graph('target.object = "@SPEAKER_SINK@"', name)
+            with mock.patch.object(speaker_calibrate, "run") as ran:
+                with self.assertRaises(SystemExit, msg=repr(name)):
+                    speaker_calibrate.move_apps(name)
+                ran.assert_not_called()
+        for name in ("alsa_output.pci-0000_00_1f.3.analog-stereo", "audio_effect.j413-convolver",
+                     "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+                     "alsa_output.usb-Sennheiser_BTD_700_09B88CA972B269AB3C08-02.analog-stereo"):
+            self.assertEqual(speaker_calibrate.checked_sink_name(name), name)
+
+    def test_a_raw_device_behind_a_protected_sink_is_not_a_match(self):
+        asahi = self.shared()
+        asahi["hardware"]["speaker"] = "alsa_output.platform-sound.RawSpeakers"
+        self.write_shared("asahi.speaker-calibration.json", asahi)
+        sinks = [{"name": "alsa_output.platform-sound.RawSpeakers"},
+                 {"name": "audio_effect.j413-convolver", "description": "MacBook Air J413 Speakers"}]
+        with mock.patch.object(speaker_calibrate, "pactl_json", lambda kind: sinks):
+            result = speaker_calibrate.import_profile(name="asahi.speaker-calibration.json")
+        self.assertFalse(result["matches"]["speakers"])
+        self.assertEqual(result["proposal"]["speaker"]["name"], "audio_effect.j413-convolver")
+
+    def test_the_date_is_a_date_or_the_file_is_refused(self):
+        valid = speaker_calibrate.valid_shared_payload
+        for when in ("2026-09-16", "2026-09-16T10:00:00+00:00", "2026-09-16T10:00:00.123456Z"):
+            shared = self.shared(); shared["profile"]["created_at"] = when
+            valid(shared)
+        for when in ('$(id)      ', '";rm -rf ~', "2026-09-1`", "", None, 20260916):
+            shared = self.shared(); shared["profile"]["created_at"] = when
+            with self.assertRaisesRegex(ValueError, "date", msg=repr(when)):
+                valid(shared)
+
+    def test_files_built_to_break_the_parser_do_not_break_the_panel(self):
+        crafted = {
+            "deep.speaker-calibration.json": "[" * 200000,
+            "huge-number.speaker-calibration.json": json.dumps(self.shared()).replace("600.0", "9" * 400, 1),
+            "hardware-list.speaker-calibration.json": json.dumps({**self.shared(), "hardware": [1, 2]}),
+            "speaker-dict.speaker-calibration.json": json.dumps(
+                {**self.shared(), "hardware": {**self.OURS, "speaker": {"a": 1}}}),
+        }
+        for name, text in crafted.items():
+            (self.downloads / name).write_text(text)
+        rows = speaker_calibrate.shared_profiles()
+        self.assertEqual(sorted(row["file"] for row in rows), sorted(crafted))
+        self.assertFalse(any(row["valid"] for row in rows))
+        for name in crafted:
+            with self.assertRaises(SystemExit, msg=name):
+                speaker_calibrate.import_profile(name=name)
+
+    def test_a_calibration_too_large_for_a_status_reply_is_refused(self):
+        bulky = self.shared()
+        bulky["profile"]["measurement"] = {"curve": [[float(i)] * 8 for i in range(4000)]}
+        with self.assertRaisesRegex(ValueError, "larger than any"):
+            speaker_calibrate.valid_shared_payload(bulky)
+
+    def test_the_listing_shows_only_names_the_import_accepts(self):
+        self.write_shared("fine.speaker-calibration.json", self.shared())
+        self.write_shared("-dash first.speaker-calibration.json", self.shared())
+        self.write_shared("semi;colon.speaker-calibration.json", self.shared())
+        self.assertEqual([row["file"] for row in speaker_calibrate.shared_profiles()],
+                         ["fine.speaker-calibration.json"])
+
+    def test_the_export_carries_no_path_and_no_device_serial(self):
+        profile = self.profile()
+        profile["microphone"]["name"] = "alsa_input.usb-Sennheiser_BTD_700_09B88CA972B269AB3C08-02.mono-fallback"
+        profile["measurement"] = {"microphone_calibration": {
+            "path": "/home/someone/Documents/umik-7091234.txt", "points": 512, "kind": "frequency-response"}}
+        self.install_active(profile)
+        text = (self.downloads / speaker_calibrate.export_profile()["file"]).read_text()
+        for private in ("/home/", "someone", "7091234", "09B88CA972B269AB3C08"):
+            self.assertNotIn(private, text)
+        exported = json.loads(text)["profile"]
+        self.assertEqual(exported["measurement"]["microphone_calibration"], {"points": 512, "kind": "frequency-response"})
+        self.assertEqual(exported["microphone"]["description"], "Usb Microphone")
+        # And what it wrote can be read back by the same plugin.
+        speaker_calibrate.valid_shared_payload(json.loads(text))
+
+    def test_disable_also_ends_an_exported_tuning_on_trial(self):
+        self.install_active()
+        with mock.patch.object(speaker_calibrate, "run"), \
+             mock.patch.object(speaker_calibrate, "move_apps"), \
+             mock.patch.object(speaker_calibrate, "forget_loudness_tracker"), \
+             mock.patch.object(speaker_calibrate, "stop_trial_host") as stopped:
+            speaker_calibrate.disable()
+        stopped.assert_called_once_with()
 
     def test_bad_names_symlinks_and_oversized_files_are_refused(self):
         with self.assertRaises(SystemExit):
