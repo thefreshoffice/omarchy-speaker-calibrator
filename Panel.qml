@@ -86,8 +86,10 @@ Panel {
       if (service.sinks[sinkIndex].internal === true) { sink = sinkIndex; break }
     root.sinkIndex = sink >= 0 ? sink : (service.sinks.length > 0 ? 0 : -1)
     var mic = -1
+    for (var defaultIndex = 0; defaultIndex < service.microphones.length; defaultIndex++)
+      if (service.microphones[defaultIndex].default === true) { mic = defaultIndex; break }
     for (var micIndex = 0; micIndex < service.microphones.length; micIndex++)
-      if (service.microphones[micIndex].internal === true) { mic = micIndex; break }
+      if (mic < 0 && service.microphones[micIndex].internal === true) { mic = micIndex; break }
     root.micIndex = mic >= 0 ? mic : (service.microphones.length > 0 ? 0 : -1)
   }
 
