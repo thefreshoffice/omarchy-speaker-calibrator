@@ -3237,25 +3237,47 @@ def registry_fetch(path):
         urllib.request.HTTPSHandler(context=ssl.create_default_context()))
     request = urllib.request.Request(share.REGISTRY_ORIGIN + path, headers={
         "User-Agent": f"omarchy-speaker-calibrator/{plugin_version()}", "Accept": "application/json"})
-    deadline = time.monotonic() + REGISTRY_TIMEOUT_SECONDS
-    try:
-        with opener.open(request, timeout=REGISTRY_TIMEOUT_SECONDS) as response:
-            if response.status != 200:
-                return None
-            data = bytearray()
-            while len(data) <= REGISTRY_FETCH_LIMIT:
-                if time.monotonic() > deadline:
-                    raise SystemExit("The registry took too long to answer.")
-                chunk = response.read(min(65536, REGISTRY_FETCH_LIMIT + 1 - len(data)))
-                if not chunk:
-                    break
-                data += chunk
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-        raise SystemExit(f"The registry answered with an error ({error.code}).")
-    except (urllib.error.URLError, OSError, ssl.SSLError) as error:
-        raise SystemExit(f"The registry could not be reached ({type(error).__name__}).")
+    import threading
+    outcome = {}
+
+    def transfer():
+        try:
+            with opener.open(request, timeout=REGISTRY_TIMEOUT_SECONDS) as response:
+                if response.status != 200:
+                    outcome["data"] = None
+                    return
+                data = bytearray()
+                while len(data) <= REGISTRY_FETCH_LIMIT:
+                    # read1 returns what has arrived; read would wait for the whole count.
+                    chunk = response.read1(min(65536, REGISTRY_FETCH_LIMIT + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                outcome["data"] = data
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                outcome["data"] = None
+            else:
+                outcome["error"] = f"The registry answered with an error ({int(error.code)})."
+        except Exception as error:       # noqa: BLE001 - whatever went wrong, it is not "no such file"
+            outcome["error"] = f"The registry could not be reached ({type(error).__name__})."
+
+    # A socket timeout is per operation and does not cover looking the name
+    # up, so a slow resolver or a peer that trickles would hold this open for
+    # as long as it liked.  The transfer runs beside a clock instead: when the
+    # time is up the answer is no, and the thread ends with this process.
+    worker = threading.Thread(target=transfer, daemon=True)
+    worker.start()
+    worker.join(REGISTRY_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise SystemExit("The registry took too long to answer.")
+    if "error" in outcome:
+        raise SystemExit(outcome["error"])
+    if "data" not in outcome:
+        raise SystemExit("The registry could not be reached.")
+    data = outcome["data"]
+    if data is None:
+        return None
     if len(data) > REGISTRY_FETCH_LIMIT:
         raise SystemExit("The registry sent more than any of its files should hold.")
     return data.decode("utf-8", "replace")
@@ -3398,14 +3420,119 @@ def public_profile():
         raise SystemExit(f"This calibration cannot be shared: {error}.")
 
 
+GH_OUTPUT_LIMIT_BYTES = 65536
+# What the GitHub tool is started with, and nothing else.  It holds the user's
+# token, so it does not inherit a PATH, a GH_HOST, a GH_TOKEN, a proxy or a
+# GIT_DIR from whatever started the shell: it finds its own sign-in through the
+# home directory and the session keyring, and talks to github.com.
+GH_ENVIRONMENT_KEPT = ("HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG")
+
+
+class ToolFailed(Exception):
+    pass
+
+
+def gh_environment():
+    env = {key: os.environ[key] for key in GH_ENVIRONMENT_KEPT if os.environ.get(key)}
+    env.update(PATH="/usr/bin:/bin", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1",
+               GH_HOST="github.com")
+    return env
+
+
+def run_bounded(argv, *, input_text=None, env=None, seconds=GH_TIMEOUT_SECONDS, limit=GH_OUTPUT_LIMIT_BYTES):
+    """Run a tool under one deadline, with a ceiling on what it may say, in a group that is cleaned up.
+
+    Returns (returncode, stdout, stderr).  Output is read as it arrives and
+    counted before it is kept, so a tool that talks without end is stopped
+    instead of being remembered; the deadline is for the whole run, and the
+    whole process group is ended and reaped however the run ends.
+    """
+    import selectors
+    deadline = time.monotonic() + seconds
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, close_fds=True,
+                                start_new_session=True)
+    except OSError as error:
+        raise ToolFailed(type(error).__name__)
+    kept = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    pending = memoryview((input_text or "").encode("utf-8"))
+    failure = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in kept:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            if input_text is not None:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE)
+            while selector.get_map():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    failure = "it took too long"
+                    break
+                for key, _ in selector.select(min(left, 1.0)):
+                    stream = key.fileobj
+                    if stream is proc.stdin:
+                        try:
+                            pending = pending[os.write(stream.fileno(), pending[:65536]):]
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            pending = pending[:0]
+                        if not len(pending):
+                            selector.unregister(stream)
+                            stream.close()
+                        continue
+                    try:
+                        chunk = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        continue
+                    kept[stream] += chunk
+                    if sum(len(data) for data in kept.values()) > limit:
+                        failure = "it said more than it should"
+                        break
+                if failure:
+                    break
+            if failure is None:
+                try:
+                    proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    failure = "it took too long"
+    finally:
+        # The whole group, whatever happened: a tool that started helpers leaves none behind.
+        for signal_number, grace in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
+            if proc.poll() is not None and failure is None:
+                break
+            try:
+                os.killpg(proc.pid, signal_number)
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except OSError:
+                pass
+    if failure:
+        raise ToolFailed(failure)
+    return proc.returncode, kept[proc.stdout].decode("utf-8", "replace"), kept[proc.stderr].decode("utf-8", "replace")
+
+
 def gh_signed_in():
     if not Path(GH).exists():
         return False
     try:
-        return subprocess.run([GH, "auth", "status", "--hostname", "github.com"], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=GH_TIMEOUT_SECONDS).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        return run_bounded([GH, "auth", "status", "--hostname", "github.com"], env=gh_environment())[0] == 0
+    except ToolFailed:
         return False
 
 
@@ -3439,16 +3566,17 @@ def share_upload():
         raise SystemExit("The GitHub tool is not signed in here; use Share via the browser instead.")
     body = ("Shared from the Omarchy Speaker Calibrator panel.\n\n### Profile\n\n```text\n" + text + "\n```\n")
     try:
-        done = subprocess.run(
-            [GH, "issue", "create", "--repo", share.REGISTRY_REPOSITORY,
+        # The host is part of the repository's name here, so no setting of the tool's can send it elsewhere.
+        returncode, stdout, stderr = run_bounded(
+            [GH, "issue", "create", "--repo", f"github.com/{share.REGISTRY_REPOSITORY}",
              "--title", f"Calibration for {public['hardware']['label']} ({public['public']['microphone_kind']})",
              "--body-file", "-"],
-            input=body, text=True, capture_output=True, timeout=GH_TIMEOUT_SECONDS)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise SystemExit(f"The upload did not finish ({type(error).__name__}).")
-    found = ISSUE_URL.search(done.stdout[-2000:] if done.stdout else "")
-    if done.returncode != 0 or not found:
-        raise SystemExit("GitHub did not accept the upload: " + (short_label(done.stderr[-300:], 300) or "no reason given"))
+            input_text=body, env=gh_environment())
+    except ToolFailed as error:
+        raise SystemExit(f"The upload did not finish: {error}.")
+    found = ISSUE_URL.search(stdout[-2000:])
+    if returncode != 0 or not found:
+        raise SystemExit("GitHub did not accept the upload: " + (short_label(stderr[-300:], 300) or "no reason given"))
     uploads = dict(list(state.get("uploads", {}).items())[-19:])
     uploads[identifier] = found.group(0)
     write_registry_state(uploads=uploads, share_explained=True)

@@ -366,7 +366,8 @@ it works for adds a little. The
 [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles) has a
 page per machine with every profile's graph.
 
-To share yours, press **Share with everyone** under Advanced. Checking the
+To share yours, press **Share this calibration with everyone**, just above the
+Advanced switch. Checking the
 calibration first raises its score. A new upload for the same machine and kind
 of microphone takes the place of your earlier one.
 
@@ -450,16 +451,23 @@ and neither happens by itself:
   you load it. The request carries no cookie, no credential and no identifier;
   GitHub sees your address and which model's list was asked for, as any web
   server would. After a no, or **Stop looking online**, nothing is requested.
-- **Sharing your calibration.** Only when you press **Share with everyone**,
-  which the first time shows what it sends: the filters, the measured and
-  corrected curves, how the measurement went, and your machine's model as its
-  firmware names it (vendor, product, SKU, board). It never contains your user
-  name, a path, a device name or serial, a recording, or free text of any
-  kind. With the GitHub command line tool signed in, the plugin hands that tool
-  the profile and the tool submits it under your account; the plugin never sees
-  your token. Without the tool, the profile goes to your clipboard and the
-  registry's form opens in your browser. Either way it is published under your
-  GitHub account and under CC0.
+- **Sharing your calibration.** Only when you press **Share this calibration
+  with everyone**, which the first time shows what it sends: the filters, the
+  measured and corrected curves, how the measurement went, your machine's model
+  as its firmware names it (vendor, product, SKU, board), and the name PipeWire
+  gives the laptop's own speakers, which is their place on the board (for
+  example `alsa_output.pci-0000_00_1f.3.analog-stereo`). It never contains your
+  user name, a path, a microphone's name, the name of a USB or Bluetooth
+  output, a serial number, a recording, or free text of any kind. The press
+  first asks the GitHub command line tool (`/usr/bin/gh`) whether it is signed
+  in, which reaches GitHub. If it is, the plugin hands that tool the profile on
+  its standard input and the tool submits it under your account; the plugin
+  never sees your token, and starts the tool without the environment's `PATH`,
+  proxy, host or token settings, always for `github.com`. Without the tool, the
+  profile goes to your clipboard and the registry's form opens in your browser.
+  Either way it is published under your GitHub account and under CC0, and
+  stays published when the plugin is removed: to withdraw it, comment on its
+  page in the registry.
 
 What comes back is treated as data from a stranger: a size limit on every read,
 no redirects followed, no proxy taken from the environment, every row of a list

@@ -2,6 +2,9 @@
 
 import importlib.util
 import json
+import re
+import time
+import os
 import subprocess
 import sys
 import tempfile
@@ -141,7 +144,7 @@ class FetchTests(ClientTestCase):
         def __init__(self, status, body):
             self.status, self.body, self.sent = status, body, 0
 
-        def read(self, size):
+        def read1(self, size):
             chunk = self.body[self.sent:self.sent + size]
             self.sent += len(chunk)
             return chunk
@@ -194,6 +197,104 @@ class FetchTests(ClientTestCase):
         self.assertIn("could not be reached", str(broken))
         refused = self.fetch("index/a/b.json", error=urllib.error.HTTPError("u", 500, "x", {}, None))[0]
         self.assertIn("error (500)", str(refused))
+
+
+    def test_one_clock_covers_the_whole_request_the_name_lookup_included(self):
+        import threading
+        release = threading.Event()
+        self.addCleanup(release.set)
+        opener = mock.Mock()
+        opener.open.side_effect = lambda *args, **kwargs: release.wait(30)       # a resolver that never answers
+        started = time.monotonic()
+        with mock.patch("urllib.request.build_opener", return_value=opener), \
+             mock.patch.object(speaker_calibrate, "REGISTRY_TIMEOUT_SECONDS", 0.3):
+            with self.assertRaisesRegex(SystemExit, "too long"):
+                speaker_calibrate.registry_fetch("index/a/b.json")
+        self.assertLess(time.monotonic() - started, 3.0)
+
+
+class PanelPageTests(unittest.TestCase):
+    """The panel opens two kinds of page and no other; the shapes are in Service.qml, checked here as they stand."""
+
+    def shapes(self):
+        source = (Path(__file__).resolve().parents[1] / "Service.qml").read_text()
+        block = source[source.index("_registryPages: ["):source.index("function openRegistryPage")]
+        found = re.findall(r"^\s*/(\^.+\$)/,?\s*$", block, re.M)
+        self.assertEqual(len(found), 2)
+        return [re.compile(item.replace("\\/", "/")) for item in found]
+
+    def opens(self, address):
+        return len(address) <= 600 and any(shape.fullmatch(address) for shape in self.shapes())
+
+    def test_what_the_helper_answers_is_opened(self):
+        self.assertTrue(self.opens(f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12"))
+        import urllib.parse
+        for label in ("SLIMBOOK Executive-14-UC2", "Dell Inc. XPS 13 9310 (2-in-1) / A&B #3, rev:2"):
+            title = f"Calibration for {label} (external microphone)"
+            address = (f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/new?"
+                       + urllib.parse.urlencode({"template": "profile.yml", "title": title}))
+            self.assertTrue(self.opens(address), address)
+
+    def test_nothing_else_is(self):
+        base = f"https://github.com/{share.REGISTRY_REPOSITORY}"
+        for address in (f"{base}/../../evil/repo/issues/1", f"{base}/issues/1/../../../../evil", f"{base}/issues/1?x=1",
+                        f"{base}/issues/1#x", f"{base}.evil.example/issues/1", f"https://github.com.evil.example/issues/1",
+                        f"http://github.com/{share.REGISTRY_REPOSITORY}/issues/1", f"{base}/issues/new?template=evil.yml&title=x",
+                        f"{base}/issues/new?template=profile.yml&title=x&body=y", f"{base}/issues/new?template=profile.yml&title=<img>",
+                        f"https://user@github.com/{share.REGISTRY_REPOSITORY}/issues/1", "file:///etc/passwd", "javascript:alert(1)",
+                        f"{base}/issues/1\nhttps://evil.example", f"{base}/issues/new?template=profile.yml&title=" + "a" * 700, ""):
+            self.assertFalse(self.opens(address), address)
+
+
+class BoundedToolTests(unittest.TestCase):
+    """The runner the GitHub tool goes through, against real processes."""
+
+    def test_what_it_is_given_arrives_on_standard_input_and_the_answer_comes_back(self):
+        # More than a pipe holds, so writing and reading have to take turns.
+        code, out, err = speaker_calibrate.run_bounded(["/usr/bin/cat"], input_text="profile " * 20000, limit=200_000)
+        self.assertEqual((code, len(out), err), (0, 160000, ""))
+        code, out, err = speaker_calibrate.run_bounded(["/usr/bin/cat"], input_text="hello", limit=100)
+        self.assertEqual((code, out, err), (0, "hello", ""))
+        code, out, err = speaker_calibrate.run_bounded(["/usr/bin/sh", "-c", "echo no >&2; exit 3"])
+        self.assertEqual((code, out, err), (3, "", "no\n"))
+
+    def test_a_tool_that_talks_without_end_is_stopped_not_remembered(self):
+        started = time.monotonic()
+        with self.assertRaisesRegex(speaker_calibrate.ToolFailed, "more than it should"):
+            speaker_calibrate.run_bounded(["/usr/bin/yes"], limit=50_000, seconds=20)
+        self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_one_deadline_for_the_whole_run_and_nothing_left_behind(self):
+        marker = f"calibrator-test-{os.getpid()}-{time.monotonic_ns()}"
+        started = time.monotonic()
+        with self.assertRaisesRegex(speaker_calibrate.ToolFailed, "too long"):
+            # The tool starts a helper of its own; both belong to the group that is ended.
+            speaker_calibrate.run_bounded(["/usr/bin/sh", "-c", f"sleep 60 & exec -a {marker} sleep 60"], seconds=0.5)
+        self.assertLess(time.monotonic() - started, 8.0)
+        time.sleep(0.2)
+        left = subprocess.run(["/usr/bin/pgrep", "-f", marker], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(left, "")
+
+    def test_a_tool_that_is_not_there_is_a_failure_not_a_crash(self):
+        with self.assertRaises(speaker_calibrate.ToolFailed):
+            speaker_calibrate.run_bounded(["/usr/bin/no-such-tool-here"])
+
+    def test_the_github_tool_inherits_no_path_host_token_or_proxy(self):
+        hostile = {"PATH": "/tmp/evil:/usr/bin", "GH_HOST": "evil.example", "GH_TOKEN": "ghp_x", "GH_REPO": "evil/repo",
+                   "GH_CONFIG_DIR": "/tmp/evil", "HTTPS_PROXY": "http://evil.example:8080", "GIT_DIR": "/tmp/evil",
+                   "LD_PRELOAD": "/tmp/evil.so", "BASH_ENV": "/tmp/evil.sh", "HOME": "/home/someone",
+                   "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            env = speaker_calibrate.gh_environment()
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(env["GH_HOST"], "github.com")
+        self.assertEqual((env["HOME"], env["DBUS_SESSION_BUS_ADDRESS"]), ("/home/someone", "unix:path=/run/user/1000/bus"))
+        for gone in ("GH_TOKEN", "GH_REPO", "GH_CONFIG_DIR", "HTTPS_PROXY", "GIT_DIR", "LD_PRELOAD", "BASH_ENV"):
+            self.assertNotIn(gone, env)
+        with mock.patch.object(speaker_calibrate, "run_bounded", return_value=(0, "", "")) as ran, \
+             mock.patch.object(speaker_calibrate.Path, "exists", return_value=True):
+            self.assertTrue(speaker_calibrate.gh_signed_in())
+        self.assertEqual(ran.call_args.kwargs["env"]["PATH"], "/usr/bin:/bin")
 
 
 class LoadTests(ClientTestCase):
@@ -250,18 +351,19 @@ class ShareTests(ClientTestCase):
 
     def test_one_press_the_profile_goes_to_the_github_tool_on_standard_input(self):
         self.install()
-        created = subprocess.CompletedProcess([], 0, stdout=f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12\n", stderr="")
+        created = (0, f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12\n", "")
         with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
-             mock.patch.object(speaker_calibrate.subprocess, "run", return_value=created) as ran:
+             mock.patch.object(speaker_calibrate, "run_bounded", return_value=created) as ran:
             result = speaker_calibrate.share_upload()
             again = speaker_calibrate.share_upload()
         self.assertEqual(ran.call_count, 1)                                     # the second press uploads nothing
         command = ran.call_args.args[0]
         self.assertEqual(command[:3], ["/usr/bin/gh", "issue", "create"])
-        self.assertEqual(command[command.index("--repo") + 1], share.REGISTRY_REPOSITORY)
+        self.assertEqual(command[command.index("--repo") + 1], "github.com/" + share.REGISTRY_REPOSITORY)   # the host is pinned
         self.assertEqual(command[-2:], ["--body-file", "-"])
         self.assertNotIn(share.SUBMISSION_PREFIX, " ".join(command))            # never on the command line
-        body = ran.call_args.kwargs["input"]
+        body = ran.call_args.kwargs["input_text"]
+        self.assertEqual(ran.call_args.kwargs["env"], speaker_calibrate.gh_environment())
         self.assertEqual(share.decode_submission(body), speaker_calibrate.public_profile()[0])
         self.assertEqual(result["url"], f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12")
         self.assertEqual(again["url"], result["url"])
@@ -269,10 +371,10 @@ class ShareTests(ClientTestCase):
 
     def test_an_answer_that_is_not_the_registry_s_issue_is_not_recorded(self):
         self.install()
-        for done in (subprocess.CompletedProcess([], 0, stdout="https://evil.example/issues/1\n", stderr=""),
-                     subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 403 <b>forbidden</b>")):
+        for done in ((0, "https://evil.example/issues/1\n", ""),
+                     (1, "", "HTTP 403 <b>forbidden</b>")):
             with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
-                 mock.patch.object(speaker_calibrate.subprocess, "run", return_value=done):
+                 mock.patch.object(speaker_calibrate, "run_bounded", return_value=done):
                 with self.assertRaisesRegex(SystemExit, "did not accept"):
                     speaker_calibrate.share_upload()
         self.assertEqual(speaker_calibrate.registry_state()["uploads"], {})
@@ -280,7 +382,7 @@ class ShareTests(ClientTestCase):
     def test_without_the_tool_it_says_so_and_runs_nothing(self):
         self.install()
         with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=False), \
-             mock.patch.object(speaker_calibrate.subprocess, "run") as ran:
+             mock.patch.object(speaker_calibrate, "run_bounded") as ran:
             with self.assertRaisesRegex(SystemExit, "browser"):
                 speaker_calibrate.share_upload()
         ran.assert_not_called()
@@ -296,9 +398,9 @@ class ShareTests(ClientTestCase):
 
     def test_the_button_asks_the_first_time_and_is_one_press_after_that(self):
         self.install()
-        created = subprocess.CompletedProcess([], 0, stdout=f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/5\n", stderr="")
+        created = (0, f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/5\n", "")
         with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
-             mock.patch.object(speaker_calibrate.subprocess, "run", return_value=created) as ran:
+             mock.patch.object(speaker_calibrate, "run_bounded", return_value=created) as ran:
             first = speaker_calibrate.share_press()
             self.assertEqual((first["state"], first["one_press"]), ("confirm", True))
             ran.assert_not_called()                                              # asked, nothing sent
@@ -311,7 +413,7 @@ class ShareTests(ClientTestCase):
         # A later calibration, once the explanation has been seen, is one press.
         self.install(created="2026-10-01T09:00:00+00:00")
         with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
-             mock.patch.object(speaker_calibrate.subprocess, "run", return_value=created) as ran:
+             mock.patch.object(speaker_calibrate, "run_bounded", return_value=created) as ran:
             self.assertEqual(speaker_calibrate.share_press()["state"], "uploaded")
             self.assertEqual(ran.call_count, 1)
 

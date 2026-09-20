@@ -204,6 +204,20 @@ class FindingTests(unittest.TestCase):
         self.assertEqual(tier({}, self.OURS), 0)
         self.assertEqual(tier("nonsense", None), 0)
 
+    def test_only_a_laptop_s_own_speaker_name_travels(self):
+        def speaker_of(name):
+            document = shared()
+            document["hardware"]["speaker"] = name
+            return share.public_payload(document)["hardware"]["speaker"]
+        for kept in ("alsa_output.pci-0000_00_1f.3.analog-stereo", "alsa_output.pci-0000_c1_00.6.HiFi__Speaker__sink",
+                     "audio_effect.j413-convolver"):
+            self.assertEqual(speaker_of(kept), kept)
+        # Named after the device: a serial number, a Bluetooth address, or nothing a stranger needs.
+        for dropped in ("alsa_output.usb-Sennheiser_BTD_700_09B88CA972B269AB3C08-00.analog-stereo",
+                        "bluez_output.AA_BB_CC_DD_EE_FF.1", "alsa_output.platform-sound.RawSpeakers",
+                        "omarchy_speaker_tuning", "audio_effect.j413-convolver.monitor", "x" * 300, 7, None):
+            self.assertIsNone(speaker_of(dropped), dropped)
+
     def test_a_clean_unchecked_measurement_scores_decently_and_a_check_adds_proof(self):
         def scored(internal, calibrated, verification, votes=0):
             profile = shared()

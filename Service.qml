@@ -203,12 +203,21 @@ Item {
   function registryLoad(identifier) { start("registryload", ["registry-load-json", "--id", String(identifier), "--preview"]) }
   function share(confirmed) { start("share", ["share-json"].concat(confirmed ? ["--confirmed"] : [])) }
   // Only ever the registry's own pages, whatever a reply says.
+  // The two pages this ever opens, each in its whole shape: a submission's
+  // issue, and the registry's form with a title made of plain words.
+  readonly property var _registryPages: [
+    /^https:\/\/github\.com\/thefreshoffice\/omarchy-speaker-profiles\/issues\/[0-9]{1,9}$/,
+    /^https:\/\/github\.com\/thefreshoffice\/omarchy-speaker-profiles\/issues\/new\?template=profile\.yml&title=[A-Za-z0-9+%._()-]{1,300}$/
+  ]
   function openRegistryPage(url) {
     var address = String(url || "")
-    if (address.indexOf("https://github.com/thefreshoffice/omarchy-speaker-profiles/") === 0
-        && !/[\s"'<>\\]/.test(address))
-      Qt.openUrlExternally(address)
+    if (address.length > 600) return
+    for (var index = 0; index < _registryPages.length; index++)
+      if (_registryPages[index].test(address)) { Qt.openUrlExternally(address); return }
   }
+  // When the list was last asked for by itself, so that being offline does
+  // not turn every status poll into another request.
+  property double _registryAskedAt: 0
   // Keep a hand-picked speaker and microphone across a restart.  The newest
   // pick wins when several arrive while something else holds the process.
   property var _rememberPending: null
@@ -433,8 +442,11 @@ Item {
             // After a yes, the list keeps itself current: the helper asks the
             // registry at most once a day, and quietly.
             var lookedAt = Number(statusPayload.registry.checked_at || 0)
-            if (statusPayload.registry.consent === "allowed" && Date.now() / 1000 - lookedAt > 86400)
+            if (statusPayload.registry.consent === "allowed" && Date.now() / 1000 - lookedAt > 86400
+                && Date.now() - root._registryAskedAt > 3600 * 1000) {
+              root._registryAskedAt = Date.now()
               Qt.callLater(function () { root.registryLookup(false) })
+            }
           }
           root.setProposal(statusPayload.proposal || null)
           // A background refresh has nothing to report; leaving "Working…" on

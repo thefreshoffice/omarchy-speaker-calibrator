@@ -39,6 +39,11 @@ SUBMISSION_LIMIT_CHARS = 60_000
 HARDWARE_FIELDS = ("sys_vendor", "product_name", "product_version", "product_sku", "board_name")
 HARDWARE_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._()+/&,#:-]{0,79}")
 DEVICE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,199}")
+# The only speaker names that travel: a laptop's own.  PipeWire names those by
+# where they sit on the board (a PCI address, or Asahi's model number), which
+# says nothing the hardware record does not already say.  A USB or Bluetooth
+# output is named after the device, serial number or address included.
+PUBLIC_SPEAKER = re.compile(r"alsa_output\.pci-[A-Za-z0-9._:+-]{1,180}|audio_effect\.j[0-9]{1,4}-convolver")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 VERSION = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}")
 
@@ -136,7 +141,8 @@ def public_payload(shared, verification=None):
     hardware = {field: hardware_text(theirs.get(field)) for field in HARDWARE_FIELDS}
     hardware["label"] = hardware_text(" ".join(part for part in (hardware["sys_vendor"], hardware["product_name"]) if part))
     speaker = theirs.get("speaker")
-    hardware["speaker"] = speaker if isinstance(speaker, str) and DEVICE_NAME.fullmatch(speaker) else None
+    hardware["speaker"] = speaker if isinstance(speaker, str) and DEVICE_NAME.fullmatch(speaker) \
+        and PUBLIC_SPEAKER.fullmatch(speaker) else None
     if not hardware["sys_vendor"] or not hardware["product_name"]:
         raise NotAPublicProfile("the firmware does not name this machine, so nobody could find the profile")
 
