@@ -43,6 +43,13 @@ In the copy, find the `node.software-dsp.rules` entry for
 systemctl --user restart wireplumber
 ```
 
+Until then the panel lists the MacBook microphone as unsupported and says why:
+that source is the array behind an adaptive beamformer, which re-estimates its
+weights while a sweep runs and suppresses sound that does not come from the
+user, the speakers included. A correction fitted through it would describe the
+beamformer. WirePlumber withdraws every client's access to the raw array, so
+the plugin cannot reach it by itself.
+
 The array then appears as `alsa_input.platform-sound.RawMics`, and the panel
 offers it as the built-in microphone with one channel per microphone. The copy
 shadows Asahi's packaged file, so repeat the one-line change after an

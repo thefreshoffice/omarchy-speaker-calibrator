@@ -1384,6 +1384,28 @@ class MicrophoneCandidateTests(unittest.TestCase):
             (True, 3), (False, 1),
         ])
 
+    def test_a_stock_asahi_machine_is_told_that_its_array_is_hidden(self):
+        # asahi-audio as installed: the beamformed voice source and the headset
+        # jack, with the raw array withdrawn from every client by WirePlumber.
+        stock = [{"name": "effect_output.j413-mic", "description": "MacBook Air J413 Microphone"},
+                 {"name": "alsa_input.platform-sound.HiFi__Headset__source"},
+                 {"name": "omarchy_speaker_tuning.monitor"}]
+        self.assertTrue(speaker_calibrate.asahi_array_hidden(stock))
+        # The voice source is never a measurement microphone, hidden array or not.
+        self.assertFalse(speaker_calibrate.is_measurement_microphone("effect_output.j413-mic"))
+        # With the documented override the array is there, and nothing needs saying.
+        exposed = stock + [{"name": "alsa_input.platform-sound.RawMics"}]
+        self.assertFalse(speaker_calibrate.asahi_array_hidden(exposed))
+        # Any other machine: a Bluetooth headset is left out for the usual reason.
+        other = [{"name": "bluez_input.AA_BB_CC_DD_EE_FF.0"}, {"name": "alsa_input.pci-0000_04_00.6.analog-stereo"}]
+        self.assertFalse(speaker_calibrate.asahi_array_hidden(other))
+        # Only Asahi's own naming counts, in full.
+        for name in ("effect_output.j413-mic.monitor", "effect_output.mic", "xeffect_output.j413-mic",
+                     "effect_output.j413-mic\nalsa_input.x"):
+            self.assertFalse(speaker_calibrate.is_asahi_voice_microphone(name), name)
+        with mock.patch.object(speaker_calibrate, "pactl_json", return_value=stock):
+            self.assertTrue(speaker_calibrate.asahi_array_hidden())
+
     def test_a_shared_calibration_never_lands_on_asahi_s_raw_speakers(self):
         # The raw device sits behind the sink that carries the speaker
         # protection; an import on a machine without a profile picks a speaker
