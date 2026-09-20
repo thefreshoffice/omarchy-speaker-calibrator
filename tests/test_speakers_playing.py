@@ -88,7 +88,7 @@ class PanelKeepsTheFailureTests(unittest.TestCase):
         self.start = self.service[start:self.service.index("\n  }\n", start)]
 
     def test_what_the_panel_starts_by_itself_leaves_a_failure_on_the_screen(self):
-        self.assertIn('readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember"]',
+        self.assertIn('readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember", "registry"]',
                       self.service)
         guarded = self.start.index("if (_ownPhases.indexOf(operation) < 0) {")
         cleared = self.start.index('error = ""')

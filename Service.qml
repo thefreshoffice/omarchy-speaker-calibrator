@@ -38,6 +38,16 @@ Item {
   // What a failure offers to do instead, when it offers anything:
   // { microphone, description, channel }.  Gone as soon as something else runs.
   property var offer: null
+  // Calibrations other people shared for this machine's model, as the last
+  // lookup found them: { consent, profiles, checked_at, uploads }.  Looking
+  // needs a yes given once; until then nothing is asked of anyone.
+  property var registry: ({ consent: null, profiles: [] })
+  // What the last press on Share answered: { state: "confirm" | "uploaded" | "browser", ... }.
+  // Nothing about sharing is asked of anyone before a press, the GitHub tool's sign-in included.
+  property var shareStatus: null
+  property string shareNote: ""
+  // Which calibration that answer describes; another one playing makes it stale.
+  property string _shareFor: ""
   // The speaker and microphone picked by hand, as the helper keeps them
   // across a restart of the shell: { sink, mic, channel }.
   property var chosen: ({})
@@ -54,7 +64,7 @@ Item {
   // What the panel starts by itself: opening it, refreshing, remembering a
   // pick.  None of these is an answer to a failure, so none of them may take
   // the failure off the screen; only something the user starts does that.
-  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember"]
+  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember", "registry"]
   function start(operation, arguments) {
     if (busy || helperPath === "") return
     phase = operation
@@ -77,7 +87,9 @@ Item {
       : operation === "vendorrestore" ? "Bringing the calibration back…"
       : operation === "import" ? "Loading the shared calibration…"
       : operation === "refit" ? "Applying…"
-      : operation === "remember" ? message : "Working…"
+      : operation === "remember" || operation === "registry" ? message
+      : operation === "registryload" ? "Loading the shared calibration…"
+      : operation === "share" ? "Sharing the calibration…" : "Working…"
     _stdout = ""
     _stderr = ""
     _overflowed = false
@@ -182,6 +194,30 @@ Item {
     start("mics", ["microphone-comparison-json"])
   }
   function refreshStatus() { start("status", ["status-json"]) }
+  // The registry.  A lookup the panel makes by itself is quiet: offline is not an error on the screen.
+  function registryAnswer(answer) { start("registry", ["registry-consent-json", "--answer", answer]) }
+  function registryLookup(refresh) {
+    if (busy) return
+    start("registry", ["registry-lookup-json", "--quiet"].concat(refresh ? ["--refresh"] : []))
+  }
+  function registryLoad(identifier) { start("registryload", ["registry-load-json", "--id", String(identifier), "--preview"]) }
+  function share(confirmed) { start("share", ["share-json"].concat(confirmed ? ["--confirmed"] : [])) }
+  // Only ever the registry's own pages, whatever a reply says.
+  // The two pages this ever opens, each in its whole shape: a submission's
+  // issue, and the registry's form with a title made of plain words.
+  readonly property var _registryPages: [
+    /^https:\/\/github\.com\/thefreshoffice\/omarchy-speaker-profiles\/issues\/[0-9]{1,9}$/,
+    /^https:\/\/github\.com\/thefreshoffice\/omarchy-speaker-profiles\/issues\/new\?template=profile\.yml&title=[A-Za-z0-9+%._()-]{1,300}$/
+  ]
+  function openRegistryPage(url) {
+    var address = String(url || "")
+    if (address.length > 600) return
+    for (var index = 0; index < _registryPages.length; index++)
+      if (_registryPages[index].test(address)) { Qt.openUrlExternally(address); return }
+  }
+  // When the list was last asked for by itself, so that being offline does
+  // not turn every status poll into another request.
+  property double _registryAskedAt: 0
   // Keep a hand-picked speaker and microphone across a restart.  The newest
   // pick wins when several arrive while something else holds the process.
   property var _rememberPending: null
@@ -397,6 +433,21 @@ Item {
         if (root.phase === "status") {
           var statusPayload = JSON.parse(raw)
           root.status = statusPayload
+          if (root.shareStatus && root._shareFor !== String((statusPayload.profile || {}).created_at || "")) {
+            root.shareStatus = null
+            root.shareNote = ""
+          }
+          if (statusPayload.registry) {
+            root.registry = statusPayload.registry
+            // After a yes, the list keeps itself current: the helper asks the
+            // registry at most once a day, and quietly.
+            var lookedAt = Number(statusPayload.registry.checked_at || 0)
+            if (statusPayload.registry.consent === "allowed" && Date.now() / 1000 - lookedAt > 86400
+                && Date.now() - root._registryAskedAt > 3600 * 1000) {
+              root._registryAskedAt = Date.now()
+              Qt.callLater(function () { root.registryLookup(false) })
+            }
+          }
           root.setProposal(statusPayload.proposal || null)
           // A background refresh has nothing to report; leaving "Working…" on
           // screen makes an idle panel look busy.
@@ -462,6 +513,27 @@ Item {
           var trial = JSON.parse(raw)
           root.message = trial.message || ""
           Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "registry") {
+          root.registry = JSON.parse(raw)
+        } else if (root.phase === "registryload") {
+          var fetched = JSON.parse(raw)
+          root.setProposal(fetched.proposal || null)
+          if (fetched.proposal && fetched.proposal.installed)
+            root.status = Object.assign({}, root.status, { enabled: true, profile: fetched.proposal, bypass: false })
+          root.message = fetched.message || "Loaded"
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "share") {
+          var pressed = JSON.parse(raw)
+          root.shareStatus = pressed
+          root._shareFor = String((root.status.profile || {}).created_at || "")
+          root.shareNote = pressed.state === "confirm" ? "" : String(pressed.message || "")
+          if (pressed.state === "uploaded") {
+            root.registry = Object.assign({}, root.registry, { shared_url: pressed.url })
+            root.message = "Shared with everyone"
+          } else if (pressed.state === "browser") {
+            root.message = ""
+            root.openRegistryPage(pressed.url)
+          } else root.message = ""
         } else if (root.phase === "import") {
           var loaded = JSON.parse(raw)
           root.setProposal(loaded.proposal || null)

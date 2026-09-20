@@ -28,6 +28,30 @@ Panel {
   property string loudnessMode: "protected"
   property string channelTrimMode: "off"
   property bool advanced: false
+  // A score in a word: 67 reads like a poor grade and is a good profile.  The
+  // same floors as the helper's score_band.
+  function scoreBand(score) {
+    var value = Number(score) || 0
+    return value >= 80 ? "excellent" : value >= 60 ? "good" : value >= 40 ? "fair" : "rough"
+  }
+  // Words for one row of the registry's list for this machine.
+  function registryLabel(entry) {
+    return "Load: measured with " + (entry.microphone_kind === "built-in microphone" ? "the built-in microphones"
+      : entry.microphone_kind === "external microphone" ? "an external microphone" : "a calibrated measuring microphone")
+      + "  ·  " + scoreBand(entry.score) + ", score " + Number(entry.score || 0)
+  }
+  function registryDescription(entry) {
+    var parts = []
+    if (entry.created_at) parts.push("measured " + String(entry.created_at))
+    if (entry.checked === "pass" || entry.checked === "warning")
+      parts.push("checked" + (entry.checked_before_db !== null && entry.checked_after_db !== null
+        ? ": " + Number(entry.checked_before_db).toFixed(1) + " → " + Number(entry.checked_after_db).toFixed(1) + " dB from the target"
+        : ""))
+    else parts.push("not checked")
+    if (Number(entry.votes || 0) > 0) parts.push(Number(entry.votes) + " found it good")
+    parts.push(Number(entry.tier) >= 3 ? "this exact machine" : "this model, another variant")
+    return parts.join("  ·  ") + ". Plays as a preview; you keep it or go back."
+  }
   property bool _optionsAdopted: false
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
@@ -44,6 +68,8 @@ Panel {
     // the calibration the panel exists to give.
     scroller.contentY = 0
     service.refresh()
+    // A question Share asked the last time the panel was open is not still being asked.
+    if (service.shareStatus !== null && service.shareStatus.state === "confirm") service.shareStatus = null
   }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
@@ -1301,6 +1327,70 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Calibrations other people shared for this model.  Asked about once;
+          // after a yes the list is simply there, and after a no nothing is.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: service.registry.consent === null
+              || (service.registry.consent === "allowed" && (service.registry.profiles || []).length > 0)
+
+            PanelSectionHeader {
+              text: "SHARED FOR THIS MACHINE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.registry.consent === null
+              width: parent.width
+              text: "Other people may have shared a calibration measured on this model. Looking asks a public "
+                + "registry on GitHub for the list for " + String((service.status.hardware || {}).label || "this model")
+                + ", about once a day. It sends nothing about you or your machine beyond that request."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Row {
+              visible: service.registry.consent === null
+              width: parent.width
+              spacing: Style.space(8)
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "Look online"
+                iconText: "󰖟"
+                bordered: true
+                selected: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.registryAnswer("allowed")
+              }
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "No, never"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.registryAnswer("declined")
+              }
+            }
+            Repeater {
+              model: service.registry.consent === "allowed" ? (service.registry.profiles || []).slice(0, 3) : []
+              ActionRow {
+                width: parent.width
+                icon: "󰓦"
+                label: service.busy && service.phase === "registryload" ? "Loading…" : root.registryLabel(modelData)
+                description: root.registryDescription(modelData)
+                enabled: !service.busy
+                onClicked: service.registryLoad(modelData.id)
+              }
+            }
+            PanelSeparator { foreground: root.foreground }
+          }
+
           Button {
             width: parent.width
             text: service.busy && service.phase === "measure" ? "Measuring… keep quiet"
@@ -1553,6 +1643,68 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Sharing sits here, in plain sight, because a calibration that works
+          // is worth more to the next person with this machine than to anyone.
+          // Nothing about it happens before the press: even asking the GitHub
+          // tool whether it is signed in reaches GitHub.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: service.status.enabled === true
+              && service.status.profile !== null && service.status.profile !== undefined
+
+            ActionRow {
+              width: parent.width
+              icon: "󰖟"
+              readonly property string sharedUrl: String((service.registry || {}).shared_url || "")
+              readonly property bool asking: service.shareStatus !== null && service.shareStatus.state === "confirm"
+              label: service.busy && service.phase === "share" ? "Sharing…"
+                : sharedUrl !== "" ? "Shared with everyone  ·  open its page"
+                : asking ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
+                : "Share this calibration with everyone"
+              readonly property var reg: service.registry || ({})
+              description: sharedUrl !== ""
+                ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
+                : (reg.share_score !== null && reg.share_score !== undefined
+                    ? "It would rate " + root.scoreBand(reg.share_score) + ", " + Number(reg.share_score) + " of 100"
+                      + (reg.share_checked ? "" : "; check the calibration first and it scores higher")
+                    : "For everyone with " + String((service.status.hardware || {}).label || "this machine"))
+                  + (reg.share_replaces === true ? "  ·  replaces your earlier upload" : "")
+              enabled: !service.busy
+              onClicked: {
+                if (sharedUrl !== "") service.openRegistryPage(sharedUrl)
+                else service.share(asking)
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.shareStatus !== null && service.shareStatus.state === "confirm"
+              width: parent.width
+              text: "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
+                + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
+                + "It does not contain your user name, any path, any device name or serial, or any recording. "
+                + (service.shareStatus !== null && service.shareStatus.one_press === true
+                   ? "Press again to upload it."
+                   : "The GitHub tool is not signed in here, so pressing again copies the profile and opens a "
+                     + "form in your browser to paste it into.")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.shareNote !== ""
+              width: parent.width
+              text: service.shareNote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            PanelSeparator { foreground: root.foreground }
+          }
+
           Toggle {
             width: parent.width
             label: "Advanced"
@@ -1682,6 +1834,87 @@ Panel {
 
             // ---------------------------------------------------------- actions
             PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+
+              ActionRow {
+                visible: root.hasMeasurement()
+                width: parent.width
+                icon: "󰑓"
+                label: service.busy && service.phase === "refit" ? "Refitting…" : "Refit and play"
+                description: "Apply " + service.optionsLabel(root.options()) + " to the last measurement and play it"
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), true)
+              }
+              ActionRow {
+                visible: root.hasMeasurement()
+                width: parent.width
+                icon: "󰑓"
+                label: "Refit only"
+                description: "Compute with the settings above, keep playing what is playing now"
+                enabled: !service.busy
+                onClicked: service.refit(root.options(), false)
+              }
+              ActionRow {
+                visible: service.proposal !== null && service.proposal !== undefined
+                  && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
+                  && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
+                width: parent.width
+                icon: "󰄬"
+                label: service.busy && service.phase === "install" ? "Installing…" : "Install last measurement"
+                description: service.optionsLabel(service.proposal)
+                  + (service.proposal && service.proposal.created_at
+                      ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
+                enabled: !service.busy
+                onClicked: service.install()
+              }
+              ActionRow {
+                visible: service.status.enabled && !service.status.bypass
+                  && service.status.profile !== null && service.status.profile !== undefined
+                width: parent.width
+                icon: "󰄾"
+                label: service.busy && service.phase === "verify" ? "Checking…" : "Check the calibration"
+                description: root.checkDescription()
+                enabled: !service.busy && root.calibrationMicrophoneConnected()
+                onClicked: service.verify()
+              }
+              ActionRow {
+                visible: service.status.verification !== undefined
+                  && service.status.verification !== null
+                  && service.status.verification.stale === false
+                  && service.status.enabled && !service.status.bypass
+                width: parent.width
+                icon: "󰁨"
+                label: service.busy && service.phase === "refine" ? "Improving…" : "Improve from the check"
+                description: "Feed what the check measured back in, fit again, and play the result"
+                enabled: !service.busy
+                onClicked: service.refine()
+              }
+              ActionRow {
+                visible: service.status.enabled && service.status.compare !== undefined
+                  && service.status.compare.available === true
+                width: parent.width
+                icon: "󰓦"
+                label: service.busy && service.phase === "compare" ? "Switching…" : "Switch profile"
+                description: "Play the other stored profile: " + service.otherLabel()
+                enabled: !service.busy
+                onClicked: service.compare()
+              }
+              ActionRow {
+                visible: service.status.enabled
+                width: parent.width
+                icon: "󰅖"
+                label: "Stop calibration"
+                description: "Remove it from the output; the profiles stay saved"
+                enabled: !service.busy
+                onClicked: service.disable()
+              }
+            }
+
+            // ---------------------------------------------------------- microphones
             PanelSeparator { foreground: root.foreground }
             PanelSectionHeader {
               text: "MICROPHONES — WHAT EACH ONE MEASURED"
@@ -1844,87 +2077,39 @@ Panel {
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
-
-            PanelSeparator { foreground: root.foreground }
-            PanelSeparator { foreground: root.foreground }
-            PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
-
-            Column {
-              width: parent.width
-              spacing: Style.space(6)
-
+            Repeater {
+              model: service.registry.consent === "allowed" ? (service.registry.profiles || []).slice(3) : []
               ActionRow {
-                visible: root.hasMeasurement()
-                width: parent.width
-                icon: "󰑓"
-                label: service.busy && service.phase === "refit" ? "Refitting…" : "Refit and play"
-                description: "Apply " + service.optionsLabel(root.options()) + " to the last measurement and play it"
-                enabled: !service.busy
-                onClicked: service.refit(root.options(), true)
-              }
-              ActionRow {
-                visible: root.hasMeasurement()
-                width: parent.width
-                icon: "󰑓"
-                label: "Refit only"
-                description: "Compute with the settings above, keep playing what is playing now"
-                enabled: !service.busy
-                onClicked: service.refit(root.options(), false)
-              }
-              ActionRow {
-                visible: service.proposal !== null && service.proposal !== undefined
-                  && service.proposal.quality !== undefined && service.proposal.quality.accepted === true
-                  && !(service.status.profile && service.status.profile.created_at === service.proposal.created_at)
-                width: parent.width
-                icon: "󰄬"
-                label: service.busy && service.phase === "install" ? "Installing…" : "Install last measurement"
-                description: service.optionsLabel(service.proposal)
-                  + (service.proposal && service.proposal.created_at
-                      ? "  ·  measured " + String(service.proposal.created_at).slice(0, 16).replace("T", " ") : "")
-                enabled: !service.busy
-                onClicked: service.install()
-              }
-              ActionRow {
-                visible: service.status.enabled && !service.status.bypass
-                  && service.status.profile !== null && service.status.profile !== undefined
-                width: parent.width
-                icon: "󰄾"
-                label: service.busy && service.phase === "verify" ? "Checking…" : "Check the calibration"
-                description: root.checkDescription()
-                enabled: !service.busy && root.calibrationMicrophoneConnected()
-                onClicked: service.verify()
-              }
-              ActionRow {
-                visible: service.status.verification !== undefined
-                  && service.status.verification !== null
-                  && service.status.verification.stale === false
-                  && service.status.enabled && !service.status.bypass
-                width: parent.width
-                icon: "󰁨"
-                label: service.busy && service.phase === "refine" ? "Improving…" : "Improve from the check"
-                description: "Feed what the check measured back in, fit again, and play the result"
-                enabled: !service.busy
-                onClicked: service.refine()
-              }
-              ActionRow {
-                visible: service.status.enabled && service.status.compare !== undefined
-                  && service.status.compare.available === true
                 width: parent.width
                 icon: "󰓦"
-                label: service.busy && service.phase === "compare" ? "Switching…" : "Switch profile"
-                description: "Play the other stored profile: " + service.otherLabel()
+                label: root.registryLabel(modelData)
+                description: root.registryDescription(modelData)
                 enabled: !service.busy
-                onClicked: service.compare()
+                onClicked: service.registryLoad(modelData.id)
               }
-              ActionRow {
-                visible: service.status.enabled
-                width: parent.width
-                icon: "󰅖"
-                label: "Stop calibration"
-                description: "Remove it from the output; the profiles stay saved"
-                enabled: !service.busy
-                onClicked: service.disable()
-              }
+            }
+            ActionRow {
+              width: parent.width
+              icon: "󰖟"
+              label: service.registry.consent === "allowed"
+                ? (service.busy && service.phase === "registry" ? "Looking…" : "Look again for calibrations shared for this machine")
+                : "Look online for calibrations shared for this machine"
+              description: service.registry.consent === "allowed"
+                ? ((service.registry.profiles || []).length === 0 ? "None were shared for this model yet. " : "")
+                  + (service.registry.unreachable ? "The registry could not be reached just now. " : "")
+                  + "Asks the public registry on GitHub for this model's list"
+                : "Asks a public registry on GitHub for this model's list, then about once a day"
+              enabled: !service.busy
+              onClicked: service.registry.consent === "allowed" ? service.registryLookup(true) : service.registryAnswer("allowed")
+            }
+            ActionRow {
+              visible: service.registry.consent === "allowed"
+              width: parent.width
+              icon: "󰅖"
+              label: "Stop looking online"
+              description: "The list disappears and the registry is not asked again"
+              enabled: !service.busy
+              onClicked: service.registryAnswer("declined")
             }
 
             DetailRow {

@@ -27,6 +27,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 
 # Reading and writing anything another process could have replaced first.
+import calibration_share as share  # noqa: E402
 from calibration_io import (  # noqa: E402
     MAX_DESCRIPTION_BYTES,
     UnsafeFile,
@@ -108,11 +109,19 @@ def install_measurement_support():
     }
 
 
-def load_dsp():
-    """Bind the measurement and fitting names; called only when they are used."""
+def load_dsp(playing=True):
+    """Bind the measurement and fitting names; called only when they are used.
+
+    ``playing`` is false where only arithmetic is done: rendering a tuning
+    from numbers needs numpy and scipy and no limiter on the machine, and the
+    registry renders on a runner that has never heard of one.
+    """
     if "np" in globals():
         return
     support = measurement_support()
+    if not playing:
+        support = dict(support, missing=[item for item in support["missing"] if item != LIMITER_PACKAGE])
+        support["available"] = not support["missing"]
     if not support["available"]:
         raise SystemExit(
             "Measuring needs " + " and ".join(support["missing"])
@@ -3167,6 +3176,481 @@ def share_directory():
     return DATA / "shared"
 
 
+# ---- the public registry -----------------------------------------------------------
+# Calibrations people chose to share, filed by machine model in a public
+# repository.  Two rules hold everything here together.  Nothing goes out or
+# comes in without a press that says so: looking up needs a yes that was given
+# once, sharing needs the Share button.  And what comes in is data: one fixed
+# HTTPS origin, no credentials, no redirects, a size limit on every read, and
+# the same validation as a file someone handed over.
+REGISTRY_STATE = DATA / "registry.json"
+REGISTRY_CACHE = DATA / "registry-cache.json"
+REGISTRY_FETCH_LIMIT = 300_000
+REGISTRY_TIMEOUT_SECONDS = 8.0
+REGISTRY_CACHE_SECONDS = 24 * 3600
+REGISTRY_ROWS_LIMIT = 50
+REGISTRY_PATH = re.compile(r"(?:index/[a-z0-9-]{1,60}/[a-z0-9-]{1,60}\.json"
+                           r"|profiles/[a-z0-9-]{1,60}/[a-z0-9-]{1,60}/[0-9a-z-]{1,80}\.json)")
+REGISTRY_ID = re.compile(r"\d{4}-\d{2}-\d{2}-(?:builtin|external|calibrated)-[0-9a-f]{10}")
+REGISTRY_KINDS = ("built-in microphone", "external microphone", "calibrated measuring microphone")
+GH = "/usr/bin/gh"
+GH_TIMEOUT_SECONDS = 30
+ISSUE_URL = re.compile(rf"https://github\.com/{re.escape(share.REGISTRY_REPOSITORY)}/issues/(\d{{1,9}})")
+
+
+def registry_state():
+    try:
+        state = json.loads(read_text_bounded(REGISTRY_STATE, 16384, missing_ok=True) or "{}")
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    kept = {"lookup": state.get("lookup") if state.get("lookup") in ("allowed", "declined") else None,
+            "share_explained": state.get("share_explained") is True, "uploads": {}}
+    uploads = state.get("uploads") if isinstance(state.get("uploads"), dict) else {}
+    for identifier, url in list(uploads.items())[:20]:
+        if isinstance(identifier, str) and REGISTRY_ID.fullmatch(identifier) and isinstance(url, str) \
+                and ISSUE_URL.fullmatch(url):
+            kept["uploads"][identifier] = url
+    return kept
+
+
+def write_registry_state(**changes):
+    state = {**registry_state(), **changes}
+    secure_directory(DATA)
+    write_atomic(REGISTRY_STATE, json.dumps(state) + "\n")
+    return state
+
+
+def registry_fetch(path):
+    """One file of the registry: its text, or None when there is no such file.
+
+    HTTPS to the one origin compiled into the plugin, without credentials,
+    cookies or a proxy from the environment, refusing every redirect, with one
+    deadline for the whole transfer and a size limit read one byte past.
+    """
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    if not REGISTRY_PATH.fullmatch(path):
+        raise SystemExit("That is not a path in the registry.")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect,
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    request = urllib.request.Request(share.REGISTRY_ORIGIN + path, headers={
+        "User-Agent": f"omarchy-speaker-calibrator/{plugin_version()}", "Accept": "application/json"})
+    import threading
+    outcome = {}
+
+    def transfer():
+        try:
+            with opener.open(request, timeout=REGISTRY_TIMEOUT_SECONDS) as response:
+                if response.status != 200:
+                    outcome["data"] = None
+                    return
+                data = bytearray()
+                while len(data) <= REGISTRY_FETCH_LIMIT:
+                    # read1 returns what has arrived; read would wait for the whole count.
+                    chunk = response.read1(min(65536, REGISTRY_FETCH_LIMIT + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                outcome["data"] = data
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                outcome["data"] = None
+            else:
+                outcome["error"] = f"The registry answered with an error ({int(error.code)})."
+        except Exception as error:       # noqa: BLE001 - whatever went wrong, it is not "no such file"
+            outcome["error"] = f"The registry could not be reached ({type(error).__name__})."
+
+    # A socket timeout is per operation and does not cover looking the name
+    # up, so a slow resolver or a peer that trickles would hold this open for
+    # as long as it liked.  The transfer runs beside a clock instead: when the
+    # time is up the answer is no, and the thread ends with this process.
+    worker = threading.Thread(target=transfer, daemon=True)
+    worker.start()
+    worker.join(REGISTRY_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        raise SystemExit("The registry took too long to answer.")
+    if "error" in outcome:
+        raise SystemExit(outcome["error"])
+    if "data" not in outcome:
+        raise SystemExit("The registry could not be reached.")
+    data = outcome["data"]
+    if data is None:
+        return None
+    if len(data) > REGISTRY_FETCH_LIMIT:
+        raise SystemExit("The registry sent more than any of its files should hold.")
+    return data.decode("utf-8", "replace")
+
+
+def _number_or_none(value):
+    return value if _finite(value) else None
+
+
+def valid_index_rows(document, ours):
+    """The rows of a machine's index that can be trusted to be shown, best first."""
+    rows = document.get("profiles") if isinstance(document, dict) else None
+    kept = []
+    for row in rows[:REGISTRY_ROWS_LIMIT] if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        identifier = row.get("id")
+        if not isinstance(identifier, str) or not REGISTRY_ID.fullmatch(identifier):
+            continue
+        if row.get("microphone_kind") not in REGISTRY_KINDS:
+            continue
+        hardware = row.get("hardware") if isinstance(row.get("hardware"), dict) else {}
+        hardware = {field: share.hardware_text(hardware.get(field)) for field in share.HARDWARE_FIELDS}
+        tier = share.match_tier(hardware, ours)
+        if tier < 2:
+            continue                 # another product's calibration has no business in this machine's index
+        checked = row.get("verification") if isinstance(row.get("verification"), dict) else None
+        score = row.get("score")
+        votes = row.get("votes")
+        issue = row.get("issue")
+        kept.append({
+            "id": identifier, "microphone_kind": row["microphone_kind"], "tier": tier,
+            "created_at": row.get("created_at") if isinstance(row.get("created_at"), str)
+            and share.DATE.fullmatch(row["created_at"]) else "",
+            "score": int(score) if _finite(score) and 0 <= score <= 100 else 0,
+            "votes": int(votes) if _finite(votes) and 0 <= votes <= 100000 else 0,
+            "issue": int(issue) if _finite(issue) and 0 < issue < 10 ** 9 else None,
+            "filters": int(row["filters"]) if _finite(row.get("filters")) and 0 <= row["filters"] <= 64 else None,
+            "error_before_db": _number_or_none(row.get("error_before_db")),
+            "error_after_db": _number_or_none(row.get("error_after_db")),
+            "checked": checked.get("verdict") if checked and checked.get("verdict") in ("pass", "warning", "fail") else None,
+            "checked_before_db": _number_or_none(checked.get("target_error_before_db")) if checked else None,
+            "checked_after_db": _number_or_none(checked.get("target_error_after_db")) if checked else None,
+            "sku": hardware["product_sku"],
+        })
+    kept.sort(key=lambda row: (-row["tier"], -row["score"]))
+    return kept
+
+
+def registry_lookup(refresh=False):
+    """Calibrations shared for this machine's model.  Asks the registry at most once a day."""
+    state = registry_state()
+    ours = hardware_id()
+    model = "/".join(share.hardware_key(ours))
+    if state.get("lookup") != "allowed":
+        return {"consent": state.get("lookup"), "model": model, "profiles": [], "checked_at": None}
+    cached = None
+    try:
+        cached = json.loads(read_text_bounded(REGISTRY_CACHE, REGISTRY_FETCH_LIMIT, missing_ok=True) or "null")
+    except (OSError, ValueError, RecursionError):
+        cached = None
+    fresh = (isinstance(cached, dict) and cached.get("model") == model
+             and _finite(cached.get("checked_at")) and 0 <= time.time() - cached["checked_at"] < REGISTRY_CACHE_SECONDS)
+    if not fresh or refresh:
+        text = registry_fetch(share.index_path(ours))
+        try:
+            document = json.loads(text) if text else {}
+        except (ValueError, RecursionError):
+            raise SystemExit("The registry's list for this machine cannot be read.")
+        cached = {"model": model, "checked_at": time.time(), "document": document}
+        secure_directory(DATA)
+        write_atomic(REGISTRY_CACHE, json.dumps(cached) + "\n")
+    return {"consent": "allowed", "model": model, "label": ours["label"],
+            "profiles": valid_index_rows(cached.get("document"), ours),
+            "checked_at": cached.get("checked_at"), "uploads": state.get("uploads", {})}
+
+
+def registry_cached():
+    """What the last lookup found, without asking anyone: for the status the panel polls."""
+    state = registry_state()
+    found = {"consent": state.get("lookup"), "profiles": [], "share_explained": state.get("share_explained"),
+             "uploads": state.get("uploads", {})}
+    if state.get("lookup") != "allowed":
+        return found
+    try:
+        cached = json.loads(read_text_bounded(REGISTRY_CACHE, REGISTRY_FETCH_LIMIT, missing_ok=True) or "null")
+    except (OSError, ValueError, RecursionError):
+        return found
+    ours = hardware_id()
+    if isinstance(cached, dict) and cached.get("model") == "/".join(share.hardware_key(ours)):
+        found["profiles"] = valid_index_rows(cached.get("document"), ours)
+        found["checked_at"] = cached.get("checked_at") if _finite(cached.get("checked_at")) else None
+    return found
+
+
+def registry_load(identifier, preview=False):
+    """Fetch one shared calibration for this machine's model and make it the last measurement."""
+    if not isinstance(identifier, str) or not REGISTRY_ID.fullmatch(identifier):
+        raise SystemExit("That is not the name of a calibration in the registry.")
+    if registry_state().get("lookup") != "allowed":
+        raise SystemExit("Looking online has not been allowed on this machine.")
+    vendor, product = share.hardware_key(hardware_id())
+    # The path is built from this machine's own model, never taken from the index.
+    text = registry_fetch(f"profiles/{vendor}/{product}/{identifier}.json")
+    if text is None:
+        raise SystemExit("That calibration is not in the registry any more.")
+    try:
+        payload = valid_shared_payload(json.loads(text))
+    except ValueError as error:
+        raise SystemExit(f"That calibration cannot be loaded: {error}.")
+    except (RecursionError, OverflowError, TypeError, AttributeError, KeyError):
+        raise SystemExit("That calibration is not a shared calibration file.")
+    result = adopt_shared_payload(payload, f"{identifier}{SHARE_SUFFIX}", registry=identifier)
+    if preview:
+        result["proposal"] = preview_if_accepted(result["proposal"])
+        result["message"] = (f"Loaded {result['proposal']['imported']['name']} from the registry and playing it. "
+                             "Apply it, or keep what you had?" if result["proposal"].get("previewing")
+                             else f"Loaded {result['proposal']['imported']['name']} from the registry and installed it.")
+        if result.get("warning"):
+            result["message"] += " " + result["warning"]
+    return result
+
+
+def public_profile():
+    """What Share would upload for the calibration that is playing: (payload, identifier, text)."""
+    payload, _, _ = shared_payload()
+    verification = None
+    try:
+        checked = json.loads(read_text_bounded(VERIFICATION, 1 << 20, missing_ok=True) or "null")
+    except (OSError, ValueError, RecursionError):
+        checked = None
+    created = (load_profile(PROFILE) or {}).get("created_at")
+    # A check counts only for the calibration it checked.
+    if isinstance(checked, dict) and checked.get("profile_created_at") == created and not checked.get("stale"):
+        verification = checked
+    try:
+        public = share.public_payload(payload, verification)
+        return public, share.profile_id(public), share.encode_submission(public)
+    except share.NotAPublicProfile as error:
+        raise SystemExit(f"This calibration cannot be shared: {error}.")
+
+
+GH_OUTPUT_LIMIT_BYTES = 65536
+# What the GitHub tool is started with, and nothing else.  It holds the user's
+# token, so it does not inherit a PATH, a GH_HOST, a GH_TOKEN, a proxy or a
+# GIT_DIR from whatever started the shell: it finds its own sign-in through the
+# home directory and the session keyring, and talks to github.com.
+GH_ENVIRONMENT_KEPT = ("HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG")
+
+
+# The plugin never asks the GitHub tool for its token and the tool does not
+# print it.  This is for the day a version of it, a debug setting or an error
+# from a server does: whatever the tool said is shown in the panel and ends up
+# in the journal, so anything shaped like a GitHub credential is blanked first.
+CREDENTIAL_SHAPES = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?i:bearer|token|authorization:?)\s+[A-Za-z0-9._~+/=-]{20,}")
+
+
+def without_credentials(text):
+    return CREDENTIAL_SHAPES.sub("[credential removed]", str(text or ""))
+
+
+class ToolFailed(Exception):
+    pass
+
+
+def gh_environment():
+    env = {key: os.environ[key] for key in GH_ENVIRONMENT_KEPT if os.environ.get(key)}
+    env.update(PATH="/usr/bin:/bin", GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1",
+               GH_HOST="github.com")
+    return env
+
+
+def run_bounded(argv, *, input_text=None, env=None, seconds=GH_TIMEOUT_SECONDS, limit=GH_OUTPUT_LIMIT_BYTES):
+    """Run a tool under one deadline, with a ceiling on what it may say, in a group that is cleaned up.
+
+    Returns (returncode, stdout, stderr).  Output is read as it arrives and
+    counted before it is kept, so a tool that talks without end is stopped
+    instead of being remembered; the deadline is for the whole run, and the
+    whole process group is ended and reaped however the run ends.
+    """
+    import selectors
+    deadline = time.monotonic() + seconds
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, close_fds=True,
+                                start_new_session=True)
+    except OSError as error:
+        raise ToolFailed(type(error).__name__)
+    kept = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    pending = memoryview((input_text or "").encode("utf-8"))
+    failure = None
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream in kept:
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ)
+            if input_text is not None:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE)
+            while selector.get_map():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    failure = "it took too long"
+                    break
+                for key, _ in selector.select(min(left, 1.0)):
+                    stream = key.fileobj
+                    if stream is proc.stdin:
+                        try:
+                            pending = pending[os.write(stream.fileno(), pending[:65536]):]
+                        except BlockingIOError:
+                            continue
+                        except OSError:
+                            pending = pending[:0]
+                        if not len(pending):
+                            selector.unregister(stream)
+                            stream.close()
+                        continue
+                    try:
+                        chunk = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        continue
+                    kept[stream] += chunk
+                    if sum(len(data) for data in kept.values()) > limit:
+                        failure = "it said more than it should"
+                        break
+                if failure:
+                    break
+            if failure is None:
+                try:
+                    proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    failure = "it took too long"
+    finally:
+        # The whole group, whatever happened: a tool that started helpers leaves none behind.
+        for signal_number, grace in ((signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
+            if proc.poll() is not None and failure is None:
+                break
+            try:
+                os.killpg(proc.pid, signal_number)
+            except (ProcessLookupError, PermissionError):
+                break
+            try:
+                proc.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except OSError:
+                pass
+    if failure:
+        raise ToolFailed(failure)
+    return proc.returncode, kept[proc.stdout].decode("utf-8", "replace"), kept[proc.stderr].decode("utf-8", "replace")
+
+
+def gh_signed_in():
+    if not Path(GH).exists():
+        return False
+    try:
+        return run_bounded([GH, "auth", "status", "--hostname", "github.com"], env=gh_environment())[0] == 0
+    except ToolFailed:
+        return False
+
+
+def share_status():
+    """What Share can do here, and what it would send; asks nobody anything."""
+    public, identifier, text = public_profile()
+    state = registry_state()
+    return {
+        "id": identifier, "name": public["name"], "bytes": len(text),
+        "microphone_kind": public["public"]["microphone_kind"],
+        "checked": (public["public"].get("verification") or {}).get("verdict"),
+        "score": share.objective_score(public),
+        "one_press": gh_signed_in(), "explained": state.get("share_explained"),
+        "uploaded": state.get("uploads", {}).get(identifier),
+        "registry": f"https://github.com/{share.REGISTRY_REPOSITORY}",
+    }
+
+
+def share_upload():
+    """Submit the calibration that is playing to the registry through the user's own GitHub sign-in.
+
+    The `gh` tool does the signing in and holds the token; this process never
+    sees it.  The profile goes to it on standard input.
+    """
+    public, identifier, text = public_profile()
+    state = registry_state()
+    if identifier in state.get("uploads", {}):
+        return {"url": state["uploads"][identifier], "id": identifier,
+                "message": "This calibration is already shared."}
+    if not gh_signed_in():
+        raise SystemExit("The GitHub tool is not signed in here; use Share via the browser instead.")
+    body = ("Shared from the Omarchy Speaker Calibrator panel.\n\n### Profile\n\n```text\n" + text + "\n```\n")
+    # What is published is numbers and a handful of fixed words.  Should anything
+    # shaped like a credential ever be in it, nothing is sent.
+    if CREDENTIAL_SHAPES.search(json.dumps(public)):
+        raise SystemExit("This calibration holds something shaped like a credential, so it was not sent.")
+    try:
+        # The host is part of the repository's name here, so no setting of the tool's can send it elsewhere.
+        returncode, stdout, stderr = run_bounded(
+            [GH, "issue", "create", "--repo", f"github.com/{share.REGISTRY_REPOSITORY}",
+             "--title", f"Calibration for {public['hardware']['label']} ({public['public']['microphone_kind']})",
+             "--body-file", "-"],
+            input_text=body, env=gh_environment())
+    except ToolFailed as error:
+        raise SystemExit(f"The upload did not finish: {error}.")
+    found = ISSUE_URL.search(stdout[-2000:])
+    if returncode != 0 or not found:
+        raise SystemExit("GitHub did not accept the upload: "
+                         + (short_label(without_credentials(stderr[-600:])[-300:], 300) or "no reason given"))
+    uploads = dict(list(state.get("uploads", {}).items())[-19:])
+    uploads[identifier] = found.group(0)
+    write_registry_state(uploads=uploads, share_explained=True)
+    return {"url": found.group(0), "id": identifier,
+            "message": "Shared. It is checked and published within a minute or two; the link shows how it went."}
+
+
+def share_press(confirmed=False):
+    """Everything the Share button does, decided on the press and never before it.
+
+    The first time it answers with what would be sent, and sends nothing;
+    pressed again it shares.  With the GitHub tool signed in that is an upload,
+    otherwise the profile goes to the clipboard for the registry's form.  Even
+    asking the tool whether it is signed in reaches GitHub, which is why none
+    of this runs when the panel merely opens.
+    """
+    public, identifier, _ = public_profile()
+    state = registry_state()
+    if identifier in state.get("uploads", {}):
+        return {"state": "uploaded", "url": state["uploads"][identifier], "id": identifier,
+                "message": "This calibration is already shared."}
+    one_press = gh_signed_in()
+    if not state.get("share_explained") and not confirmed:
+        return {"state": "confirm", "one_press": one_press, "id": identifier, "name": public["name"],
+                "score": share.objective_score(public), "words": share.score_words(public),
+                "band": share.score_band(share.objective_score(public)),
+                "checked": (public["public"].get("verification") or {}).get("verdict")}
+    if one_press:
+        return {"state": "uploaded", **share_upload()}
+    return {"state": "browser", **share_for_browser()}
+
+
+def share_for_browser():
+    """The browser way: the profile on the clipboard and the address of the form to paste it into."""
+    import urllib.parse
+    public, identifier, text = public_profile()
+    try:
+        subprocess.run(["/usr/bin/wl-copy"], input=text, text=True, timeout=10, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit("The profile could not be put on the clipboard.")
+    title = f"Calibration for {public['hardware']['label']} ({public['public']['microphone_kind']})"
+    write_registry_state(share_explained=True)
+    return {"id": identifier,
+            "url": f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/new?"
+                   + urllib.parse.urlencode({"template": "profile.yml", "title": title}),
+            "message": "The profile is on the clipboard. Paste it into the form that opens, and submit."}
+
+
 def dmi_value(field):
     try:
         raw = read_text_bounded(Path("/sys/class/dmi/id") / field, 4096,
@@ -3253,10 +3737,30 @@ def write_shared(name, text, subdirectory=None):
 
 
 def export_profile():
-    """The calibration that is playing, as one file to hand to someone."""
+    """The calibration that is playing, as one file to hand to someone, with its graph."""
+    payload, name, slug = shared_payload()
+    hardware = payload["hardware"]
+    path = write_shared(f"{slug or 'calibration'}{SHARE_SUFFIX}", json.dumps(payload, indent=1) + "\n")
+    graph = None
+    try:
+        # Drawn from the public form, so the picture shows what a stranger would get.
+        graph = write_shared(f"{slug or 'calibration'}.svg", share.render_svg(share.public_payload(payload)))
+    except share.NotAPublicProfile:
+        pass
+    return {
+        "file": path.name, "graph": graph.name if graph else None, "directory": str(path.parent), "name": name,
+        "hardware": {key: hardware.get(key) for key in DMI_FIELDS + ("label",)},
+        "message": f"Saved {path.name}" + (" and its graph" if graph else "") + f" in {path.parent}. Hand that "
+                   "file to someone with the same machine; dropped into their Downloads folder, it shows up "
+                   "in their panel.",
+    }
+
+
+def shared_payload():
+    """The calibration that is playing as a shared document: (payload, name, slug)."""
     profile = load_profile(PROFILE)
     if profile is None:
-        raise SystemExit("No calibration is installed, so there is nothing to export.")
+        raise SystemExit("No calibration is installed, so there is nothing to share.")
     hardware = hardware_id()
     kind = MICROPHONE_KIND_LABELS[microphone_kind(profile)]
     day = str(profile.get("created_at", ""))[:10] or dt.date.today().isoformat()
@@ -3291,12 +3795,7 @@ def export_profile():
         "profile": shared,
     }
     slug = re.sub(r"[^a-z0-9]+", "-", f"{hardware['label']} {kind} {day}".lower()).strip("-")[:80]
-    path = write_shared(f"{slug or 'calibration'}{SHARE_SUFFIX}", json.dumps(payload, indent=1) + "\n")
-    return {
-        "file": path.name, "directory": str(path.parent), "name": name, "hardware": hardware,
-        "message": f"Saved {path.name} in {path.parent}. Hand that file to someone with the same "
-                   "machine; dropped into their Downloads folder, it shows up in their panel.",
-    }
+    return payload, name, slug
 
 
 def _finite(value):
@@ -3504,6 +4003,11 @@ def import_profile(name=None, path=None):
         raise SystemExit(f"{source.name} cannot be loaded: {error}.")
     except (RecursionError, OverflowError, TypeError, AttributeError, KeyError):
         raise SystemExit(f"{source.name} is not a shared calibration file.")
+    return adopt_shared_payload(payload, source.name)
+
+
+def adopt_shared_payload(payload, source_name, registry=None):
+    """Make a validated shared calibration the last measurement, pointed at this machine's speakers."""
     ours = hardware_id()
     theirs = payload.get("hardware") or {}
     # The speaker comes from this machine's own list, the one the panel
@@ -3523,7 +4027,7 @@ def import_profile(name=None, path=None):
     profile["deep_bass"] = current.get("deep_bass", DEEP_BASS_DEFAULT)
     profile["loudness_compensation"] = current.get("loudness_compensation", LOUDNESS_COMPENSATION_DEFAULT)
     profile["imported"] = {
-        "file": source.name, "name": short_label(payload.get("name")),
+        "file": source_name, "registry": registry, "name": short_label(payload.get("name")),
         "exported_at": short_label(payload.get("exported_at"), 40),
         "hardware": {key: short_label(theirs.get(key)) for key in DMI_FIELDS + ("label", "speaker_description")},
         "this_machine": ours["label"], "matches": matches,
@@ -3535,7 +4039,7 @@ def import_profile(name=None, path=None):
     )
     return {
         "proposal": profile, "matches": matches, "warning": warning,
-        "message": f"Loaded {profile['imported']['name'] or source.name}. Press Install last "
+        "message": f"Loaded {profile['imported']['name'] or source_name}. Press Install last "
                    "measurement to hear it; Switch profile brings your own back."
                    + (f" {warning}" if warning else ""),
     }
@@ -3740,7 +4244,7 @@ def ebur128_lra(signal, rate):
 
 def vendor_metrics(sections, input_gain, rate, reference=None, harmonics=None):
     """The four figures Omarchy asks a tuning to report, less the fit's own."""
-    load_dsp()
+    load_dsp(playing=False)
     from calibration_optimizer import group_delay_swing_ms, chain_sos
     import scipy.signal
     swing = group_delay_swing_ms(sections, rate)
@@ -3773,13 +4277,38 @@ def vendor_metrics(sections, input_gain, rate, reference=None, harmonics=None):
     }
 
 
-def render_vendor_tuning(reference=None):
-    """The playing calibration as an Omarchy vendor tuning, as texts."""
-    profile = load_profile(PROFILE)
+VENDOR_ORIGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,:#-]{0,119}")
+
+
+def render_vendor_tuning(reference=None, *, profile=None, hardware=None, today=None, origin=None):
+    """A calibration as an Omarchy vendor tuning, as texts.
+
+    The playing calibration on this machine, unless a profile and the hardware
+    it was made on are handed in: the registry renders the best calibration
+    for a machine that way.  ``today`` and ``origin`` keep such a rendering
+    reproducible and say where it came from; both end up in a file that
+    Omarchy sources as shell, so they are held to a plain character set.
+    """
+    handed_in = profile is not None
     if profile is None:
-        raise SystemExit("No calibration is installed, so there is nothing to render.")
+        profile = load_profile(PROFILE)
+        if profile is None:
+            raise SystemExit("No calibration is installed, so there is nothing to render.")
+        hardware = hardware_id()
+    if not isinstance(hardware, dict) or not isinstance(profile.get("fit"), dict):
+        raise SystemExit("There is no fit or no hardware to render a tuning from.")
+    if origin is not None and not VENDOR_ORIGIN.fullmatch(str(origin)):
+        raise SystemExit("That origin is not plain text; refusing to write it into a tuning.")
+    if today is not None and not share.DATE.fullmatch(str(today)):
+        raise SystemExit("That date is not a date; refusing to write it into a tuning.")
+    if handed_in:
+        # Somebody else's hardware record, written between shell quotes below.
+        hardware = {key: value if key == "speaker" else share.hardware_text(value) for key, value in hardware.items()}
+        hardware["label"] = hardware.get("label") or share.hardware_text(
+            " ".join(part for part in (hardware.get("sys_vendor"), hardware.get("product_name")) if part))
+    if not hardware.get("label"):
+        raise SystemExit("The hardware has no name to match a tuning on.")
     fit = profile["fit"]
-    hardware = hardware_id()
     slug = vendor_slug(hardware)
     sections = vendor_sections(fit)
     trim = fit.get("channel_trim") or {}
@@ -3790,10 +4319,14 @@ def render_vendor_tuning(reference=None):
     mic = profile.get("microphone") or {}
     kind = "the built-in microphones" if mic.get("internal") else "an external measuring microphone at the listening position"
     when = str(profile.get("created_at", ""))[:10]
-    today = dt.date.today().isoformat()
+    if not share.DATE.fullmatch(when):
+        raise SystemExit("The measurement date is not a date; refusing to write it into a tuning.")
+    today = str(today) if today is not None else dt.date.today().isoformat()
     label = hardware["label"]
     sku = hardware.get("product_sku") or ""
-    sink_name = (profile.get("speaker") or {}).get("name") or ""
+    sink_name = (profile.get("speaker") or {}).get("name") or hardware.get("speaker") or ""
+    if not is_internal_speaker(sink_name):
+        raise SystemExit("A vendor tuning is for a laptop's own speakers, and this calibration is for another output.")
     voicing = VOICING_LABELS.get(profile.get("voicing"), "flat")
     header = f'''# {label} speaker tuning.
 #
@@ -3841,7 +4374,7 @@ description="{label} speakers"
 sink_pattern='^{checked_sink_name(sink_name)}$'
 
 ## Provenance.
-derived_from="Omarchy Speaker Calibrator {plugin_version()}: sweep measurement with {kind}, {voicing} target, measured {when}"
+derived_from="Omarchy Speaker Calibrator {plugin_version()}: sweep measurement with {kind}, {voicing} target, measured {when}{f'; {origin}' if origin else ''}"
 validated_by=""   ## your name, once you have listened on the hardware named below
 validated_on="{today}"
 validated_hardware="{label}{f' ({sku})' if sku else ''}"
@@ -3865,6 +4398,23 @@ Files:
 '''
     return {"slug": slug, "label": label, "tuning": tuning, "chain": chain, "readme": readme,
             "metrics": metrics, "sections": len(sections)}
+
+
+def render_registry_tuning(public, *, identifier, score, today):
+    """The vendor tuning of a public profile from the registry, as texts.
+
+    Deep bass is the listener's switch and does not travel with a profile, so
+    the tuning is rendered with the plugin's default: what somebody who loads
+    this profile from the registry hears.
+    """
+    eligible, reason = share.vendor_eligible(public, score)
+    if not eligible:
+        raise SystemExit(f"Not rendered as a tuning: {reason}.")
+    profile = dict(public["profile"], deep_bass=DEEP_BASS_DEFAULT)
+    profile["microphone"] = dict(profile.get("microphone") or {})
+    return render_vendor_tuning(
+        profile=profile, hardware=dict(public["hardware"]), today=today,
+        origin=f"registry profile {identifier}, score {int(score)}")
 
 
 def write_vendor_export(rendered):
@@ -4257,6 +4807,26 @@ def cached_status():
     return payload if isinstance(payload, dict) and payload.get("service") else {}
 
 
+def status_registry():
+    try:
+        found = registry_cached()
+    except Exception:            # the status must never fail over a cache file
+        return {"consent": None, "profiles": []}
+    found.update(shared_url=None, share_score=None, share_band=None, share_checked=None, share_replaces=False)
+    try:
+        if load_profile(PROFILE) is not None:
+            public, identifier, _ = public_profile()
+            found["shared_url"] = (found.get("uploads") or {}).get(identifier)
+            found["share_score"] = share.objective_score(public)
+            found["share_band"] = share.score_band(found["share_score"])
+            found["share_checked"] = (public["public"].get("verification") or {}).get("verdict")
+            # A check made after sharing makes it a different profile: sharing again replaces the earlier one.
+            found["share_replaces"] = bool(found.get("uploads")) and found["shared_url"] is None
+    except (SystemExit, Exception):
+        pass
+    return found
+
+
 def status_payload():
     profile = load_profile(PROFILE)
     proposal = load_profile(PROPOSAL)
@@ -4287,6 +4857,8 @@ def status_payload():
             "microphones": archived_microphones(),
             "hardware": hardware_id(),
             "sharedProfiles": shared_profiles(),
+            # What the last lookup found, read from its cache: the status asks nobody.
+            "registry": status_registry(),
             "unusableMicrophones": [short_label(name) for name in unusable_microphones()],
             "asahiArrayHidden": asahi_array_hidden(),
             "measurementSupport": measurement_support()}
@@ -4479,6 +5051,20 @@ def main():
                  "install-measurement-support", "loudness-toggle"):
         sub.add_parser(name)
     sub.add_parser("verify-json")
+    lookup = sub.add_parser("registry-lookup-json", help="calibrations shared for this machine's model")
+    lookup.add_argument("--refresh", action="store_true")
+    lookup.add_argument("--quiet", action="store_true",
+                        help="when the registry cannot be reached, answer from the cache instead of failing")
+    consent = sub.add_parser("registry-consent-json", help="allow or decline looking online for shared calibrations")
+    consent.add_argument("--answer", choices=("allowed", "declined"), required=True)
+    load = sub.add_parser("registry-load-json", help="load one shared calibration as the last measurement")
+    load.add_argument("--id", required=True)
+    load.add_argument("--preview", action="store_true")
+    pressed = sub.add_parser("share-json", help="what the panel's Share button does")
+    pressed.add_argument("--confirmed", action="store_true", help="what it sends has been shown and agreed to")
+    sub.add_parser("share-status-json", help="what sharing the playing calibration would send, and how")
+    sub.add_parser("share-upload-json", help="share the playing calibration through the signed-in GitHub tool")
+    sub.add_parser("share-browser-json", help="put the profile on the clipboard and name the form to paste it into")
     remember = sub.add_parser("remember-selection-json",
                               help="keep the speaker and microphone picked by hand across restarts")
     remember.add_argument("--sink")
@@ -4535,7 +5121,29 @@ def main():
                            help="install and play the result when it passes")
     args = parser.parse_args()
     command = args.command or "wizard"
-    if command == "remember-selection-json":
+    if command == "registry-lookup-json":
+        try:
+            print(json.dumps(registry_lookup(args.refresh)))
+        except SystemExit as stop:
+            # The panel looks by itself when it opens.  Being offline is not a
+            # failure to put on the screen in red every time.
+            if not args.quiet or isinstance(stop.code, int):
+                raise
+            print(json.dumps({**registry_cached(), "unreachable": short_label(str(stop.code), 200)}))
+    elif command == "registry-consent-json":
+        write_registry_state(lookup=args.answer)
+        print(json.dumps(registry_lookup(True) if args.answer == "allowed" else registry_cached()))
+    elif command == "registry-load-json":
+        print(json.dumps(registry_load(args.id, args.preview)))
+    elif command == "share-json":
+        print(json.dumps(share_press(args.confirmed)))
+    elif command == "share-status-json":
+        print(json.dumps(share_status()))
+    elif command == "share-upload-json":
+        print(json.dumps(share_upload()))
+    elif command == "share-browser-json":
+        print(json.dumps(share_for_browser()))
+    elif command == "remember-selection-json":
         print(json.dumps(remember_selection(args.sink, args.mic, args.channel)))
     elif command == "devices-json":
         print(json.dumps(devices_payload()))
