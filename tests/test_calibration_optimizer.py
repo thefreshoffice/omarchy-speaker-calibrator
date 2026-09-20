@@ -1328,6 +1328,69 @@ class MicrophoneCandidateTests(unittest.TestCase):
             ["Digital Microphone"],
         )
 
+    def test_asahi_devices_default_to_protected_speakers_and_internal_array(self):
+        devices = {
+            "sinks": [
+                {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+                {"name": "audio_effect.j413-convolver", "sample_specification": "float32le 2ch 48000Hz"},
+                {"name": "alsa_output.platform-sound.RawSpeakers"},
+                {"name": "audio_effect.unrelated"},
+                {"name": "omarchy_speaker_tuning"},
+            ],
+            "sources": [
+                {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"},
+                {"name": "alsa_input.platform-sound.HiFi__Headset__source"},
+                {"name": "omarchy_speaker_tuning.monitor"},
+            ],
+        }
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=devices.__getitem__):
+            payload = speaker_calibrate.devices_payload()
+        self.assertEqual([d["name"] for d in payload["sinks"]], [
+            "alsa_output.platform-sound.HiFi__Headphones__sink", "audio_effect.j413-convolver",
+        ])
+        self.assertEqual([d["internal"] for d in payload["sinks"]], [False, True])
+        self.assertEqual([(d["internal"], d["channels"]) for d in payload["microphones"]], [
+            (True, 3), (False, 1),
+        ])
+
+    def test_a_shared_calibration_never_lands_on_asahi_s_raw_speakers(self):
+        # The raw device sits behind the sink that carries the speaker
+        # protection; an import on a machine without a profile picks a speaker
+        # by itself and must pick from the same list the panel offers.
+        sinks = [
+            {"name": "alsa_output.platform-sound.RawSpeakers"},
+            {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+            {"name": "omarchy_speaker_tuning"},
+            {"name": "audio_effect.j413-convolver", "description": "MacBook Air J413 Speakers"},
+        ]
+        with mock.patch.object(speaker_calibrate, "load_profile", return_value=None), \
+             mock.patch.object(speaker_calibrate, "pactl_json", return_value=sinks):
+            self.assertEqual(speaker_calibrate.local_speaker()["name"], "audio_effect.j413-convolver")
+
+    def test_built_in_means_the_same_on_every_kind_of_machine(self):
+        for name, built_in in {
+            "audio_effect.j413-convolver": True,
+            "alsa_input.platform-sound.RawMics": True,
+            "alsa_output.platform-sound.RawSpeakers": False,
+            "alsa_output.platform-sound.HiFi__Headphones__sink": False,
+            "alsa_input.platform-sound.HiFi__Headset__source": False,
+            "effect_output.j413-mic": False,
+            "alsa_output.pci-0000_00_1f.3.analog-stereo": True,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo": False,
+            "alsa_input.pci-0000_00_1f.3.analog-stereo": True,
+        }.items():
+            self.assertEqual(speaker_calibrate.is_built_in(name), built_in, name)
+
+    def test_asahi_array_can_measure_all_channels(self):
+        sink = {"name": "audio_effect.j413-convolver"}
+        mic = {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"}
+        with mock.patch.object(speaker_calibrate, "physical_sinks", return_value=[sink]), \
+             mock.patch.object(speaker_calibrate, "microphones", return_value=[mic]), \
+             mock.patch.object(speaker_calibrate, "build_profile", return_value={"measured": True}) as measure:
+            result = speaker_calibrate.calibrate_noninteractive(sink["name"], mic["name"], "all", "neutral")
+        self.assertEqual(result, {"measured": True})
+        measure.assert_called_once_with(sink, mic, "all", "neutral", None, "protected", "normal", "off")
+
 
 class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""
