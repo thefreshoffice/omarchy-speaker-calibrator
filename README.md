@@ -203,10 +203,24 @@ too weak. PipeWire only sees what comes out of the firmware, and recording from
 the ALSA device directly reads the same point, so there is no raw stream to ask
 for; the mixer switches the firmware exposes are the only handle.
 
-The level probes before every measurement therefore also check that the
-recorded level follows the played level one-for-one. When it does not, the
-result carries a warning, and names the processing switches that are on for
-that microphone together with the `amixer` command that turns one off.
+So every measurement, a calibration and a check alike, runs with the
+processing switches of the measuring microphone's own sound card switched off,
+and puts them back exactly as they were when it ends, pass or fail. Only
+switches whose name says they change with the signal are touched (DRC, AGC,
+automatic gain, noise suppression, echo cancelling), only on that one card, and
+only for the seconds a measurement takes; calls and dictation before and after
+are as they were. The switches are recorded before the first one is touched, so
+a run that is killed halfway is repaired the next time the helper starts, which
+the panel does within seconds. The result says which switches were suspended.
+On a Dell XPS 16 this is the difference between a calibration and none: with
+its `Microphone Capture DRC switch` on, the level search stops because the
+recording will not follow the sweep level.
+
+Not every machine exposes its processing as a switch. The level probes
+therefore also check that the recorded level follows the played level
+one-for-one. When it does not, the result carries a warning, and names any
+processing switch that is still on for that microphone together with the
+`amixer` command that turns it off.
 
 To check a machine without calibrating anything, a few quiet chirps and no
 sweeps:
@@ -216,10 +230,10 @@ python3 speaker-calibrate.py devices-json          # the speaker and microphone 
 python3 speaker-calibrate.py microphone-linearity-json --sink <speaker> --mic <microphone>
 ```
 
-With `--bypass` it probes a second time with those switches off and puts them
-back afterwards. The switches are recorded before they are touched, so a run
-that is killed halfway is repaired the next time the helper starts. Calibration
-itself never changes a mixer switch.
+It probes with the switches as you have them, which a measurement never does,
+so it shows what the processing does to the level. With `--bypass` it probes a
+second time with those switches off, the way a measurement runs, and puts them
+back afterwards.
 
 ### Comparing the two microphones
 
@@ -377,6 +391,7 @@ created outside it and stay behind:
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
 | `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps |
+| `~/.local/share/omarchy-speaker-calibrator/microphone-processing-restore.json` | exists only during a measurement: which microphone switches to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
 | `~/Downloads/omarchy-tuning-*/` | vendor tunings you exported |
 

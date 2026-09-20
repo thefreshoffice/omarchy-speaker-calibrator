@@ -292,6 +292,42 @@ class SwitchTests(unittest.TestCase):
         self.assertEqual(speaker_calibrate.restore_microphone_processing(), [])
         self.assertEqual(self.mixer.writes, [])
 
+    def test_every_measurement_runs_with_the_processing_off_and_says_so(self):
+        seen = {}
+
+        def sweeps(sink_name, mic_name, *args, **kwargs):
+            seen["during"] = self.mixer.state["Microphone Capture DRC switch"]
+            seen["call"] = (sink_name, mic_name, args, kwargs)
+            return {"quality": {"accepted": True, "warnings": [], "guidance": ["Keep still."]}}
+
+        with mock.patch.object(speaker_calibrate, "measure_through_sweeps", side_effect=sweeps):
+            measurement = speaker_calibrate.capture_measurement(
+                "alsa_output.pci-spk", "alsa_input.pci-dmic", "all", None, level_sink="x")
+        self.assertEqual(seen["during"], "off")
+        self.assertEqual(seen["call"], ("alsa_output.pci-spk", "alsa_input.pci-dmic", ("all", None), {"level_sink": "x"}))
+        self.assertEqual(self.mixer.state["Microphone Capture DRC switch"], "on")
+        self.assertEqual(measurement["microphone_processing_suspended"], ["Microphone Capture DRC switch"])
+        # It is said, and it is not a warning: the verdict is about the speakers.
+        self.assertEqual(measurement["quality"]["warnings"], [])
+        self.assertIn("'Microphone Capture DRC switch'", measurement["quality"]["guidance"][-1])
+        self.assertEqual(measurement["quality"]["guidance"][0], "Keep still.")
+
+    def test_a_measurement_that_fails_still_puts_the_processing_back(self):
+        with mock.patch.object(speaker_calibrate, "measure_through_sweeps",
+                               side_effect=ValueError("Background sound is too loud.")):
+            with self.assertRaises(ValueError):
+                speaker_calibrate.capture_measurement("alsa_output.pci-spk", "alsa_input.pci-dmic", 0)
+        self.assertEqual(self.mixer.state["Microphone Capture DRC switch"], "on")
+        self.assertFalse(speaker_calibrate.MIC_PROCESSING_STATE.exists())
+
+    def test_only_the_measuring_microphone_s_card_is_touched(self):
+        # Pull request #13 scanned every card; a USB interface's own
+        # compressor is none of a laptop measurement's business.
+        with mock.patch.object(speaker_calibrate, "measure_through_sweeps", return_value={"quality": {}}):
+            measurement = speaker_calibrate.capture_measurement("alsa_output.pci-spk", "alsa_input.usb-mic", 0)
+        self.assertEqual(self.mixer.writes, [])
+        self.assertNotIn("microphone_processing_suspended", measurement)
+
     def test_nothing_on_means_nothing_written(self):
         self.mixer.state["Microphone Capture DRC switch"] = "off"
         with speaker_calibrate.microphone_processing_bypassed("alsa_input.pci-dmic") as off:

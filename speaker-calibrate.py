@@ -1822,7 +1822,40 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
     return search
 
 
-def capture_measurement(
+def capture_measurement(sink_name, mic_name, *args, **kwargs):
+    """Measure with the microphone's own processing out of the way.
+
+    On a laptop whose microphone runs through a firmware compressor, a
+    calibration does not come out weak, it does not come out at all: the level
+    search stops because the recording will not follow the sweep level (first
+    reported on a Dell XPS 16, pull request #13).  So every measurement, a
+    calibration and a check alike, runs with the processing switches of the
+    microphone's own sound card off, and puts them back exactly as they were:
+    when it passes, when it fails, and, through the record written before the
+    first switch is touched, after a run that was killed.  A microphone with no
+    such switch is measured as before, with the linearity check as the net.
+    """
+    with microphone_processing_bypassed(mic_name) as suspended:
+        measurement = measure_through_sweeps(sink_name, mic_name, *args, **kwargs)
+    return note_suspended_processing(measurement, suspended)
+
+
+def note_suspended_processing(measurement, suspended):
+    """Say in the result what was switched off for it; never a warning."""
+    names = [short_label(item.get("name")) for item in suspended or [] if item.get("name")]
+    if not names or not isinstance(measurement, dict):
+        return measurement
+    measurement["microphone_processing_suspended"] = names
+    quality = measurement.get("quality")
+    if isinstance(quality, dict):
+        listed = ", ".join(f"'{name}'" for name in names)
+        note = (f"Microphone processing was switched off for this measurement and switched back "
+                f"on afterwards: {listed}.")
+        quality["guidance"] = list(dict.fromkeys(list(quality.get("guidance") or []) + [note]))
+    return measurement
+
+
+def measure_through_sweeps(
     sink_name, mic_name, channel, mic_cal_file=None, *,
     level_sink=None, sweeps=None, recording=None,
 ):
