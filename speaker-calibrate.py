@@ -42,8 +42,9 @@ from calibration_io import (  # noqa: E402
 DSP_NAMES = (
     "LEVEL_SEARCH_ABORT_STATUSES", "SweepSpec", "analyse_capture",
     "analyse_level_probe", "build_measurement_signal",
-    "combine_microphone_measurements", "level_after_clipping",
-    "level_search_advice", "parse_mic_calibration", "read_pcm16_wave_channels",
+    "combine_microphone_measurements", "level_after_clipping", "level_linearity",
+    "level_search_advice", "linearity_probe_level", "parse_mic_calibration",
+    "read_pcm16_wave_channels",
     "search_measurement_level", "write_pcm16_wave",
 )
 OPTIMIZER_NAMES = (
@@ -1757,6 +1758,190 @@ def playing_applications():
     return names
 
 
+# Laptops with a digital microphone array run it through a pipeline inside the
+# sound firmware: compression, automatic gain, noise suppression.  PipeWire
+# only ever sees what comes out of it, and recording from the ALSA device
+# directly reads the same point, so the mixer switches the firmware exposes
+# are the only handle there is.  These words in a capture switch's name mark
+# processing that changes with the signal, which a sweep cannot measure through.
+MIC_PROCESSING_PATTERN = re.compile(
+    r"drc|agc|auto[ _-]?gain|dynamic range|noise|\bns\b|aec|echo", re.IGNORECASE
+)
+MIC_PROCESSING_NOT_CAPTURE = re.compile(r"playback|speaker|headphone|hdmi", re.IGNORECASE)
+MIC_PROCESSING_STATE = DATA / "microphone-processing-restore.json"
+
+
+def source_alsa_card(mic_name):
+    """The ALSA card number behind a PipeWire source, or None."""
+    try:
+        sources = pactl_json("sources")
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return None
+    for item in sources:
+        if item.get("name") == mic_name:
+            card = str(item.get("properties", {}).get("alsa.card", "")).strip()
+            return card if card.isdigit() else None
+    return None
+
+
+def mixer_switch_values(card, name):
+    """A boolean mixer control's values as amixer prints them ("on,on"), or None."""
+    if "'" in name:
+        return None
+    try:
+        shown = run(["amixer", "-c", card, "cget", f"name='{name}'"],
+                    check=False, capture=True)
+    except OSError:
+        return None
+    if shown.returncode != 0 or "type=BOOLEAN" not in shown.stdout:
+        return None
+    found = re.search(r"^\s*: values=([a-z,]+)\s*$", shown.stdout, re.MULTILINE)
+    return found.group(1) if found else None
+
+
+def microphone_processing_switches(mic_name):
+    """Signal-dependent processing switches on this microphone's sound card.
+
+    Every failure is an empty list: a machine without amixer, a microphone that
+    is not an ALSA device and a card without such switches all look the same.
+    """
+    card = source_alsa_card(mic_name)
+    if card is None:
+        return []
+    try:
+        listing = run(["amixer", "-c", card, "controls"], check=False, capture=True)
+    except OSError:
+        return []
+    if listing.returncode != 0:
+        return []
+    switches = []
+    for name in re.findall(r"name='([^']+)'", listing.stdout):
+        if not name.lower().endswith("switch"):
+            continue
+        if not MIC_PROCESSING_PATTERN.search(name) or MIC_PROCESSING_NOT_CAPTURE.search(name):
+            continue
+        values = mixer_switch_values(card, name)
+        if values is None:
+            continue
+        switches.append({"card": card, "name": name, "values": values,
+                         "on": "on" in values.split(",")})
+    return switches
+
+
+def set_mixer_switch(card, name, values):
+    try:
+        done = run(["amixer", "-c", str(card), "cset", f"name='{name}'", values],
+                   check=False, capture=True)
+    except OSError:
+        return False
+    return done.returncode == 0
+
+
+def process_is_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def restore_microphone_processing(*, own=False):
+    """Put back the switches a bypassed measurement turned off.
+
+    The record is written before anything is switched, so a run that was killed
+    outright is repaired by the next start of this helper.  A record whose run
+    is still alive belongs to that run.
+    """
+    try:
+        state = json.loads(MIC_PROCESSING_STATE.read_text())
+    except (OSError, ValueError):
+        return []
+    if not own and process_is_alive(state.get("pid")):
+        return []
+    restored = []
+    for item in state.get("switches") or []:
+        if set_mixer_switch(item.get("card"), item.get("name"), item.get("values", "on")):
+            restored.append(item.get("name"))
+    try:
+        MIC_PROCESSING_STATE.unlink()
+    except OSError:
+        pass
+    return restored
+
+
+@contextlib.contextmanager
+def microphone_processing_bypassed(mic_name):
+    """Turn this microphone's processing switches off for the body, then back."""
+    switches = [item for item in microphone_processing_switches(mic_name) if item["on"]]
+    if not switches:
+        yield []
+        return
+    MIC_PROCESSING_STATE.parent.mkdir(parents=True, exist_ok=True)
+    MIC_PROCESSING_STATE.write_text(json.dumps({"pid": os.getpid(), "switches": switches}))
+    try:
+        turned_off = [
+            item for item in switches
+            if set_mixer_switch(item["card"], item["name"],
+                                ",".join("off" for _ in item["values"].split(",")))
+        ]
+        # The firmware pipeline takes a moment to settle on the new setting.
+        time.sleep(0.3)
+        yield turned_off
+    finally:
+        restore_microphone_processing(own=True)
+
+
+def microphone_linearity(sink_name, mic_name, channel, bypass=False):
+    """Run only the level probes and report how linear the capture path is.
+
+    A diagnostic for a machine whose microphone may be processed: a few quiet
+    chirps, no sweeps, nothing installed.  With ``bypass`` the probes run a
+    second time with the processing switches off, and the switches are put back.
+    """
+    sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
+    mic = next((item for item in microphones() if item["name"] == mic_name), None)
+    if sink is None or mic is None:
+        raise SystemExit("The selected speaker or microphone is no longer available.")
+    channels = channel_count(mic)
+    channel = parse_channel_selection(channel)
+
+    def measure():
+        try:
+            search = find_measurement_level(sink_name, mic_name, channel, channels)
+        except ValueError as error:
+            return {"error": str(error)}
+        warnings, guidance = level_search_advice(search)
+        return {
+            "status": search["status"],
+            "selected_level_dbfs": search["selected_level_dbfs"],
+            "linearity": search.get("linearity"),
+            "probes": [
+                {key: item.get(key) for key in (
+                    "level_dbfs", "loud_rms_dbfs", "peak_dbfs", "noise_dbfs",
+                    "prominence_db", "background_rms_dbfs", "clipped_samples")}
+                for item in search["attempts"] + (
+                    [search["linearity_probe"]] if search.get("linearity_probe") else [])
+            ],
+            "warnings": warnings,
+            "guidance": guidance,
+        }
+
+    report = {
+        "speaker": sink_name,
+        "microphone": mic_name,
+        "switches": microphone_processing_switches(mic_name),
+        "as_configured": measure(),
+        "bypassed": None,
+    }
+    if bypass:
+        with microphone_processing_bypassed(mic_name) as turned_off:
+            report["bypassed"] = dict(
+                measure(), switched_off=[item["name"] for item in turned_off]
+            ) if turned_off else {"skipped": "No processing switch is on for this microphone."}
+        report["switches_after"] = microphone_processing_switches(mic_name)
+    return report
+
+
 class NoSignal(ValueError):
     """The microphone heard nothing of the probe, even at the loudest level.
 
@@ -1830,14 +2015,6 @@ def restore_microphone_volume(*, own=False):
     except OSError:
         pass
     return done
-
-
-def process_is_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, ValueError, TypeError):
-        return False
-    return True
 
 
 class MicrophoneGain:
@@ -2039,10 +2216,55 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
             guidance.append("Currently playing audio: " + ", ".join(playing) + ".")
         failure = NoSignal if search["status"] == "no-signal" else ValueError
         raise failure(" ".join(warnings + guidance))
+    # One more probe, quieter than anything played so far, when the search
+    # settled too quickly to show how the recorded level follows the played one.
+    extra_level = linearity_probe_level(search)
+    if extra_level is not None:
+        search["linearity_probe"] = {"level_dbfs": extra_level, **run_probe(extra_level)}
+    search["linearity"] = level_linearity(
+        search["attempts"] + ([search["linearity_probe"]] if extra_level is not None else [])
+    )
+    search["microphone_processing"] = (
+        microphone_processing_switches(mic_name)
+        if (search["linearity"] or {}).get("verdict") in ("compressed", "expanded") else []
+    )
     return search
 
 
-def capture_measurement(
+def capture_measurement(sink_name, mic_name, *args, **kwargs):
+    """Measure with the microphone's own processing out of the way.
+
+    On a laptop whose microphone runs through a firmware compressor, a
+    calibration does not come out weak, it does not come out at all: the level
+    search stops because the recording will not follow the sweep level (first
+    reported on a Dell XPS 16, pull request #13).  So every measurement, a
+    calibration and a check alike, runs with the processing switches of the
+    microphone's own sound card off, and puts them back exactly as they were:
+    when it passes, when it fails, and, through the record written before the
+    first switch is touched, after a run that was killed.  A microphone with no
+    such switch is measured as before, with the linearity check as the net.
+    """
+    with microphone_processing_bypassed(mic_name) as suspended:
+        measurement = measure_through_sweeps(sink_name, mic_name, *args, **kwargs)
+    return note_suspended_processing(measurement, suspended)
+
+
+def note_suspended_processing(measurement, suspended):
+    """Say in the result what was switched off for it; never a warning."""
+    names = [short_label(item.get("name")) for item in suspended or [] if item.get("name")]
+    if not names or not isinstance(measurement, dict):
+        return measurement
+    measurement["microphone_processing_suspended"] = names
+    quality = measurement.get("quality")
+    if isinstance(quality, dict):
+        listed = ", ".join(f"'{name}'" for name in names)
+        note = (f"Microphone processing was switched off for this measurement and switched back "
+                f"on afterwards: {listed}.")
+        quality["guidance"] = list(dict.fromkeys(list(quality.get("guidance") or []) + [note]))
+    return measurement
+
+
+def measure_through_sweeps(
     sink_name, mic_name, channel, mic_cal_file=None, *,
     level_sink=None, sweeps=None, recording=None,
 ):
@@ -4238,6 +4460,10 @@ def exit_on_terminate(signum, frame):
 
 def main():
     signal.signal(signal.SIGTERM, exit_on_terminate)
+    if MIC_PROCESSING_STATE.exists():
+        # A bypassed measurement was killed before it could put the
+        # microphone's processing switches back.
+        restore_microphone_processing()
     if MIC_GAIN_STATE.exists():
         # A measurement was killed before it could put the microphone's input
         # level back.
@@ -4277,6 +4503,14 @@ def main():
     refine = sub.add_parser("refine-json")
     refine.add_argument("--install", action="store_true",
                         help="install and play the improved profile")
+    linearity = sub.add_parser(
+        "microphone-linearity-json",
+        help="check whether the microphone path compresses, with a few quiet probes")
+    linearity.add_argument("--sink", required=True)
+    linearity.add_argument("--mic", required=True)
+    linearity.add_argument("--channel", default="0")
+    linearity.add_argument("--bypass", action="store_true",
+                           help="probe again with the processing switches off, then restore them")
     calibrate = sub.add_parser("calibrate-json")
     calibrate.add_argument("--sink", required=True)
     calibrate.add_argument("--mic", required=True)
@@ -4313,6 +4547,9 @@ def main():
         print(json.dumps(use_calibrated_output()))
     elif command == "microphone-comparison-json":
         print(json.dumps(microphone_comparison()))
+    elif command == "microphone-linearity-json":
+        print(json.dumps(
+            microphone_linearity(args.sink, args.mic, args.channel, args.bypass), indent=2))
     elif command == "calibrate-json":
         profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,

@@ -171,7 +171,9 @@ class LevelSearchWithGainTests(GainTestCase):
              mock.patch.object(speaker_calibrate, "level_search_advice",
                                side_effect=lambda found: ([f"failed: {found['status']}"], []), create=True), \
              mock.patch.object(speaker_calibrate, "LEVEL_SEARCH_ABORT_STATUSES",
-                               ("no-signal", "background-too-loud", "level-independent"), create=True):
+                               ("no-signal", "background-too-loud", "level-independent"), create=True), \
+             mock.patch.object(speaker_calibrate, "linearity_probe_level", return_value=None, create=True), \
+             mock.patch.object(speaker_calibrate, "level_linearity", return_value=None, create=True):
             with speaker_calibrate.microphone_gain_managed(MIC) as managed:
                 found = speaker_calibrate.find_measurement_level(
                     SINK, MIC, "all", 2, gain=managed if gain else None)
