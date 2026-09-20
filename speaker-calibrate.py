@@ -538,6 +538,26 @@ def unusable_microphones():
             and not is_measurement_microphone(item.get("name", ""))]
 
 
+def is_asahi_voice_microphone(name):
+    """Asahi's processed microphone: the array behind an adaptive beamformer."""
+    return re.fullmatch(r"effect_output\.j[0-9]+-mic", str(name)) is not None
+
+
+def asahi_array_hidden(sources=None):
+    """True on an Apple Silicon machine whose own microphone array cannot be seen.
+
+    asahi-audio puts the array behind a beamformer that adapts to the sound it
+    hears and suppresses what does not come from the user, which is where the
+    speakers are, so it cannot be measured through.  WirePlumber then withdraws
+    every client's permission on the raw array, and no choice of recording
+    target gets it back: only the documented one-line override does.  Without
+    this the panel tells the user to select a built-in array that is not there.
+    """
+    names = [str(item.get("name", "")) for item in (pactl_json("sources") if sources is None else sources)]
+    return (any(is_asahi_voice_microphone(name) for name in names)
+            and ASAHI_RAW_MICROPHONES not in names)
+
+
 def channel_count(item):
     spec = item.get("sample_specification") or item.get("sample_spec") or ""
     found = re.search(r"(\d+)ch", str(spec))
@@ -4046,6 +4066,7 @@ def status_payload():
             "hardware": hardware_id(),
             "sharedProfiles": shared_profiles(),
             "unusableMicrophones": [short_label(name) for name in unusable_microphones()],
+            "asahiArrayHidden": asahi_array_hidden(),
             "measurementSupport": measurement_support()}
     try:
         write_atomic(STATUS_CACHE, json.dumps(payload) + "\n")
