@@ -95,6 +95,23 @@ class RenderingTests(unittest.TestCase):
             render(public())
 
 
+class RunnerTests(unittest.TestCase):
+    def test_rendering_needs_no_limiter_on_the_machine_but_measuring_does(self):
+        # The registry renders on a runner without the LV2 limiter; its first tuning failed on exactly this.
+        bound = {name: speaker_calibrate.__dict__.pop(name) for name in list(speaker_calibrate.__dict__)
+                 if name == "np"}
+        self.addCleanup(lambda: speaker_calibrate.__dict__.update(bound))
+        with mock.patch.object(speaker_calibrate, "LIMITER_PROBE", Path("/nonexistent/limiter.ttl")):
+            with self.assertRaisesRegex(SystemExit, "lsp-plugins-lv2"):
+                speaker_calibrate.load_dsp()
+            speaker_calibrate.__dict__.pop("np", None)
+            speaker_calibrate.load_dsp(playing=False)
+            rendered = speaker_calibrate.render_registry_tuning(
+                public(), identifier="2026-09-20-calibrated-0123456789", score=90, today="2026-09-21")
+        self.assertIn("limiter_headroom_db", rendered["tuning"])
+        self.assertTrue(rendered["metrics"]["signal"].startswith("pink noise"))
+
+
 class HostileUploadTests(unittest.TestCase):
     ATTACKS = ('$(touch canary)', '`touch canary`', '"; touch canary; "', "'; touch canary; '", "x\ntouch canary",
                "\\", "${IFS}", "a" * 500)

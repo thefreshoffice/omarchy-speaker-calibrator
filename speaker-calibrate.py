@@ -109,11 +109,19 @@ def install_measurement_support():
     }
 
 
-def load_dsp():
-    """Bind the measurement and fitting names; called only when they are used."""
+def load_dsp(playing=True):
+    """Bind the measurement and fitting names; called only when they are used.
+
+    ``playing`` is false where only arithmetic is done: rendering a tuning
+    from numbers needs numpy and scipy and no limiter on the machine, and the
+    registry renders on a runner that has never heard of one.
+    """
     if "np" in globals():
         return
     support = measurement_support()
+    if not playing:
+        support = dict(support, missing=[item for item in support["missing"] if item != LIMITER_PACKAGE])
+        support["available"] = not support["missing"]
     if not support["available"]:
         raise SystemExit(
             "Measuring needs " + " and ".join(support["missing"])
@@ -4236,7 +4244,7 @@ def ebur128_lra(signal, rate):
 
 def vendor_metrics(sections, input_gain, rate, reference=None, harmonics=None):
     """The four figures Omarchy asks a tuning to report, less the fit's own."""
-    load_dsp()
+    load_dsp(playing=False)
     from calibration_optimizer import group_delay_swing_ms, chain_sos
     import scipy.signal
     swing = group_delay_swing_ms(sections, rate)
