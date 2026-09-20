@@ -219,6 +219,30 @@ class FindingTests(unittest.TestCase):
         failed = dict(VERIFIED, verdict="fail")
         self.assertEqual(scored(False, False, failed), unchecked)      # a failed check proves nothing, and says so in words
 
+    def test_level_warnings_cost_nothing_once_the_measurement_proves_itself_clean(self):
+        def warnings_part(count, **metrics):
+            profile = shared()
+            profile["profile"]["quality"]["warnings"] = ["w"] * count
+            profile["profile"]["quality"]["metrics"].update(metrics)
+            return share.score_parts(share.public_payload(profile))["warnings"]
+        quiet_and_clean = dict(maximum_accepted_peak_dbfs=-17.7, snr_mid_db=69.4, worst_repeatability_db=0.11)
+        self.assertEqual(warnings_part(2, **quiet_and_clean), 0.0)
+        self.assertEqual(str(warnings_part(2, **quiet_and_clean)), "0.0")           # not a negative zero in the index
+        self.assertEqual(warnings_part(3, **quiet_and_clean), -2.0)                 # a third warning is about something else
+        # Quiet and noisy, or quiet and unrepeatable: the level did hurt.
+        self.assertEqual(warnings_part(2, **dict(quiet_and_clean, snr_mid_db=25.0)), -4.0)
+        self.assertEqual(warnings_part(2, **dict(quiet_and_clean, worst_repeatability_db=0.9)), -4.0)
+        # A good level: whatever the warnings are, they are not about a quiet signal.
+        self.assertEqual(warnings_part(2, **dict(quiet_and_clean, maximum_accepted_peak_dbfs=-5.0)), -4.0)
+        # Figures missing or not numbers: nothing is excused.
+        self.assertEqual(warnings_part(2, maximum_accepted_peak_dbfs=-17.7, snr_mid_db=None), -4.0)
+
+    def test_a_score_has_a_word(self):
+        self.assertEqual([share.score_band(score) for score in (100, 80, 79, 67, 60, 59, 40, 39, 0)],
+                         ["excellent", "excellent", "good", "good", "good", "fair", "fair", "rough", "rough"])
+        self.assertEqual(share.score_band(None), "rough")
+        self.assertEqual(share.score_band(float("nan")), "rough")
+
     def test_the_parts_add_up_and_can_be_shown(self):
         public = share.public_payload(shared(), VERIFIED)
         parts = share.score_parts(public, votes=2)

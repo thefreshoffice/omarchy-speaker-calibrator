@@ -277,6 +277,38 @@ def _until_break(lines):
         yield stripped
 
 
+# A quiet laptop speaker reaches the loudest allowed sweep and still leaves the
+# microphone far below full scale, which earns the measurement up to two
+# warnings about level.  They are advice for the person measuring.  Whether the
+# level hurt is measured too: a signal far above the noise in the midrange that
+# repeats to within half a decibel was loud enough, and a stranger loses
+# nothing by it.
+SCORE_LOW_PEAK_DBFS = -9.0
+SCORE_CLEAN_SNR_MID_DB = 40.0
+SCORE_CLEAN_REPEATABILITY_DB = 0.5
+SCORE_LEVEL_WARNINGS = 2
+
+# What a score means in a word, because 67 reads like a poor grade and is a good profile.
+SCORE_BANDS = ((80, "excellent"), (60, "good"), (40, "fair"), (0, "rough"))
+
+
+def score_band(score):
+    score = score if _finite(score) else 0
+    return next(word for floor, word in SCORE_BANDS if score >= floor)
+
+
+def excused_warnings(quality):
+    """How many of a measurement's warnings are about a level that provably did no harm."""
+    metrics = quality.get("metrics") or {}
+    peak, snr, repeat = (metrics.get("maximum_accepted_peak_dbfs"), metrics.get("snr_mid_db"),
+                         metrics.get("worst_repeatability_db"))
+    if not (_finite(peak) and _finite(snr) and _finite(repeat)):
+        return 0
+    if peak >= SCORE_LOW_PEAK_DBFS or snr < SCORE_CLEAN_SNR_MID_DB or repeat > SCORE_CLEAN_REPEATABILITY_DB:
+        return 0
+    return SCORE_LEVEL_WARNINGS
+
+
 SCORE_MICROPHONE = {"calibrated measuring microphone": 40.0, "external microphone": 32.0,
                     "built-in microphone": 18.0}
 
@@ -306,7 +338,8 @@ def score_parts(payload, votes=0):
     before, after = checked.get("target_error_before_db"), checked.get("target_error_after_db")
     parts["measured_improvement"] = 8.0 * min(1.0, max(0.0, (before - after) / before)) \
         if parts["checked"] and _finite(before) and _finite(after) and before > 0 else 0.0
-    parts["warnings"] = -min(8.0, 2.0 * float(quality.get("warning_count") or 0))
+    counted = max(0, int(quality.get("warning_count") or 0) - excused_warnings(quality))
+    parts["warnings"] = -min(8.0, 2.0 * counted) or 0.0
     parts["votes"] = min(10.0, 2.0 * max(0, int(votes or 0)))
     return parts
 
@@ -320,7 +353,7 @@ def score_words(payload):
     """The score's two main facts in words, because a number alone reads as a verdict."""
     parts = score_parts(payload)
     quality = (payload.get("profile") or {}).get("quality") or {}
-    measurement = ("clean measurement" if parts["repeatability"] >= 15.0 and (quality.get("warning_count") or 0) <= 1
+    measurement = ("clean measurement" if parts["repeatability"] >= 15.0 and parts["warnings"] >= -2.0
                    else "good measurement" if parts["repeatability"] >= 10.0 else "usable measurement")
     verdict = ((payload.get("public") or {}).get("verification") or {}).get("verdict")
     check = {"pass": "checked and passed", "warning": "checked, passed with warnings",

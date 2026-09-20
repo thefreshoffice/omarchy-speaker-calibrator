@@ -28,11 +28,17 @@ Panel {
   property string loudnessMode: "protected"
   property string channelTrimMode: "off"
   property bool advanced: false
+  // A score in a word: 67 reads like a poor grade and is a good profile.  The
+  // same floors as the helper's score_band.
+  function scoreBand(score) {
+    var value = Number(score) || 0
+    return value >= 80 ? "excellent" : value >= 60 ? "good" : value >= 40 ? "fair" : "rough"
+  }
   // Words for one row of the registry's list for this machine.
   function registryLabel(entry) {
     return "Load: measured with " + (entry.microphone_kind === "built-in microphone" ? "the built-in microphones"
       : entry.microphone_kind === "external microphone" ? "an external microphone" : "a calibrated measuring microphone")
-      + "  ·  score " + Number(entry.score || 0)
+      + "  ·  " + scoreBand(entry.score) + ", score " + Number(entry.score || 0)
   }
   function registryDescription(entry) {
     var parts = []
@@ -1654,7 +1660,7 @@ Panel {
               description: sharedUrl !== ""
                 ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
                 : (reg.share_score !== null && reg.share_score !== undefined
-                    ? "It would score " + Number(reg.share_score) + " of 100"
+                    ? "It would rate " + root.scoreBand(reg.share_score) + ", " + Number(reg.share_score) + " of 100"
                       + (reg.share_checked ? "" : "; check the calibration first and it scores higher")
                     : "For everyone with " + String((service.status.hardware || {}).label || "this machine"))
                   + (reg.share_replaces === true ? "  ·  replaces your earlier upload" : "")
