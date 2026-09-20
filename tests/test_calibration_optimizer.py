@@ -1275,6 +1275,28 @@ class MicrophoneCandidateTests(unittest.TestCase):
         self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.80_C3_BA_81_E7_90.1"))
         self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
 
+    def test_devices_identify_pipewire_s_default_microphone(self):
+        sources = [
+            {"name": "alsa_input.pci-card.HiFi__Mic2__source",
+             "description": "Stereo Microphone", "sample_specification": "s16le 2ch 48000Hz"},
+            {"name": "alsa_input.pci-card.HiFi__Mic1__source",
+             "description": "Digital Microphone", "sample_specification": "s16le 2ch 48000Hz"},
+        ]
+
+        def pactl(kind):
+            return [] if kind == "sinks" else sources
+
+        default = subprocess.CompletedProcess(
+            [], 0, stdout="alsa_input.pci-card.HiFi__Mic1__source\n", stderr=""
+        )
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=pactl), \
+             mock.patch.object(speaker_calibrate, "run", return_value=default):
+            microphones = speaker_calibrate.devices_payload()["microphones"]
+        self.assertEqual(
+            [item["description"] for item in microphones if item["default"]],
+            ["Digital Microphone"],
+        )
+
 
 class MeasurementSupportTests(unittest.TestCase):
     """Omarchy ships neither numpy nor scipy, so their absence is a state."""
@@ -2259,6 +2281,19 @@ class DeviceSelectionTests(unittest.TestCase):
         builtin = self.select.index("firstInternal(service.sinks)")
         self.assertLess(chosen, calibrated)
         self.assertLess(calibrated, builtin)
+
+    def test_pipewire_s_default_decides_between_built_in_microphones_only(self):
+        calibrated = self.select.index("(profile.microphone || {}).name")
+        default = self.select.index("defaultInternal(service.microphones)")
+        builtin = self.select.index("firstInternal(service.microphones)")
+        self.assertLess(calibrated, default)
+        self.assertLess(default, builtin)
+        start = self.source.index("function defaultInternal(list)")
+        helper = self.source[start:self.source.index("\n  }\n", start)]
+        # A dock's webcam as the default source must not displace the laptop's
+        # own microphone without being picked.
+        self.assertIn("list[index].default === true && list[index].internal === true", helper)
+        self.assertNotIn("defaultInternal(service.sinks)", self.select)
 
     def test_a_click_is_remembered_by_name(self):
         self.assertIn("root.chosenMic = modelData.name", self.source)

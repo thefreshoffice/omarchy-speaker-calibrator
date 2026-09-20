@@ -505,6 +505,10 @@ def channel_count(item):
 
 
 def devices_payload():
+    default_source = run(
+        ["pactl", "get-default-source"], check=False, capture=True
+    ).stdout.strip()
+
     def public(item, kind):
         name = item["name"]
         return {
@@ -514,6 +518,10 @@ def devices_payload():
             "channels": channel_count(item),
             "kind": kind,
             "internal": name.startswith(("alsa_input.pci-", "alsa_output.pci-")),
+            # A laptop can expose both an unplugged analog microphone jack and
+            # its real built-in digital array.  Let the panel select the source
+            # WirePlumber chose instead of whichever pactl happened to list first.
+            "default": kind == "microphone" and name == default_source,
         }
     return {
         "sinks": [public(item, "speaker") for item in physical_sinks()],

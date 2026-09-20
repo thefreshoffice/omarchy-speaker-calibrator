@@ -95,9 +95,19 @@ Panel {
       if (list[index].internal === true) return index
     return list.length > 0 ? 0 : -1
   }
+  // A laptop can expose an unplugged analog jack beside its real microphone
+  // array, in either order.  PipeWire's default settles which built-in one
+  // works; a default that is not built in (a dock's webcam, a headset) is
+  // left to be picked by hand.
+  function defaultInternal(list) {
+    for (var index = 0; index < list.length; index++)
+      if (list[index].default === true && list[index].internal === true) return index
+    return -1
+  }
   // Which rows are selected, decided afresh whenever the lists or the status
   // arrive: the device picked by hand while it is connected, else the one the
-  // calibration in use was made with, else the laptop's own.  Re-selecting
+  // calibration in use was made with, else the laptop's own (PipeWire's
+  // default microphone when it is one of them).  Re-selecting
   // the built-in devices on every refresh forgot the choice each time the
   // panel was opened.
   function selectDevices() {
@@ -108,6 +118,7 @@ Panel {
     root.sinkIndex = sink
     var mic = deviceIndex(service.microphones, root.chosenMic)
     if (mic < 0) mic = deviceIndex(service.microphones, (profile.microphone || {}).name)
+    if (mic < 0) mic = defaultInternal(service.microphones)
     if (mic < 0) mic = firstInternal(service.microphones)
     var before = root.micIndex >= 0 && service.microphones[root.micIndex]
       ? service.microphones[root.micIndex].name : ""

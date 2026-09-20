@@ -1238,12 +1238,15 @@ def analyse_level_probe(
     *,
     background_seconds: float = 0.3,
     block_seconds: float = 0.05,
+    startup_settle_seconds: float = 0.2,
 ) -> dict:
     """Summarize a short level-probe recording without relying on timing.
 
-    The recorder starts ``background_seconds`` or more before the probe plays,
-    so the opening of the recording is room sound alone and is reported as
-    background.  Everything after it is the probe region.  Noise and
+    The recorder starts ``background_seconds`` or more before the probe plays.
+    Some digital microphone drivers emit a short full-scale burst while their
+    node starts, so ``startup_settle_seconds`` is discarded before room sound
+    is judged.  The following background window is reported as background;
+    everything after it is the probe region.  Noise and
     prominence come from short RMS blocks, so a late recorder start or an
     early stop cannot masquerade as a quiet speaker.
 
@@ -1271,13 +1274,16 @@ def analyse_level_probe(
     block_rms = np.sqrt(np.mean(blocks * blocks, axis=1))
     block_peak = np.max(np.abs(blocks), axis=1)
     count = blocks.shape[0]
-    background_blocks = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
-    background_rms = np.sqrt(np.mean(block_rms[:background_blocks] ** 2, axis=0))
-    background_peak = np.max(block_peak[:background_blocks], axis=0)
+    background_end = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
+    settle_blocks = int(np.clip(round(startup_settle_seconds * rate / block),
+                                0, max(0, background_end - 1)))
+    background_rms = np.sqrt(np.mean(
+        block_rms[settle_blocks:background_end] ** 2, axis=0))
+    background_peak = np.max(block_peak[settle_blocks:background_end], axis=0)
 
-    region_rms = block_rms[background_blocks:]
-    region_peak = block_peak[background_blocks:]
-    noise = np.percentile(block_rms, 10, axis=0)
+    region_rms = block_rms[background_end:]
+    region_peak = block_peak[background_end:]
+    noise = np.percentile(block_rms[settle_blocks:], 10, axis=0)
     loud = np.percentile(region_rms, 95, axis=0)
     prominences = [dbfs(loud[index]) - dbfs(noise[index]) for index in range(channels)]
     best = int(np.argmax(prominences))
@@ -1288,7 +1294,7 @@ def analyse_level_probe(
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
     loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]
     peak = float(loudest_blocks[1] if loudest_blocks.size >= 4 else loudest_blocks[0])
-    region = values[background_blocks * block:usable]
+    region = values[background_end * block:usable]
     return {
         "peak_dbfs": round(dbfs(peak), 3),
         "tonal_peak_dbfs": round(dbfs(tonal_peak), 3),
