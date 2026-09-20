@@ -446,6 +446,20 @@ def sink_volume_db(name):
     return parse_sink_volume_db(result.stdout)
 
 
+# A sink name is written into PipeWire configuration, into the vendor
+# tuning Omarchy sources as shell, and onto pactl's command line.  PipeWire's
+# own names are letters, digits and a little punctuation; a quote, a brace or a
+# leading dash is never a device and is refused wherever a name is used, however
+# it got there.
+SINK_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,199}")
+
+
+def checked_sink_name(name):
+    if not isinstance(name, str) or not SINK_NAME_PATTERN.fullmatch(name):
+        raise SystemExit("That speaker output's name is not one PipeWire would give a device; refusing to use it.")
+    return name
+
+
 def is_physical_sink(name):
     """True for a real output device, never the calibrated sink in front of one."""
     name = str(name)
@@ -926,6 +940,7 @@ def _number(value):
 
 def filter_config(sink, fit_payload, *, deep_bass=False,
                   loudness_compensation=False, sink_volume_db=0.0):
+    sink = checked_sink_name(sink)
     controls = graph_controls(
         fit_payload, deep_bass=deep_bass,
         loudness_compensation=loudness_compensation, sink_volume_db=sink_volume_db,
@@ -1056,7 +1071,7 @@ def use_calibrated_output():
 
 
 def move_apps(target):
-    run(["pactl", "set-default-sink", target])
+    run(["pactl", "set-default-sink", checked_sink_name(target)])
     for stream in pactl_json("sink-inputs"):
         props = stream.get("properties", {})
         if props.get("application.name") and props.get("application.name") != "EasyEffects":
@@ -2357,6 +2372,8 @@ def archived_microphones():
 SHARE_FORMAT = "omarchy-speaker-calibration/1"
 SHARE_SUFFIX = ".speaker-calibration.json"
 SHARE_LIMIT_BYTES = 1 << 20
+SHARE_PROFILE_LIMIT_BYTES = 200_000
+SHARE_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}(T[0-9:.]{5,15}([+-]\d{2}:\d{2}|Z)?)?")
 SHARE_LIST_LIMIT = 12
 SHARE_SCAN_LIMIT = 5000
 SHARE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,150}")
@@ -2492,7 +2509,18 @@ def export_profile():
     # The correction file is a path on the exporting machine; only whether
     # there was one travels.
     mic["calibration_file"] = bool(mic.get("calibration_file"))
+    # A USB device's node name carries its serial number; the description says
+    # what kind of microphone it was, which is all the other side needs.
+    mic.pop("name", None)
     shared["microphone"] = mic
+    # The measurement remembers the same correction file by its full path.
+    measurement = dict(shared.get("measurement") or {})
+    if isinstance(measurement.get("microphone_calibration"), dict):
+        measurement["microphone_calibration"] = {
+            key: value for key, value in measurement["microphone_calibration"].items() if key != "path"
+        }
+    if measurement:
+        shared["measurement"] = measurement
     speaker = profile.get("speaker") or {}
     payload = {
         "format": SHARE_FORMAT,
@@ -2513,7 +2541,12 @@ def export_profile():
 
 
 def _finite(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer of four hundred digits
+        return False
 
 
 def _within(value, bounds):
@@ -2562,9 +2595,24 @@ def valid_shared_payload(payload):
     if not isinstance(payload, dict) or payload.get("format") != SHARE_FORMAT:
         raise ValueError("not a shared calibration file")
     payload = bounded_copy(payload)
+    hardware = payload.get("hardware")
+    if hardware is None:
+        hardware = payload["hardware"] = {}
+    if not isinstance(hardware, dict) or not isinstance(hardware.get("speaker"), (str, type(None))):
+        raise ValueError("the hardware record is not one this plugin writes")
     profile = payload.get("profile")
     if not isinstance(profile, dict):
         raise ValueError("no calibration inside")
+    # The date ends up in an exported vendor tuning, which Omarchy sources as
+    # shell, so it is a date or the file is refused.
+    if not isinstance(profile.get("created_at"), str) or not SHARE_DATE_PATTERN.fullmatch(profile["created_at"]):
+        raise ValueError("the measurement date is not a date")
+    # The proposal travels inside every status reply, which the panel caps.
+    if len(json.dumps(profile, indent=2)) > SHARE_PROFILE_LIMIT_BYTES:
+        raise ValueError("the calibration inside is larger than any this plugin writes")
+    # Whatever speaker record the file carries names the exporter's device;
+    # the importer decides the speaker from this machine's own list.
+    profile.pop("speaker", None)
     fit = profile.get("fit")
     if not isinstance(fit, dict):
         raise ValueError("no filter set")
@@ -2633,6 +2681,10 @@ def shared_summary(path, ours, sinks):
     except (OSError, UnsafeFile, ValueError) as error:
         return {"file": path.name, "valid": False,
                 "reason": short_label(str(error), SHARE_TEXT_LIMIT) or "cannot be read"}
+    except (RecursionError, OverflowError, TypeError, AttributeError, KeyError):
+        # A file built to break the parser sits in Downloads until someone
+        # deletes it; it must not take the panel's status down with it.
+        return {"file": path.name, "valid": False, "reason": "not a shared calibration file"}
     theirs = payload.get("hardware") or {}
     profile = payload["profile"]
     return {
@@ -2654,13 +2706,15 @@ def shared_profiles():
             for count, entry in enumerate(entries):
                 if count >= SHARE_SCAN_LIMIT:
                     break
-                if entry.name.endswith(SHARE_SUFFIX) and entry.is_file(follow_symlinks=False):
+                # Only names the import would accept: a row that cannot be loaded is noise.
+                if (entry.name.endswith(SHARE_SUFFIX) and SHARE_NAME_PATTERN.fullmatch(entry.name)
+                        and entry.is_file(follow_symlinks=False)):
                     candidates.append((entry.stat(follow_symlinks=False).st_mtime, entry.name))
     except OSError:
         return []
     candidates.sort(reverse=True)
     ours = hardware_id()
-    sinks = {item.get("name") for item in pactl_json("sinks")}
+    sinks = {item.get("name") for item in physical_sinks()}
     return [shared_summary(directory / name, ours, sinks) for _, name in candidates[:SHARE_LIST_LIMIT]]
 
 
@@ -2689,12 +2743,21 @@ def import_profile(name=None, path=None):
         raise SystemExit(f"{source.name} cannot be read: {error}")
     except ValueError as error:
         raise SystemExit(f"{source.name} cannot be loaded: {error}.")
+    except (RecursionError, OverflowError, TypeError, AttributeError, KeyError):
+        raise SystemExit(f"{source.name} is not a shared calibration file.")
     ours = hardware_id()
     theirs = payload.get("hardware") or {}
-    sinks = {item.get("name") for item in pactl_json("sinks")}
-    matches = {"machine": hardware_matches(theirs, ours), "speakers": theirs.get("speaker") in sinks}
+    # The speaker comes from this machine's own list, the one the panel
+    # offers, and never from the file: the exporter's device when this machine
+    # has one of that name, else this machine's speakers.  The list leaves out
+    # the raw device behind a protected speaker sink.
+    here = {item.get("name"): item for item in physical_sinks()}
+    matches = {"machine": hardware_matches(theirs, ours), "speakers": theirs.get("speaker") in here}
     profile = payload["profile"]
-    if not matches["speakers"]:
+    if matches["speakers"]:
+        found = here[theirs["speaker"]]
+        profile["speaker"] = {"name": checked_sink_name(found["name"]), "description": label(found)}
+    else:
         profile["speaker"] = local_speaker()
     # The switches are this machine's, not the exporter's.
     current = load_profile(PROFILE) or {}
@@ -2883,7 +2946,7 @@ def vendor_test_signal(reference, rate):
     """A hot master to run through the chain: a track, or pink noise."""
     if reference:
         proc = subprocess.run(
-            ["ffmpeg", "-nostdin", "-v", "error", "-i", str(reference), "-t", str(VENDOR_REFERENCE_SECONDS),
+            ["/usr/bin/ffmpeg", "-nostdin", "-v", "error", "-i", str(reference), "-t", str(VENDOR_REFERENCE_SECONDS),
              "-ac", "2", "-ar", str(rate), "-f", "f32le", "-"],
             capture_output=True, check=False,
         )
@@ -2904,7 +2967,7 @@ def ebur128_lra(signal, rate):
         return None
     pcm = np.clip(signal, -1.0, 1.0).astype(np.float32).tobytes()
     proc = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "info", "-f", "f32le", "-ar", str(rate), "-ac", "2", "-i", "-",
+        ["/usr/bin/ffmpeg", "-nostdin", "-v", "info", "-f", "f32le", "-ar", str(rate), "-ac", "2", "-i", "-",
          "-af", "ebur128=framelog=quiet", "-f", "null", "-"],
         input=pcm, capture_output=True, check=False,
     )
@@ -3012,7 +3075,7 @@ description="{label} speakers"
 {match_line}
 ## The internal speaker sink, as PipeWire names it on this machine.  Plain
 ## dots on purpose: Omarchy hands this to awk -v, which eats backslashes.
-sink_pattern='^{sink_name}$'
+sink_pattern='^{checked_sink_name(sink_name)}$'
 
 ## Provenance.
 derived_from="Omarchy Speaker Calibrator {plugin_version()}: sweep measurement with {kind}, {voicing} target, measured {when}"
@@ -3091,7 +3154,7 @@ TRIAL_UNIT_TEXT = (UNIT_TEXT
 
 def trial_graph(chain, speaker):
     """The rendered chain as a second sink: its own names, the real target."""
-    return (chain.replace("@SPEAKER_SINK@", speaker)
+    return (chain.replace("@SPEAKER_SINK@", checked_sink_name(speaker))
             .replace(f'"{VIRTUAL_SINK}_output"', f'"{TRIAL_SINK}_output"')
             .replace(f'"{VIRTUAL_SINK}"', f'"{TRIAL_SINK}"')
             .replace('"Laptop Speakers"', '"Exported tuning (trial)"'))
@@ -3617,6 +3680,7 @@ def disable():
     if target:
         move_apps(target)
     forget_loudness_tracker()
+    stop_trial_host()
     run(["systemctl", "--user", "disable", "--now", SERVICE], check=False)
     print("Speaker calibration disabled." + (f" Output restored to {target}." if target else ""))
 

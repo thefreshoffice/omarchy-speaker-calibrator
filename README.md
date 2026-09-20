@@ -254,7 +254,10 @@ named after the machine, the microphone and the date, for example
 `slimbook-executive-external-mic-2026-09-16.speaker-calibration.json`. The
 file carries the machine it was made on (the vendor, product, SKU and board
 from the firmware, the same fields Omarchy keys its own speaker tunings on)
-and the speaker device, and nothing about you: no user name, no paths.
+and the speaker device, and nothing about you: no user name, no paths, and no
+microphone device name, since a USB device's name carries its serial number.
+What kind of microphone it was travels, and whether it had a correction file,
+never where that file lives.
 
 A shared file dropped into your Downloads folder appears in the same section.
 **Load** makes it the last measurement, ready to install, exactly like a fresh
@@ -293,6 +296,12 @@ through Omarchy's own installer with its matching and verification, is
 tuning host, so playback pauses for a second, and `vendor-restore-json` puts
 the calibration back.
 
+A shared file never chooses the speaker output. The exporter's device is used
+only when this machine's own list has one of exactly that name, and otherwise
+the calibration is pointed at this machine's speakers; whatever name a file
+carries is never written into a configuration. A file built to upset the
+reader is listed as unreadable and nothing more.
+
 Every value a shared file could feed into the filter chain is checked against
 the same limits the optimizer works under before anything is loaded: no cut
 deeper than 18 dB, no boost above 6 dB, no high-pass above 400 Hz, no trim
@@ -320,7 +329,8 @@ omarchy plugin remove thefreshoffice.speaker-calibrator
 ```
 
 Press **Disable** in the panel first. That restores the default output, stops
-both services and takes the filter out of the audio path. If the plugin is
+the services, ends an exported tuning that is on trial and removes its files,
+and takes the filter out of the audio path. If the plugin is
 removed while a calibration is still active, the PipeWire filter keeps running
 from the files below until they are deleted or the machine restarts, and the
 panel is no longer there to switch it off.
@@ -334,7 +344,18 @@ created outside it and stay behind:
 | `~/.config/systemd/user/omarchy-speaker-loudness.service` | follows the volume for loudness compensation |
 | `~/.config/pipewire/omarchy-speaker-tuning.conf` | the filter sink |
 | `~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf` | the measured filters |
+| `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Disable removes it |
+| `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
+| `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
 | `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps |
+| `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
+| `~/Downloads/omarchy-tuning-*/` | vendor tunings you exported |
+
+The files in Downloads are yours: the plugin wrote them because you pressed
+Export and never deletes them. On Apple Silicon, the copy of
+`99-asahi.conf` under `~/.config/wireplumber/wireplumber.conf.d/` is one you
+made by hand following the setup above; delete it to hide the raw microphone
+array again.
 
 Those recordings are audio captured in your room by your microphone. Nothing
 is ever sent anywhere, but they survive removal until deleted.
@@ -343,10 +364,14 @@ To remove all of it after disabling:
 
 ```bash
 systemctl --user disable --now omarchy-speaker-tuning.service omarchy-speaker-loudness.service
+systemctl --user stop omarchy-speaker-trial.service
 rm -f ~/.config/systemd/user/omarchy-speaker-tuning.service \
       ~/.config/systemd/user/omarchy-speaker-loudness.service \
+      ~/.config/systemd/user/omarchy-speaker-trial.service \
       ~/.config/pipewire/omarchy-speaker-tuning.conf \
-      ~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf
+      ~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf \
+      ~/.config/pipewire/omarchy-speaker-trial.conf \
+      ~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf
 systemctl --user daemon-reload
 rm -rf ~/.local/share/omarchy-speaker-calibrator
 ```
