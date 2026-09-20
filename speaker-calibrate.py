@@ -4569,6 +4569,8 @@ def main():
     sub.add_parser("verify-json")
     lookup = sub.add_parser("registry-lookup-json", help="calibrations shared for this machine's model")
     lookup.add_argument("--refresh", action="store_true")
+    lookup.add_argument("--quiet", action="store_true",
+                        help="when the registry cannot be reached, answer from the cache instead of failing")
     consent = sub.add_parser("registry-consent-json", help="allow or decline looking online for shared calibrations")
     consent.add_argument("--answer", choices=("allowed", "declined"), required=True)
     load = sub.add_parser("registry-load-json", help="load one shared calibration as the last measurement")
@@ -4626,7 +4628,14 @@ def main():
     args = parser.parse_args()
     command = args.command or "wizard"
     if command == "registry-lookup-json":
-        print(json.dumps(registry_lookup(args.refresh)))
+        try:
+            print(json.dumps(registry_lookup(args.refresh)))
+        except SystemExit as stop:
+            # The panel looks by itself when it opens.  Being offline is not a
+            # failure to put on the screen in red every time.
+            if not args.quiet or isinstance(stop.code, int):
+                raise
+            print(json.dumps({**registry_cached(), "unreachable": short_label(str(stop.code), 200)}))
     elif command == "registry-consent-json":
         write_registry_state(lookup=args.answer)
         print(json.dumps(registry_lookup(True) if args.answer == "allowed" else registry_cached()))

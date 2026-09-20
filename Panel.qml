@@ -28,6 +28,26 @@ Panel {
   property string loudnessMode: "protected"
   property string channelTrimMode: "off"
   property bool advanced: false
+  // Share asks once, the first time, by showing what it sends.
+  property bool shareConfirm: false
+  // Words for one row of the registry's list for this machine.
+  function registryLabel(entry) {
+    return "Load: measured with " + (entry.microphone_kind === "built-in microphone" ? "the built-in microphones"
+      : entry.microphone_kind === "external microphone" ? "an external microphone" : "a calibrated measuring microphone")
+      + "  ·  score " + Number(entry.score || 0)
+  }
+  function registryDescription(entry) {
+    var parts = []
+    if (entry.created_at) parts.push("measured " + String(entry.created_at))
+    if (entry.checked === "pass" || entry.checked === "warning")
+      parts.push("checked" + (entry.checked_before_db !== null && entry.checked_after_db !== null
+        ? ": " + Number(entry.checked_before_db).toFixed(1) + " → " + Number(entry.checked_after_db).toFixed(1) + " dB from the target"
+        : ""))
+    else parts.push("not checked")
+    if (Number(entry.votes || 0) > 0) parts.push(Number(entry.votes) + " found it good")
+    parts.push(Number(entry.tier) >= 3 ? "this exact machine" : "this model, another variant")
+    return parts.join("  ·  ") + ". Plays as a preview; you keep it or go back."
+  }
   property bool _optionsAdopted: false
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
@@ -44,6 +64,7 @@ Panel {
     // the calibration the panel exists to give.
     scroller.contentY = 0
     service.refresh()
+    root.shareConfirm = false
   }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
@@ -1301,6 +1322,70 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Calibrations other people shared for this model.  Asked about once;
+          // after a yes the list is simply there, and after a no nothing is.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: service.registry.consent === null
+              || (service.registry.consent === "allowed" && (service.registry.profiles || []).length > 0)
+
+            PanelSectionHeader {
+              text: "SHARED FOR THIS MACHINE"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.registry.consent === null
+              width: parent.width
+              text: "Other people may have shared a calibration measured on this model. Looking asks a public "
+                + "registry on GitHub for the list for " + String((service.status.hardware || {}).label || "this model")
+                + ", about once a day. It sends nothing about you or your machine beyond that request."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Row {
+              visible: service.registry.consent === null
+              width: parent.width
+              spacing: Style.space(8)
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "Look online"
+                iconText: "󰖟"
+                bordered: true
+                selected: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.registryAnswer("allowed")
+              }
+              Button {
+                width: (parent.width - parent.spacing) / 2
+                text: "No, never"
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.registryAnswer("declined")
+              }
+            }
+            Repeater {
+              model: service.registry.consent === "allowed" ? (service.registry.profiles || []).slice(0, 3) : []
+              ActionRow {
+                width: parent.width
+                icon: "󰓦"
+                label: service.busy && service.phase === "registryload" ? "Loading…" : root.registryLabel(modelData)
+                description: root.registryDescription(modelData)
+                enabled: !service.busy
+                onClicked: service.registryLoad(modelData.id)
+              }
+            }
+            PanelSeparator { foreground: root.foreground }
+          }
+
           Button {
             width: parent.width
             text: service.busy && service.phase === "measure" ? "Measuring… keep quiet"
@@ -1558,7 +1643,10 @@ Panel {
               root.advanced = !root.advanced
               // Every time, not just the first: measuring with another
               // microphone changes what there is to compare.
-              if (root.advanced) service.loadMicrophones()
+              if (root.advanced) {
+                service.loadMicrophones()
+                if (service.status.enabled && service.status.profile) service.shareStatusCheck()
+              }
             }
           }
 
@@ -1780,6 +1868,54 @@ Panel {
               visible: service.status.enabled
                 && service.status.profile !== null && service.status.profile !== undefined
               width: parent.width
+              icon: "󰖟"
+              readonly property var share: service.shareStatus || ({})
+              label: service.busy && (service.phase === "shareupload" || service.phase === "sharebrowser") ? "Sharing…"
+                : share.uploaded ? "Shared with everyone  ·  open its page"
+                : service.shareStatus && share.one_press !== true ? "Share with everyone via the browser"
+                : "Share with everyone"
+              description: share.uploaded
+                ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
+                : "Publishes this calibration for everyone with " + String((service.status.hardware || {}).label || "this machine")
+                  + (service.shareStatus ? "  ·  it would score " + Number(share.score || 0) + " of 100" : "")
+              enabled: !service.busy
+              onClicked: {
+                if (share.uploaded) service.openRegistryPage(share.uploaded)
+                else if (!service.shareStatus) service.shareStatusCheck()
+                else if (share.explained !== true && !root.shareConfirm) root.shareConfirm = true
+                else if (share.one_press === true) { root.shareConfirm = false; service.shareUpload() }
+                else { root.shareConfirm = false; service.shareBrowser() }
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: root.shareConfirm
+              width: parent.width
+              text: "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
+                + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
+                + "It does not contain your user name, any path, any device name or serial, or any recording. "
+                + (service.shareStatus && service.shareStatus.one_press === true
+                   ? "Press Share with everyone again to upload it."
+                   : "Press again: the profile is copied, a form opens in your browser, and you paste it there.")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.shareNote !== ""
+              width: parent.width
+              text: service.shareNote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            ActionRow {
+              visible: service.status.enabled
+                && service.status.profile !== null && service.status.profile !== undefined
+              width: parent.width
               icon: "󰁨"
               label: service.busy && service.phase === "vendor" ? "Rendering…" : "Export as an Omarchy tuning"
               description: "Writes tuning.conf and filter-chain.conf in the layout Omarchy ships under "
@@ -1837,6 +1973,40 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
+            }
+            Repeater {
+              model: service.registry.consent === "allowed" ? (service.registry.profiles || []).slice(3) : []
+              ActionRow {
+                width: parent.width
+                icon: "󰓦"
+                label: root.registryLabel(modelData)
+                description: root.registryDescription(modelData)
+                enabled: !service.busy
+                onClicked: service.registryLoad(modelData.id)
+              }
+            }
+            ActionRow {
+              width: parent.width
+              icon: "󰖟"
+              label: service.registry.consent === "allowed"
+                ? (service.busy && service.phase === "registry" ? "Looking…" : "Look again for calibrations shared for this machine")
+                : "Look online for calibrations shared for this machine"
+              description: service.registry.consent === "allowed"
+                ? ((service.registry.profiles || []).length === 0 ? "None were shared for this model yet. " : "")
+                  + (service.registry.unreachable ? "The registry could not be reached just now. " : "")
+                  + "Asks the public registry on GitHub for this model's list"
+                : "Asks a public registry on GitHub for this model's list, then about once a day"
+              enabled: !service.busy
+              onClicked: service.registry.consent === "allowed" ? service.registryLookup(true) : service.registryAnswer("allowed")
+            }
+            ActionRow {
+              visible: service.registry.consent === "allowed"
+              width: parent.width
+              icon: "󰅖"
+              label: "Stop looking online"
+              description: "The list disappears and the registry is not asked again"
+              enabled: !service.busy
+              onClicked: service.registryAnswer("declined")
             }
 
             PanelSeparator { foreground: root.foreground }
