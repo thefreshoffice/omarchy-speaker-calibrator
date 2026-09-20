@@ -1613,9 +1613,15 @@ Panel {
                 + ((service.status.unusableMicrophones || []).length > 1
                     ? " are not supported as measurement inputs. "
                     : " is not supported as a measurement input. ")
-                + "A headset or voice microphone is processed before it arrives, so it "
-                + "describes that processing rather than your speakers. Select the built-in "
-                + "microphone array or a wired or USB microphone."
+                + (service.status.asahiArrayHidden === true
+                    ? "On Apple Silicon the built-in microphones sit behind a voice beamformer "
+                      + "that adapts to what it hears and turns the speakers down, so a measurement "
+                      + "through it would describe the beamformer. The raw microphones are hidden "
+                      + "until one line of WirePlumber configuration shows them: see Apple Silicon "
+                      + "(Asahi) in the plugin's README. A wired or USB microphone works as it is."
+                    : "A headset or voice microphone is processed before it arrives, so it "
+                      + "describes that processing rather than your speakers. Select the built-in "
+                      + "microphone array or a wired or USB microphone.")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption

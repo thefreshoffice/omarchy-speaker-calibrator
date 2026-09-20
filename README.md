@@ -43,6 +43,13 @@ In the copy, find the `node.software-dsp.rules` entry for
 systemctl --user restart wireplumber
 ```
 
+Until then the panel lists the MacBook microphone as unsupported and says why:
+that source is the array behind an adaptive beamformer, which re-estimates its
+weights while a sweep runs and suppresses sound that does not come from the
+user, the speakers included. A correction fitted through it would describe the
+beamformer. WirePlumber withdraws every client's access to the raw array, so
+the plugin cannot reach it by itself.
+
 The array then appears as `alsa_input.platform-sound.RawMics`, and the panel
 offers it as the built-in microphone with one channel per microphone. The copy
 shadows Asahi's packaged file, so repeat the one-line change after an
@@ -235,6 +242,49 @@ your pick stays what it was.
 The speaker and microphone you pick by hand are remembered across restarts, in
 `selection.json` in the plugin's data folder: device names only, and a name is
 only honoured while a device of that name is connected.
+
+### When the microphone is processed
+
+Laptops with a digital microphone array often run it through a pipeline inside
+the sound firmware: dynamic range compression, automatic gain, noise
+suppression. A sweep cannot be measured through that. A compressor turns the
+level down exactly where the speakers are loud and up where they are weak, so
+the measured curve comes out flatter than the speakers are and the correction
+too weak. PipeWire only sees what comes out of the firmware, and recording from
+the ALSA device directly reads the same point, so there is no raw stream to ask
+for; the mixer switches the firmware exposes are the only handle.
+
+So every measurement, a calibration and a check alike, runs with the
+processing switches of the measuring microphone's own sound card switched off,
+and puts them back exactly as they were when it ends, pass or fail. Only
+switches whose name says they change with the signal are touched (DRC, AGC,
+automatic gain, noise suppression, echo cancelling), only on that one card, and
+only for the seconds a measurement takes; calls and dictation before and after
+are as they were. The switches are recorded before the first one is touched, so
+a run that is killed halfway is repaired the next time the helper starts, which
+the panel does within seconds. The result says which switches were suspended.
+On a Dell XPS 16 this is the difference between a calibration and none: with
+its `Microphone Capture DRC switch` on, the level search stops because the
+recording will not follow the sweep level.
+
+Not every machine exposes its processing as a switch. The level probes
+therefore also check that the recorded level follows the played level
+one-for-one. When it does not, the result carries a warning, and names any
+processing switch that is still on for that microphone together with the
+`amixer` command that turns it off.
+
+To check a machine without calibrating anything, a few quiet chirps and no
+sweeps:
+
+```console
+python3 speaker-calibrate.py devices-json          # the speaker and microphone names
+python3 speaker-calibrate.py microphone-linearity-json --sink <speaker> --mic <microphone>
+```
+
+It probes with the switches as you have them, which a measurement never does,
+so it shows what the processing does to the level. With `--bypass` it probes a
+second time with those switches off, the way a measurement runs, and puts them
+back afterwards.
 
 ### Comparing the two microphones
 
@@ -450,6 +500,7 @@ created outside it and stay behind:
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
 | `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared) and `registry-cache.json` (the last list for your model) |
+| `~/.local/share/omarchy-speaker-calibrator/microphone-processing-restore.json` | exists only during a measurement: which microphone switches to put back |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-volume-restore.json` | exists only during a measurement that lowered the microphone's input level: what to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
 | `~/Downloads/omarchy-tuning-*/` | vendor tunings you exported |
