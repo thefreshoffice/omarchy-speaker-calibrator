@@ -102,7 +102,11 @@ class Tracker:
             start = self.helper.loudness_controls(self.applied_db, True, self.input_gain)
             writes = self.helper.loudness_ramp(start, target)
         else:
-            writes = [target]
+            # The first write after a start also carries the limiter's timing:
+            # a graph loaded from a file written by an older version still has
+            # the limiter on the defaults that were audible on bass.
+            timing = getattr(self.helper, "limiter_timing_controls", dict)()
+            writes = [dict(target, **timing)]
         for index, controls in enumerate(writes):
             if index:
                 time.sleep(RAMP_INTERVAL_SECONDS)

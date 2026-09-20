@@ -356,6 +356,34 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertIn('{ output = "bal_r:Out" input = "limiter:in_r" }', graph)
         self.assertIn('name = bal_l label = linear control = { "Mult" = 1 "Add" = 0 }', graph)
 
+    def test_the_limiter_does_not_follow_a_bass_cycle(self):
+        # One cycle of 60 Hz lasts 17 ms.  On LSP's default 5 ms the limiter's
+        # gain rides the waveform and modulates everything played with it,
+        # which was heard as clipping with a player at 120 %.  Lookahead and
+        # attack go together: the attack cannot outrun the lookahead.  Ten
+        # milliseconds cured 60 Hz and did nothing for 100 Hz, whose cycle is
+        # exactly that long; fifteen covers the bass range, measured with a
+        # microphone in front of the speakers.
+        timing = speaker_calibrate.limiter_timing_controls()
+        self.assertEqual(timing, {"limiter:lk": 15.0, "limiter:at": 15.0})
+        self.assertGreater(timing["limiter:lk"], 1000.0 / 80.0)      # longer than a cycle of 80 Hz
+        self.assertEqual(timing["limiter:lk"], timing["limiter:at"])
+        fit = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.0], "input_gain_linear": 0.8}
+        graph = speaker_calibrate.filter_config("alsa_output.pci-test.analog-stereo", fit)
+        limiter = graph[graph.index("limiter_stereo"):]
+        limiter = limiter[:limiter.index("}")]
+        for setting in ('"lk" = 15.0', '"at" = 15.0', '"alr" = 0', '"boost" = 0', '"th" = 0.891'):
+            self.assertIn(setting, limiter)
+        # The slow level regulation would clean it up too, by turning everything down.
+        self.assertNotIn('"alr" = 1', graph)
+
+    def test_a_running_graph_gets_the_timing_from_the_tracker_s_first_write(self):
+        tracker_source = (Path(speaker_calibrate.__file__).parent / "loudness-tracker.py").read_text()
+        first = tracker_source[tracker_source.index("        else:\n            # The first write after a start"):]
+        first = first[:first.index("for index, controls in enumerate(writes):")]
+        self.assertIn("limiter_timing_controls", first)
+        self.assertIn("writes = [dict(target, **timing)]", first)
+
     def test_graph_controls_fill_every_fixed_slot(self):
         fit = {
             "centers_hz": [1000, 2500],
@@ -368,8 +396,11 @@ class CalibrationOptimizerTests(unittest.TestCase):
         # Per channel: two high-passes, three shelves, the parametric slots,
         # and the balance trim's two controls; plus the limiter's input gain
         # and the compensator's six, which are not per channel.
-        # ... plus the deep-bass path: three corners, a gain and its offset per channel.
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6 + 10)
+        # ... plus the deep-bass path: three corners, a gain and its offset per channel,
+        # and the limiter's lookahead and attack.
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6 + 10 + 2)
+        self.assertEqual(controls["limiter:lk"], 15.0)
+        self.assertEqual(controls["limiter:at"], 15.0)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Add"], 0.0)
