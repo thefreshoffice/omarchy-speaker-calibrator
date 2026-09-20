@@ -3882,13 +3882,38 @@ def vendor_metrics(sections, input_gain, rate, reference=None, harmonics=None):
     }
 
 
-def render_vendor_tuning(reference=None):
-    """The playing calibration as an Omarchy vendor tuning, as texts."""
-    profile = load_profile(PROFILE)
+VENDOR_ORIGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 .,:#-]{0,119}")
+
+
+def render_vendor_tuning(reference=None, *, profile=None, hardware=None, today=None, origin=None):
+    """A calibration as an Omarchy vendor tuning, as texts.
+
+    The playing calibration on this machine, unless a profile and the hardware
+    it was made on are handed in: the registry renders the best calibration
+    for a machine that way.  ``today`` and ``origin`` keep such a rendering
+    reproducible and say where it came from; both end up in a file that
+    Omarchy sources as shell, so they are held to a plain character set.
+    """
+    handed_in = profile is not None
     if profile is None:
-        raise SystemExit("No calibration is installed, so there is nothing to render.")
+        profile = load_profile(PROFILE)
+        if profile is None:
+            raise SystemExit("No calibration is installed, so there is nothing to render.")
+        hardware = hardware_id()
+    if not isinstance(hardware, dict) or not isinstance(profile.get("fit"), dict):
+        raise SystemExit("There is no fit or no hardware to render a tuning from.")
+    if origin is not None and not VENDOR_ORIGIN.fullmatch(str(origin)):
+        raise SystemExit("That origin is not plain text; refusing to write it into a tuning.")
+    if today is not None and not share.DATE.fullmatch(str(today)):
+        raise SystemExit("That date is not a date; refusing to write it into a tuning.")
+    if handed_in:
+        # Somebody else's hardware record, written between shell quotes below.
+        hardware = {key: value if key == "speaker" else share.hardware_text(value) for key, value in hardware.items()}
+        hardware["label"] = hardware.get("label") or share.hardware_text(
+            " ".join(part for part in (hardware.get("sys_vendor"), hardware.get("product_name")) if part))
+    if not hardware.get("label"):
+        raise SystemExit("The hardware has no name to match a tuning on.")
     fit = profile["fit"]
-    hardware = hardware_id()
     slug = vendor_slug(hardware)
     sections = vendor_sections(fit)
     trim = fit.get("channel_trim") or {}
@@ -3899,10 +3924,14 @@ def render_vendor_tuning(reference=None):
     mic = profile.get("microphone") or {}
     kind = "the built-in microphones" if mic.get("internal") else "an external measuring microphone at the listening position"
     when = str(profile.get("created_at", ""))[:10]
-    today = dt.date.today().isoformat()
+    if not share.DATE.fullmatch(when):
+        raise SystemExit("The measurement date is not a date; refusing to write it into a tuning.")
+    today = str(today) if today is not None else dt.date.today().isoformat()
     label = hardware["label"]
     sku = hardware.get("product_sku") or ""
-    sink_name = (profile.get("speaker") or {}).get("name") or ""
+    sink_name = (profile.get("speaker") or {}).get("name") or hardware.get("speaker") or ""
+    if not is_internal_speaker(sink_name):
+        raise SystemExit("A vendor tuning is for a laptop's own speakers, and this calibration is for another output.")
     voicing = VOICING_LABELS.get(profile.get("voicing"), "flat")
     header = f'''# {label} speaker tuning.
 #
@@ -3950,7 +3979,7 @@ description="{label} speakers"
 sink_pattern='^{checked_sink_name(sink_name)}$'
 
 ## Provenance.
-derived_from="Omarchy Speaker Calibrator {plugin_version()}: sweep measurement with {kind}, {voicing} target, measured {when}"
+derived_from="Omarchy Speaker Calibrator {plugin_version()}: sweep measurement with {kind}, {voicing} target, measured {when}{f'; {origin}' if origin else ''}"
 validated_by=""   ## your name, once you have listened on the hardware named below
 validated_on="{today}"
 validated_hardware="{label}{f' ({sku})' if sku else ''}"
@@ -3974,6 +4003,23 @@ Files:
 '''
     return {"slug": slug, "label": label, "tuning": tuning, "chain": chain, "readme": readme,
             "metrics": metrics, "sections": len(sections)}
+
+
+def render_registry_tuning(public, *, identifier, score, today):
+    """The vendor tuning of a public profile from the registry, as texts.
+
+    Deep bass is the listener's switch and does not travel with a profile, so
+    the tuning is rendered with the plugin's default: what somebody who loads
+    this profile from the registry hears.
+    """
+    eligible, reason = share.vendor_eligible(public, score)
+    if not eligible:
+        raise SystemExit(f"Not rendered as a tuning: {reason}.")
+    profile = dict(public["profile"], deep_bass=DEEP_BASS_DEFAULT)
+    profile["microphone"] = dict(profile.get("microphone") or {})
+    return render_vendor_tuning(
+        profile=profile, hardware=dict(public["hardware"]), today=today,
+        origin=f"registry profile {identifier}, score {int(score)}")
 
 
 def write_vendor_export(rendered):

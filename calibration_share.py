@@ -292,6 +292,26 @@ SCORE_LEVEL_WARNINGS = 2
 SCORE_BANDS = ((80, "excellent"), (60, "good"), (40, "fair"), (0, "rough"))
 
 
+# What a calibration has to show before it is rendered as a tuning for
+# everyone with that machine: a score that rates good, and a check, because a
+# tuning that ships to people who never measured anything needs proof that the
+# filters did what the measurement said they would.
+VENDOR_MINIMUM_SCORE = 60
+VENDOR_CHECKS = ("pass", "warning")
+
+
+def vendor_eligible(payload, score):
+    """Whether this public profile may become its machine's vendor tuning, and if not, why."""
+    verdict = ((payload.get("public") or {}).get("verification") or {}).get("verdict")
+    if not (payload.get("hardware") or {}).get("speaker"):
+        return False, "it does not name the speakers it was made for"
+    if verdict not in VENDOR_CHECKS:
+        return False, "it has not been checked"
+    if not _finite(score) or score < VENDOR_MINIMUM_SCORE:
+        return False, f"it scores below {VENDOR_MINIMUM_SCORE}"
+    return True, ""
+
+
 def score_band(score):
     score = score if _finite(score) else 0
     return next(word for floor, word in SCORE_BANDS if score >= floor)
