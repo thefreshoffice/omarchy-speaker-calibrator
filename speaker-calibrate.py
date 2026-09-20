@@ -457,7 +457,7 @@ SINK_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,199}")
 
 def checked_sink_name(name):
     if not isinstance(name, str) or not SINK_NAME_PATTERN.fullmatch(name):
-        raise SystemExit("That speaker output's name is not one PipeWire would give a device; refusing to use it.")
+        raise SystemExit("That device name is not one PipeWire would give a device; refusing to use it.")
     return name
 
 
@@ -558,6 +558,116 @@ def is_built_in(name):
     return is_internal_speaker(name) or is_internal_microphone(name)
 
 
+def source_plugged_in(item):
+    """False only when PipeWire says the source's jack has nothing plugged in.
+
+    A laptop lists its headset jack as a microphone whether or not anything is
+    in it, and on some machines as a built-in one.  PipeWire reports each
+    port's jack state, so the dead one can be told apart without playing a
+    sound.  Codecs without jack detection report "unknown", and unknown counts
+    as present: this only ever rules a source out on a positive report.
+    """
+    ports = [port for port in item.get("ports") or [] if isinstance(port, dict)]
+    if not ports:
+        return True
+    active = item.get("active_port")
+    chosen = [port for port in ports if port.get("name") == active] or ports
+    return not all(str(port.get("availability", "")).strip().lower() == "not available"
+                   for port in chosen)
+
+
+# The speaker and microphone picked by hand, kept across a restart of the
+# shell.  Names only, held to the shape PipeWire gives a device, and only ever
+# honoured while a device of that name is in the list.
+SELECTION = DATA / "selection.json"
+SELECTION_CHANNEL_LIMIT = 64
+
+
+def valid_selection(found):
+    """The part of a stored selection that can be trusted, possibly nothing."""
+    if not isinstance(found, dict):
+        return {}
+    kept = {}
+    for key in ("sink", "mic"):
+        value = found.get(key)
+        if isinstance(value, str) and SINK_NAME_PATTERN.fullmatch(value):
+            kept[key] = value
+    channel = found.get("channel")
+    if isinstance(channel, int) and not isinstance(channel, bool) and 0 <= channel <= SELECTION_CHANNEL_LIMIT:
+        kept["channel"] = channel
+    return kept
+
+
+def load_selection():
+    try:
+        return valid_selection(json.loads(read_text_bounded(SELECTION, 4096, missing_ok=True) or "{}"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+
+
+def remember_selection(sink=None, mic=None, channel=None):
+    """Keep what was picked by hand; a name PipeWire would not give is refused."""
+    selection = load_selection()
+    for key, value in (("sink", sink), ("mic", mic)):
+        if value is not None:
+            selection[key] = checked_sink_name(value)
+    if channel is not None:
+        try:
+            selection["channel"] = int(channel)
+        except (TypeError, ValueError):
+            raise SystemExit("The channel to remember is not a number.")
+    selection = valid_selection(selection)
+    secure_directory(DATA)
+    write_atomic(SELECTION, json.dumps(selection) + "\n")
+    return {"chosen": selection}
+
+
+# --- a device that cannot make or hear a sound, known without playing one ---------
+def silenced_reason(item):
+    """Why this sink or source is silent in the sound settings, or None.
+
+    A microphone turned down to zero records nothing, and the level search
+    answers nothing by playing louder, up to the loudest probe allowed.  Mute
+    and volume are in the device list, so this is known before a sound is made.
+    """
+    if not isinstance(item, dict):
+        return None
+    if item.get("mute") is True:
+        return "is muted"
+    volume = item.get("volume")
+    values = [entry.get("value") for entry in volume.values() if isinstance(entry, dict)] \
+        if isinstance(volume, dict) else []
+    numbers = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
+    if numbers and all(value <= 0 for value in numbers):
+        return "is turned down to zero"
+    return None
+
+
+class DeviceSilenced(ValueError):
+    """A speaker or microphone is muted or at zero volume; nothing was played."""
+
+
+def refuse_silenced_devices(sink_names, mic_name):
+    """Stop before the first probe when the sound settings already explain a silence."""
+    try:
+        sinks = {item.get("name"): item for item in pactl_json("sinks")}
+        sources = {item.get("name"): item for item in pactl_json("sources")}
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return
+    for name in dict.fromkeys(name for name in sink_names if name):
+        reason = silenced_reason(sinks.get(name))
+        if reason:
+            raise DeviceSilenced(
+                f"{short_label(label(sinks[name]))} {reason} in the sound settings, so nothing "
+                "was played. Unmute it or raise its volume, then measure again.")
+    reason = silenced_reason(sources.get(mic_name))
+    if reason:
+        raise DeviceSilenced(
+            f"{short_label(label(sources[mic_name]))} {reason} in the sound settings, so it would "
+            "record nothing and nothing was played. Unmute it or raise its input volume, then "
+            "measure again.")
+
+
 def devices_payload():
     default_source = run(
         ["pactl", "get-default-source"], check=False, capture=True
@@ -576,8 +686,13 @@ def devices_payload():
             # its real built-in digital array.  Let the panel select the source
             # WirePlumber chose instead of whichever pactl happened to list first.
             "default": kind == "microphone" and name == default_source,
+            # Not for speakers: headphones that are not plugged in are not a
+            # reason to hide the speakers that share their device.
+            "available": source_plugged_in(item) if kind == "microphone" else True,
+            "silenced": silenced_reason(item),
         }
     return {
+        "chosen": load_selection(),
         "sinks": [public(item, "speaker") for item in physical_sinks()],
         "microphones": [public(item, "microphone") for item in microphones()],
     }
@@ -1767,8 +1882,17 @@ def microphone_linearity(sink_name, mic_name, channel, bypass=False):
     return report
 
 
+class NoSignal(ValueError):
+    """The microphone heard nothing of the probe, even at the loudest level.
+
+    The one measurement failure that another microphone can cure, so it has a
+    type of its own instead of being recognised by its wording.
+    """
+
+
 def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
+    refuse_silenced_devices([sink_name, level_sink], mic_name)
     load_dsp()
     default_level = default_sweep_level(level_sink or sink_name)
     probe_program = DATA / "level-probe.wav"
@@ -1806,7 +1930,8 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
         playing = playing_applications()
         if playing:
             guidance.append("Currently playing audio: " + ", ".join(playing) + ".")
-        raise ValueError(" ".join(warnings + guidance))
+        failure = NoSignal if search["status"] == "no-signal" else ValueError
+        raise failure(" ".join(warnings + guidance))
     # One more probe, quieter than anything played so far, when the search
     # settled too quickly to show how the recorded level follows the played one.
     extra_level = linearity_probe_level(search)
@@ -2252,12 +2377,34 @@ def parse_channel_selection(value):
         raise SystemExit("Microphone channel must be a zero-based number or 'all'.") from error
 
 
+# The helper's exit code when a failure comes with something to offer, as one
+# JSON document on standard output: {"error": ..., "offer": {...}}.
+OFFER_EXIT_CODE = 3
+
+
+def channel_for_microphone(channel, mic):
+    """The channel selection applied to a specific microphone, or None.
+
+    The panel validates against the microphone it offered, but the fallback
+    below may continue on a different one: 'all' only makes sense on a
+    built-in array, and a channel number past the device's count means the
+    first channel.
+    """
+    channels = channel_count(mic)
+    if channel == "all":
+        return "all" if is_internal_microphone(mic["name"]) else None
+    if 0 <= channel < channels:
+        return channel
+    return 0
+
+
 def calibrate_noninteractive(
     sink_name, mic_name, channel, voicing, mic_cal_file=None, loudness="protected",
     bass="normal", channel_trim="off",
 ):
     sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
-    mic = next((item for item in microphones() if item["name"] == mic_name), None)
+    available = microphones()
+    mic = next((item for item in available if item["name"] == mic_name), None)
     if sink is None or mic is None:
         raise SystemExit("Selected audio device is no longer available.")
     channel = parse_channel_selection(channel)
@@ -2267,12 +2414,89 @@ def calibrate_noninteractive(
         raise SystemExit("All-channel mode is available only for built-in microphone arrays.")
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
-    try:
-        return build_profile(
-            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
-        )
-    except ValueError as error:
-        raise SystemExit(str(error)) from error
+    # A selected microphone that hears nothing is not always a silent room:
+    # on machines with several capture devices one of them is often a jack
+    # with nothing plugged in.  Rather than failing the whole measurement on
+    # that guess, fall through to the laptop's other built-in microphones and
+    # let the first live one answer.
+    #
+    # Only built-in ones, and only for a built-in choice.  A webcam across the
+    # desk or a headset is a different kind of measurement with different
+    # limits, and someone who picked an external microphone meant that one.
+    others = [
+        item for item in available
+        if item["name"] != mic_name and is_internal_microphone(item["name"])
+        and source_plugged_in(item) and not silenced_reason(item)
+    ] if internal_mic else []
+    # A jack PipeWire reports empty is not probed when another microphone can
+    # answer: the probe for a deaf one climbs to the loudest level allowed.
+    skipped = bool(others) and not source_plugged_in(mic)
+    candidates = ([] if skipped else [mic]) + others
+    deaf = [label(mic)] if skipped else []
+    unheard = None
+    for candidate in candidates:
+        resolved = channel if candidate is mic else channel_for_microphone(channel, candidate)
+        if resolved is None:
+            continue
+        try:
+            profile = build_profile(
+                sink, candidate, resolved, voicing,
+                # A microphone calibration file describes one microphone, so
+                # it does not follow the measurement to a different one.
+                mic_cal_file if candidate is mic else None,
+                loudness, bass, channel_trim,
+            )
+        except NoSignal as error:
+            deaf.append(label(candidate))
+            unheard = error
+            continue
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        if candidate is not mic:
+            profile["microphone_fallback"] = {
+                "requested": mic_name,
+                "used": candidate["name"],
+                "reason": "not-plugged-in" if skipped else "no-signal",
+            }
+            # Said where the panel shows it, because a calibration made with
+            # another microphone than the one picked must not be a surprise.
+            quality = profile.get("quality")
+            if isinstance(quality, dict):
+                why = ("has nothing plugged in" if skipped
+                       else "did not pick up the level probe")
+                note = (f"{short_label(label(mic))} {why}, so this was measured with "
+                        f"{short_label(label(candidate))}, the laptop's other built-in microphone.")
+                quality["guidance"] = list(dict.fromkeys(list(quality.get("guidance") or []) + [note]))
+        return profile
+    if not internal_mic and unheard is not None:
+        # An external microphone that was picked is never replaced behind
+        # anyone's back: a built-in one is another kind of measurement.  But
+        # when one is there, the failure offers it, and one press takes it.
+        offered = next((
+            item for item in available
+            if is_internal_microphone(item["name"]) and source_plugged_in(item)
+            and not silenced_reason(item)), None)
+        if offered is not None:
+            message = (f"{short_label(label(mic))} did not pick up the level probe, even at the loudest "
+                       "allowed sweep level. Check its mute switch, its gain and its cable. The "
+                       f"laptop's own microphone ({short_label(label(offered))}) is available: measuring "
+                       "with it gives a rougher, relative result, but it needs nothing plugged in.")
+            print(json.dumps({"error": message, "offer": {
+                "microphone": offered["name"],
+                "description": short_label(label(offered)),
+                "channel": "all" if channel_count(offered) > 1 else 0,
+            }}))
+            print(message, file=sys.stderr)
+            raise SystemExit(OFFER_EXIT_CODE)
+    if len(deaf) < 2:
+        # One microphone, one answer: the level search's own words, which also
+        # say what else is playing.
+        raise SystemExit(str(unheard) if unheard else "The selected microphone has nothing plugged in.")
+    raise SystemExit(
+        "None of the built-in microphones picked up the level probe, even at the loudest "
+        "allowed sweep level (" + ", ".join(short_label(name) for name in deaf) + "). Check "
+        "that the speakers are unmuted and raise the hardware volume, then measure again."
+    )
 
 
 def install_proposal():
@@ -3941,6 +4165,11 @@ def main():
                  "install-measurement-support", "loudness-toggle"):
         sub.add_parser(name)
     sub.add_parser("verify-json")
+    remember = sub.add_parser("remember-selection-json",
+                              help="keep the speaker and microphone picked by hand across restarts")
+    remember.add_argument("--sink")
+    remember.add_argument("--mic")
+    remember.add_argument("--channel")
     sub.add_parser("export-json")
     sub.add_parser("preview-apply-json")
     sub.add_parser("preview-discard-json")
@@ -3992,7 +4221,9 @@ def main():
                            help="install and play the result when it passes")
     args = parser.parse_args()
     command = args.command or "wizard"
-    if command == "devices-json":
+    if command == "remember-selection-json":
+        print(json.dumps(remember_selection(args.sink, args.mic, args.channel)))
+    elif command == "devices-json":
         print(json.dumps(devices_payload()))
     elif command == "status-json":
         print(json.dumps(status_payload()))
@@ -4027,7 +4258,12 @@ def main():
     elif command == "bypass-toggle":
         print(json.dumps(bypass_toggle()))
     elif command == "verify-json":
-        print(json.dumps(verify_calibration()))
+        try:
+            print(json.dumps(verify_calibration()))
+        except ValueError as error:
+            # A level search that stops (a muted microphone, a loud room) is a
+            # message for the panel, not a traceback.
+            raise SystemExit(str(error)) from error
     elif command == "relevel-json":
         print(json.dumps(relevel(bass=args.bass, loudness=args.loudness)))
     elif command == "vendor-try-json":

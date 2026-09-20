@@ -90,9 +90,14 @@ Panel {
       if (list[index].name === name) return index
     return -1
   }
+  // A headset jack is listed as a microphone whether or not anything is in
+  // it, on some laptops as a built-in one.  PipeWire says when a jack is
+  // empty, and an empty one is never the automatic choice.
   function firstInternal(list) {
     for (var index = 0; index < list.length; index++)
-      if (list[index].internal === true) return index
+      if (list[index].internal === true && list[index].available !== false) return index
+    for (var any = 0; any < list.length; any++)
+      if (list[any].internal === true) return any
     return list.length > 0 ? 0 : -1
   }
   // A laptop can expose an unplugged analog jack beside its real microphone
@@ -101,7 +106,8 @@ Panel {
   // left to be picked by hand.
   function defaultInternal(list) {
     for (var index = 0; index < list.length; index++)
-      if (list[index].default === true && list[index].internal === true) return index
+      if (list[index].default === true && list[index].internal === true
+          && list[index].available !== false) return index
     return -1
   }
   // Which rows are selected, decided afresh whenever the lists or the status
@@ -112,6 +118,13 @@ Panel {
   // panel was opened.
   function selectDevices() {
     var profile = service.status.profile || {}
+    // A pick made before the shell was restarted counts as a pick.
+    var kept = service.chosen || {}
+    if (root.chosenSink === "" && kept.sink) root.chosenSink = kept.sink
+    if (root.chosenMic === "" && kept.mic) {
+      root.chosenMic = kept.mic
+      root.chosenChannel = Math.max(0, Number(kept.channel) || 0)
+    }
     var sink = deviceIndex(service.sinks, root.chosenSink)
     if (sink < 0) sink = deviceIndex(service.sinks, (profile.speaker || {}).name)
     if (sink < 0) sink = firstInternal(service.sinks)
@@ -1034,6 +1047,28 @@ Panel {
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
           }
+          // When the microphone that was picked hears nothing and the laptop
+          // has its own, the failure offers that one.  One press, for this
+          // measurement only: the pick stays what it was.
+          Button {
+            readonly property int offeredIndex: service.offer
+              ? root.deviceIndex(service.microphones, service.offer.microphone) : -1
+            visible: service.error !== "" && offeredIndex >= 0 && root.sinkIndex >= 0
+            width: parent.width
+            bordered: true
+            iconText: "󰍬"
+            // The label comes from the panel's own device list, never from the reply.
+            text: offeredIndex >= 0
+              ? "Measure with " + service.microphones[offeredIndex].description + " instead" : ""
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !service.busy
+            onClicked: {
+              var mic = service.microphones[offeredIndex]
+              var channel = (mic.internal === true && Number(mic.channels || 1) > 1) ? "all" : 0
+              service.measure(service.sinks[root.sinkIndex].name, mic.name, channel, root.options(), "preview")
+            }
+          }
 
           Text {
             textFormat: Text.PlainText
@@ -1351,7 +1386,11 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
-                onClicked: { root.sinkIndex = index; root.chosenSink = modelData.name }
+                onClicked: {
+                  root.sinkIndex = index
+                  root.chosenSink = modelData.name
+                  service.rememberSelection(root.chosenSink, root.chosenMic, root.chosenChannel)
+                }
               }
             }
             Text {
@@ -1406,6 +1445,8 @@ Panel {
                     + (modelData.internal
                         ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
                         : "  ·  external")
+                    + (modelData.available === false ? "  ·  nothing plugged in" : "")
+                    + (modelData.silenced ? "  ·  " + (modelData.silenced === "is muted" ? "muted" : "volume at zero") : "")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !service.busy
@@ -1414,6 +1455,7 @@ Panel {
                     root.chosenMic = modelData.name
                     root.chosenChannel = 0
                     channelBox.currentIndex = 0
+                    service.rememberSelection(root.chosenSink, root.chosenMic, 0)
                   }
                 }
 
@@ -1586,7 +1628,10 @@ Panel {
                 Layout.fillWidth: true
                 model: root.channelOptions()
                 enabled: !service.busy
-                onActivated: root.chosenChannel = currentIndex
+                onActivated: {
+                  root.chosenChannel = currentIndex
+                  service.rememberSelection(root.chosenSink, root.chosenMic, currentIndex)
+                }
               }
 
               Text {
