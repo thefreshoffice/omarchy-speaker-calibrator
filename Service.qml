@@ -35,6 +35,12 @@ Item {
   property string phase: ""
   property string error: ""
   property string message: ""
+  // What a failure offers to do instead, when it offers anything:
+  // { microphone, description, channel }.  Gone as soon as something else runs.
+  property var offer: null
+  // The speaker and microphone picked by hand, as the helper keeps them
+  // across a restart of the shell: { sink, mic, channel }.
+  property var chosen: ({})
   property string _stdout: ""
   property string _stderr: ""
   // The helper is ours, but its output is still input to this process: the
@@ -49,6 +55,7 @@ Item {
     if (busy || helperPath === "") return
     phase = operation
     error = ""
+    if (operation !== "remember") offer = null
     message = operation === "measure"
       ? "Measuring — a short level check, then six sweeps, about 30 seconds. Keep quiet…"
       : operation === "compare" ? "Switching profiles…"
@@ -63,7 +70,8 @@ Item {
       : operation === "vendortry" ? "Installing the exported tuning through Omarchy's own installer…"
       : operation === "vendorrestore" ? "Bringing the calibration back…"
       : operation === "import" ? "Loading the shared calibration…"
-      : operation === "refit" ? "Applying…" : "Working…"
+      : operation === "refit" ? "Applying…"
+      : operation === "remember" ? message : "Working…"
     _stdout = ""
     _stderr = ""
     _overflowed = false
@@ -168,6 +176,17 @@ Item {
     start("mics", ["microphone-comparison-json"])
   }
   function refreshStatus() { start("status", ["status-json"]) }
+  // Keep a hand-picked speaker and microphone across a restart.  The newest
+  // pick wins when several arrive while something else holds the process.
+  property var _rememberPending: null
+  function rememberSelection(sink, mic, channel) {
+    var arguments = ["remember-selection-json"]
+    if (sink) arguments.push("--sink", sink)
+    if (mic) arguments.push("--mic", mic)
+    arguments.push("--channel", String(Math.max(0, Number(channel) || 0)))
+    if (busy) { _rememberPending = arguments; return }
+    start("remember", arguments)
+  }
   // Measure; with install=true the result is installed and played as soon as
   // it passes, so one press does the whole job.
   function measure(sink, mic, channel, options, install) {
@@ -263,8 +282,14 @@ Item {
 
   // Whatever the run was, if a refresh was asked for while it held the
   // process, do it now.
-  onBusyChanged: if (!busy && (_refreshPending || _micsPending)) Qt.callLater(function () {
+  onBusyChanged: if (!busy && (_refreshPending || _micsPending || _rememberPending)) Qt.callLater(function () {
     if (root.busy) return
+    if (root._rememberPending) {
+      var remembered = root._rememberPending
+      root._rememberPending = null
+      root.start("remember", remembered)
+      return
+    }
     if (root._refreshPending) {
       root._refreshPending = false
       root.start("devices", ["devices-json"])
@@ -300,6 +325,18 @@ Item {
         return
       }
       if (exitCode !== 0) {
+        // A failure that offers something arrives as one JSON document.
+        try {
+          var failure = JSON.parse(raw)
+          if (failure && typeof failure.error === "string") {
+            var offered = failure.offer
+            root.offer = (offered && typeof offered.microphone === "string") ? offered : null
+            root.error = failure.error
+            root.message = ""
+            root.phase = ""
+            return
+          }
+        } catch (notJson) {}
         root.error = err || raw || "Operation failed"
         root.message = ""
         root.phase = ""
@@ -308,11 +345,17 @@ Item {
       try {
         if (root.phase === "devices") {
           var devices = JSON.parse(raw)
+          root.chosen = devices.chosen || ({})
           root.sinks = devices.sinks || []
           root.microphones = devices.microphones || []
           root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "remember") {
+          root.chosen = (JSON.parse(raw) || {}).chosen || root.chosen
+          root.phase = ""
           return
         }
         if (root.phase === "output") {

@@ -192,6 +192,29 @@ applied inside the headset. It cannot describe a loudspeaker, and a
 calibration fitted to one would be correcting for the headset. Those are named
 in the panel as connected but unusable rather than quietly dropped.
 
+A laptop also lists its headset jack as a microphone whether or not anything
+is in it, and on some machines as a built-in one next to the real array.
+PipeWire reports when a jack is empty, so such a source is marked **nothing
+plugged in** and is never the automatic choice. Where the hardware cannot
+tell, the measurement finds out: a built-in microphone that hears nothing of
+the level probe hands over to the laptop's other built-in microphone, and the
+result says that it did. It never hands over to an external microphone, and an
+external microphone you picked is never replaced.
+
+A microphone that is muted or turned down to zero in the sound settings is
+marked as such in the list, and a measurement with it, or through muted
+speakers, stops before the first sound with a message that says which device
+and why. Nothing is played louder to find out what the settings already say.
+
+An external microphone you picked is never swapped for another one. When it
+hears nothing at all and the laptop has a microphone of its own, the failure
+offers that one, and one press measures with it for that measurement only;
+your pick stays what it was.
+
+The speaker and microphone you pick by hand are remembered across restarts, in
+`selection.json` in the plugin's data folder: device names only, and a name is
+only honoured while a device of that name is connected.
+
 ### Comparing the two microphones
 
 Advanced keeps the last measurement from each kind of microphone and draws

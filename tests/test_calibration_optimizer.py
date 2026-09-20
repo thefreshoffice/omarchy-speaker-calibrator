@@ -2498,7 +2498,7 @@ class DeviceSelectionTests(unittest.TestCase):
     def test_a_click_is_remembered_by_name(self):
         self.assertIn("root.chosenMic = modelData.name", self.source)
         self.assertIn("root.chosenSink = modelData.name", self.source)
-        self.assertIn("onActivated: root.chosenChannel = currentIndex", self.source)
+        self.assertIn("root.chosenChannel = currentIndex", self.source)
 
 
 if __name__ == "__main__":
