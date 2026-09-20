@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import io
+import json
 import subprocess
+import tempfile
 import sys
 import unittest
 from pathlib import Path
@@ -160,6 +163,7 @@ class LevelSearchErrorTests(unittest.TestCase):
                                return_value=(["The microphone heard nothing."], []), create=True), \
              mock.patch.object(speaker_calibrate, "LEVEL_SEARCH_ABORT_STATUSES",
                                ("no-signal", "background-too-loud", "level-independent"), create=True), \
+             mock.patch.object(speaker_calibrate, "refuse_silenced_devices"), \
              mock.patch.object(speaker_calibrate, "playing_applications", return_value=[]):
             speaker_calibrate.find_measurement_level(SINK["name"], ARRAY["name"], 0, 2)
 
@@ -170,6 +174,139 @@ class LevelSearchErrorTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 self.search(status)
             self.assertNotIsInstance(caught.exception, NoSignal)
+
+
+def volume(value):
+    return {"front-left": {"value": value, "value_percent": f"{round(value / 655.36)}%", "db": "x"},
+            "front-right": {"value": value, "value_percent": f"{round(value / 655.36)}%", "db": "x"}}
+
+
+class SilencedDeviceTests(unittest.TestCase):
+    def test_mute_and_zero_volume_are_reasons_and_nothing_else_is(self):
+        reason = speaker_calibrate.silenced_reason
+        self.assertEqual(reason({"mute": True, "volume": volume(65536)}), "is muted")
+        self.assertEqual(reason({"mute": False, "volume": volume(0)}), "is turned down to zero")
+        self.assertIsNone(reason({"mute": False, "volume": volume(1)}))
+        self.assertIsNone(reason({"mute": False, "volume": {"mono": {"value": 0}, "aux": {"value": 30000}}}))
+        for odd in ({}, {"volume": "loud"}, {"volume": {}}, {"volume": {"mono": {"value": None}}},
+                    {"volume": {"mono": {"value": True}}}, None, "x"):
+            self.assertIsNone(reason(odd), odd)
+
+    def check(self, sinks, sources, sink_names, mic):
+        with mock.patch.object(speaker_calibrate, "pactl_json",
+                               side_effect=lambda kind: sinks if kind == "sinks" else sources):
+            speaker_calibrate.refuse_silenced_devices(sink_names, mic)
+
+    def test_a_microphone_at_zero_stops_the_measurement_before_a_sound(self):
+        headset = dict(USB_MIC, description="BTD 700 Mono", mute=False, volume=volume(0))
+        with self.assertRaisesRegex(speaker_calibrate.DeviceSilenced, "BTD 700 Mono is turned down to zero"):
+            self.check([SINK], [headset], [SINK["name"], None], headset["name"])
+
+    def test_muted_speakers_too_including_the_real_ones_behind_the_calibrated_sink(self):
+        muted = dict(SINK, mute=True)
+        with self.assertRaisesRegex(speaker_calibrate.DeviceSilenced, "Speakers is muted"):
+            self.check([{"name": "omarchy_speaker_tuning"}, muted], [ARRAY],
+                       ["omarchy_speaker_tuning", SINK["name"]], ARRAY["name"])
+
+    def test_healthy_or_unknown_devices_pass(self):
+        self.check([dict(SINK, mute=False, volume=volume(40000))], [ARRAY], [SINK["name"], None], ARRAY["name"])
+        self.check([], [], ["gone"], "gone too")
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=OSError):
+            speaker_calibrate.refuse_silenced_devices([SINK["name"]], ARRAY["name"])
+
+    def test_the_level_search_asks_first(self):
+        with mock.patch.object(speaker_calibrate, "refuse_silenced_devices",
+                               side_effect=speaker_calibrate.DeviceSilenced("muted")) as asked, \
+             mock.patch.object(speaker_calibrate, "load_dsp") as loaded:
+            with self.assertRaises(speaker_calibrate.DeviceSilenced):
+                speaker_calibrate.find_measurement_level("sink", "mic", 0, 1, level_sink="real")
+        asked.assert_called_once_with(["sink", "real"], "mic")
+        loaded.assert_not_called()
+
+    def test_the_device_list_says_it_and_the_fallback_skips_it(self):
+        default = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+        quiet = dict(ARRAY, mute=True)
+        with mock.patch.object(speaker_calibrate, "pactl_json",
+                               side_effect=lambda kind: [SINK] if kind == "sinks" else [JACK, quiet]), \
+             mock.patch.object(speaker_calibrate, "run", return_value=default), \
+             mock.patch.object(speaker_calibrate, "load_selection", return_value={}):
+            listed = speaker_calibrate.devices_payload()["microphones"]
+        self.assertEqual([item["silenced"] for item in listed], [None, "is muted"])
+
+
+class OfferTests(FallbackTests):
+    def test_an_external_pick_that_hears_nothing_offers_the_built_in_one(self):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+            stop, tried = self.calibrate([JACK, ARRAY, USB_MIC], USB_MIC, {USB_MIC["name"]: NoSignal("silent")})
+        self.assertEqual(stop.code, speaker_calibrate.OFFER_EXIT_CODE)
+        self.assertEqual([name for name, _, _ in tried], [USB_MIC["name"]])      # nothing else was measured
+        reply = json.loads(out.getvalue())
+        self.assertEqual(reply["offer"], {"microphone": ARRAY["name"], "description": "Digital Microphone",
+                                          "channel": "all"})
+        self.assertIn("Usb Microphone did not pick up the level probe", reply["error"])
+        self.assertIn("Digital Microphone", reply["error"])
+
+    def test_no_built_in_microphone_worth_offering_means_the_plain_failure(self):
+        for microphones in ([JACK, USB_MIC], [dict(ARRAY, mute=True), USB_MIC], [USB_MIC, WEBCAM]):
+            stop, _ = self.calibrate(microphones, USB_MIC, {USB_MIC["name"]: NoSignal("The microphone heard nothing.")})
+            self.assertEqual(str(stop), "The microphone heard nothing.")
+
+    def test_a_muted_built_in_microphone_is_not_a_substitute_either(self):
+        stop, tried = self.calibrate([BLIND_JACK, dict(ARRAY, mute=True)], BLIND_JACK,
+                                     {BLIND_JACK["name"]: NoSignal("heard nothing")})
+        self.assertEqual([name for name, _, _ in tried], [BLIND_JACK["name"]])
+        self.assertEqual(str(stop), "heard nothing")
+
+
+class RememberedSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        data = Path(self.folder.name) / "data"
+        data.mkdir(mode=0o700)
+        for name, value in (("DATA", data), ("SELECTION", data / "selection.json")):
+            patch = mock.patch.object(speaker_calibrate, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_a_pick_survives_and_a_later_one_replaces_only_what_it_names(self):
+        self.assertEqual(speaker_calibrate.load_selection(), {})
+        speaker_calibrate.remember_selection(SINK["name"], USB_MIC["name"], "2")
+        self.assertEqual(speaker_calibrate.load_selection(),
+                         {"sink": SINK["name"], "mic": USB_MIC["name"], "channel": 2})
+        speaker_calibrate.remember_selection(mic=ARRAY["name"], channel=0)
+        self.assertEqual(speaker_calibrate.load_selection(),
+                         {"sink": SINK["name"], "mic": ARRAY["name"], "channel": 0})
+        self.assertEqual(speaker_calibrate.SELECTION.stat().st_mode & 0o777, 0o600)
+
+    def test_a_name_pipewire_would_not_give_is_refused_and_nothing_is_written(self):
+        for name in ('x" } context.exec = [', "-rf", "a b", ""):
+            with self.assertRaises(SystemExit, msg=name):
+                speaker_calibrate.remember_selection(mic=name)
+        with self.assertRaises(SystemExit):
+            speaker_calibrate.remember_selection(mic=ARRAY["name"], channel="all")
+        self.assertFalse(speaker_calibrate.SELECTION.exists())
+
+    def test_a_file_someone_else_wrote_is_read_with_suspicion(self):
+        for text in ('{"mic": "x\" } ] context.exec", "sink": 7, "channel": 900}', "[1, 2]", "not json",
+                     "[" * 100000, '{"channel": true}'):
+            speaker_calibrate.SELECTION.write_text(text)
+            speaker_calibrate.SELECTION.chmod(0o600)
+            self.assertEqual(speaker_calibrate.load_selection(), {}, text[:30])
+        speaker_calibrate.SELECTION.unlink()
+        target = Path(self.folder.name) / "elsewhere.json"
+        target.write_text(json.dumps({"mic": ARRAY["name"]}))
+        speaker_calibrate.SELECTION.symlink_to(target)
+        self.assertEqual(speaker_calibrate.load_selection(), {})
+
+    def test_the_device_list_carries_it(self):
+        speaker_calibrate.remember_selection(SINK["name"], ARRAY["name"], 1)
+        default = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+        with mock.patch.object(speaker_calibrate, "pactl_json", return_value=[]), \
+             mock.patch.object(speaker_calibrate, "run", return_value=default):
+            self.assertEqual(speaker_calibrate.devices_payload()["chosen"],
+                             {"sink": SINK["name"], "mic": ARRAY["name"], "channel": 1})
 
 
 class PanelSelectionTests(unittest.TestCase):
@@ -186,6 +323,29 @@ class PanelSelectionTests(unittest.TestCase):
         any_internal = first.index("list[any].internal === true")
         self.assertLess(preferred, any_internal)
         self.assertIn("list[index].available !== false", self.function("defaultInternal"))
+
+    def test_a_pick_from_before_a_restart_counts_as_a_pick(self):
+        select = self.function("selectDevices")
+        adopted = select.index('if (root.chosenMic === "" && kept.mic)')
+        ranked = select.index("deviceIndex(service.microphones, root.chosenMic)")
+        self.assertLess(adopted, ranked)
+        self.assertEqual(self.source.count("service.rememberSelection("), 3)   # speaker, microphone, channel
+
+    def test_the_offer_is_one_press_and_never_changes_the_pick(self):
+        start = self.source.index("readonly property int offeredIndex")
+        button = self.source[start:self.source.index("\n          }\n", start)]
+        self.assertIn("root.deviceIndex(service.microphones, service.offer.microphone)", button)
+        self.assertIn("service.microphones[offeredIndex].description", button)   # the panel's own label
+        self.assertNotIn("service.offer.description", button)
+        self.assertIn("service.measure(", button)
+        self.assertNotIn("chosenMic", button)
+        self.assertNotIn("rememberSelection", button)
+
+    def test_a_failure_with_an_offer_is_read_as_one_document(self):
+        service = (Path(speaker_calibrate.__file__).parent / "Service.qml").read_text()
+        self.assertIn('typeof failure.error === "string"', service)
+        self.assertIn('typeof offered.microphone === "string"', service)
+        self.assertIn('if (operation !== "remember") offer = null', service)
 
     def test_the_row_says_so(self):
         self.assertIn('modelData.available === false ? "  ·  nothing plugged in" : ""', self.source)
