@@ -1671,7 +1671,11 @@ def record_while_playing(
     if mic_name == ASAHI_RAW_MICROPHONES:
         # PipeWire otherwise chooses FL,FR,LFE for a three-channel recording.
         command.append("--channel-map=" + ",".join(f"AUX{i}" for i in range(channels)))
-    recorder = subprocess.Popen(command + [str(recording)], preexec_fn=die_with_parent)
+    # pw-record announces the file it writes; on the helper's error stream that
+    # line ended up in front of every failure message the panel shows.
+    recorder = subprocess.Popen(command + [str(recording)], preexec_fn=die_with_parent,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
     try:
         time.sleep(lead_seconds)
         run(["pw-play", f"--target={sink_name}", str(program)])
@@ -1705,7 +1709,143 @@ class NoSignal(ValueError):
     """
 
 
-def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None):
+# A built-in microphone is often left at full input gain: on the machine this
+# was found on, +36 dB of boost and +6 dB of capture gain.  At that setting
+# the preamplifier's own hiss and the rumble below the measured band sit above
+# the background gate in a quiet room, and the quietest probe clips.  Setting
+# levels is this search's job, the microphone's as much as the speakers', so
+# when the search stops for a reason that points at a hot microphone, the
+# input level comes down a step and the search runs again.  PipeWire maps the
+# source volume onto the codec's boost and capture controls where it has them.
+MIC_GAIN_STEP_DB = 12
+MIC_GAIN_STEPS = 3
+MIC_GAIN_STATE = DATA / "microphone-volume-restore.json"
+HOT_MICROPHONE_STATUSES = ("background-too-loud", "clipping-at-minimum-level", "limited-by-minimum-level")
+# Lowered for a loud background, the room still has to prove it was the
+# microphone: the probe must then stand this far above what is left.
+MIC_GAIN_MINIMUM_PROMINENCE_DB = 12.0
+# After a step down, a loudest sweep that peaks at least here is simply a good level.
+MIC_GAIN_GOOD_PEAK_DBFS = -18.0
+
+
+def source_volume_values(mic_name):
+    """The source's per-channel volume as PipeWire's raw integers, or None."""
+    try:
+        sources = pactl_json("sources")
+    except (subprocess.CalledProcessError, ValueError, OSError):
+        return None
+    for item in sources:
+        if item.get("name") != mic_name:
+            continue
+        volume = item.get("volume")
+        if not isinstance(volume, dict):
+            return None
+        values = [entry.get("value") for entry in volume.values() if isinstance(entry, dict)]
+        if values and all(isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 262144
+                          for value in values):
+            return values
+    return None
+
+
+def restore_microphone_volume(*, own=False):
+    """Put a microphone's input level back after a measurement lowered it.
+
+    The record is written before the level is touched, so a run that was
+    killed outright is repaired when this helper next starts.  A record whose
+    run is still alive belongs to that run.
+    """
+    try:
+        state = json.loads(read_text_bounded(MIC_GAIN_STATE, 4096, missing_ok=True) or "null")
+    except (OSError, ValueError, RecursionError):
+        state = None
+    if not isinstance(state, dict):
+        return False
+    if not own and process_is_alive(state.get("pid")):
+        return False
+    name, values = state.get("microphone"), state.get("values")
+    done = False
+    if (isinstance(name, str) and SINK_NAME_PATTERN.fullmatch(name) and isinstance(values, list) and values
+            and all(isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 262144
+                    for value in values)):
+        done = run(["pactl", "set-source-volume", name] + [str(value) for value in values],
+                   check=False, capture=True).returncode == 0
+    try:
+        MIC_GAIN_STATE.unlink()
+    except OSError:
+        pass
+    return done
+
+
+def process_is_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+class MicrophoneGain:
+    """The measuring microphone's input level for the length of one measurement."""
+
+    def __init__(self, mic_name):
+        self.mic_name = mic_name
+        self.lowered_db = 0
+        self.reasons = []
+        self._recorded = False
+
+    def lower(self, reason):
+        """Take the input level down one step; False when it cannot or should not."""
+        if self.lowered_db >= MIC_GAIN_STEP_DB * MIC_GAIN_STEPS:
+            return False
+        if not self._recorded:
+            values = source_volume_values(self.mic_name)
+            if values is None or not SINK_NAME_PATTERN.fullmatch(str(self.mic_name)):
+                return False
+            secure_directory(DATA)
+            write_atomic(MIC_GAIN_STATE, json.dumps(
+                {"pid": os.getpid(), "microphone": self.mic_name, "values": values}) + "\n")
+            self._recorded = True
+        lowered = run(["pactl", "set-source-volume", self.mic_name, f"-{MIC_GAIN_STEP_DB}dB"],
+                      check=False, capture=True)
+        if lowered.returncode != 0:
+            return False
+        self.lowered_db += MIC_GAIN_STEP_DB
+        self.reasons.append(reason)
+        # The codec's gain stage takes a moment to settle on the new step.
+        time.sleep(0.4)
+        return True
+
+    def restore(self):
+        if self._recorded:
+            restore_microphone_volume(own=True)
+            self._recorded = False
+
+
+@contextlib.contextmanager
+def microphone_gain_managed(mic_name):
+    gain = MicrophoneGain(mic_name)
+    try:
+        yield gain
+    finally:
+        gain.restore()
+
+
+def hot_microphone_reason(search, default_level):
+    """Why this search's outcome points at too much microphone gain, or None."""
+    status = search.get("status")
+    if status in HOT_MICROPHONE_STATUSES:
+        return status
+    attempts = search.get("attempts") or []
+    # It settled, but only by playing very quietly after clipping: the
+    # microphone overloads long before the speakers are anywhere near their
+    # level, and what little is played then stands barely above the noise.
+    if (any(int(item.get("clipped_samples", 0)) > 0 for item in attempts)
+            and float(search.get("selected_level_dbfs", 0.0)) <= default_level - 12.0):
+        return "clipped-at-a-quiet-level"
+    return None
+
+
+def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=None, gain=None):
     """Probe the speaker/microphone pair and choose the sweep level."""
     refuse_silenced_devices([sink_name, level_sink], mic_name)
     load_dsp()
@@ -1730,16 +1870,36 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
             captures = captures[:, [channel]]
         return analyse_level_probe(captures, RATE)
 
-    search = search_measurement_level(
-        run_probe,
-        start_level_dbfs=default_level + LEVEL_SEARCH_START_OFFSET_DB,
-        bounds=(
-            default_level + LEVEL_SEARCH_BOUNDS_DB[0],
-            default_level + LEVEL_SEARCH_BOUNDS_DB[1],
-        ),
-        attempts=LEVEL_SEARCH_ATTEMPTS,
-    )
-    search["default_level_dbfs"] = default_level
+    def run_search():
+        found = search_measurement_level(
+            run_probe,
+            start_level_dbfs=default_level + LEVEL_SEARCH_START_OFFSET_DB,
+            bounds=(
+                default_level + LEVEL_SEARCH_BOUNDS_DB[0],
+                default_level + LEVEL_SEARCH_BOUNDS_DB[1],
+            ),
+            attempts=LEVEL_SEARCH_ATTEMPTS,
+        )
+        found["default_level_dbfs"] = default_level
+        return found
+
+    search = run_search()
+    first = search
+    while gain is not None:
+        reason = hot_microphone_reason(search, default_level)
+        if reason is None or not gain.lower(reason):
+            break
+        search = run_search()
+    if gain is not None and gain.lowered_db:
+        search["microphone_gain_db"] = -gain.lowered_db
+        search["microphone_gain_reasons"] = list(gain.reasons)
+        best = max((float(item.get("prominence_db", 0.0)) for item in search.get("attempts") or [{}]),
+                   default=0.0)
+        if (first["status"] == "background-too-loud" and search["status"] not in LEVEL_SEARCH_ABORT_STATUSES
+                and best < MIC_GAIN_MINIMUM_PROMINENCE_DB):
+            # Turning the microphone down quietens any room on paper.  If the
+            # probe still barely stands out, it was the room after all.
+            search = dict(first, microphone_gain_db=-gain.lowered_db)
     if search["status"] in LEVEL_SEARCH_ABORT_STATUSES:
         warnings, guidance = level_search_advice(search)
         playing = playing_applications()
@@ -1765,8 +1925,16 @@ def capture_measurement(
         (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
     )
     secure_directory(DATA, repair_contents=True)
+    with microphone_gain_managed(mic_name) as gain:
+        return _measure_at_found_level(
+            sink_name, mic_name, channel, channels, mic_cal_file, level_sink, sweeps, recording, gain)
+
+
+def _measure_at_found_level(
+    sink_name, mic_name, channel, channels, mic_cal_file, level_sink, sweeps, recording, gain
+):
     level_search = find_measurement_level(
-        sink_name, mic_name, channel, channels, level_sink=level_sink
+        sink_name, mic_name, channel, channels, level_sink=level_sink, gain=gain
     )
     sweeps = sweeps or DATA / "calibration-sweeps.wav"
     recording = recording or DATA / "measurement.wav"
@@ -1812,6 +1980,19 @@ def attach_level_search(measurement, level_search):
         return
     measurement["level_search"] = level_search
     warnings, guidance = level_search_advice(level_search)
+    lowered = -int(level_search.get("microphone_gain_db") or 0)
+    if lowered > 0:
+        attempts = level_search.get("attempts") or [{}]
+        # The input level comes down in whole steps, so the loudest sweep can
+        # end a few decibels under the target.  That is a good level, and
+        # advice to raise the microphone's gain, straight after lowering it,
+        # is not advice.
+        if (level_search.get("status") == "limited-by-maximum-level"
+                and float(attempts[-1].get("peak_dbfs", -120.0)) >= MIC_GAIN_GOOD_PEAK_DBFS):
+            warnings, guidance = [], []
+        guidance = list(guidance) + [
+            f"The microphone's input level was too high to measure with, so it was lowered by "
+            f"{lowered} dB for this measurement and put back afterwards."]
     quality = measurement["quality"]
     quality["warnings"] = list(dict.fromkeys(quality["warnings"] + warnings))
     quality["guidance"] = list(dict.fromkeys(quality["guidance"] + guidance))
@@ -3920,6 +4101,10 @@ def exit_on_terminate(signum, frame):
 
 def main():
     signal.signal(signal.SIGTERM, exit_on_terminate)
+    if MIC_GAIN_STATE.exists():
+        # A measurement was killed before it could put the microphone's input
+        # level back.
+        restore_microphone_volume()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     for name in ("wizard", "status", "status-json", "status-cache-json",

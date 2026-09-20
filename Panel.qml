@@ -1323,10 +1323,14 @@ Panel {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
-            color: root.dim
+            text: service.error !== "" ? service.error
+              : "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
+            // A failure is said here as well as under the header: whoever
+            // pressed the button above is looking at this line, and the header
+            // is a screen further up.
+            color: service.error !== "" ? (bar ? bar.urgent : Color.urgent) : root.dim
             font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: service.error !== "" ? Style.font.body : Style.font.bodySmall
             wrapMode: Text.WordWrap
           }
 

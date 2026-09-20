@@ -119,6 +119,19 @@ speakers is mostly the bass. Clock drift between playback and recording is
 estimated and corrected. Clipping, sweep prominence, alignment, repeatability,
 microphone gain stability and harmonic residuals are all checked.
 
+Setting levels is the plugin's job, the microphone's as much as the speakers'.
+A built-in microphone is often left at full input gain, where the
+preamplifier's own hiss and the rumble below the measured band read as a loud
+room and the quietest probe already clips. When the level search stops for a
+reason that points at that, it lowers the microphone's input level a step
+(12 dB, three steps at most) and searches again, which also lets the sweeps
+play louder and stand further above the room. The level is put back exactly as
+it was when the measurement ends, pass or fail, and it is written down before
+it is touched, so a measurement that is killed halfway is repaired the next
+time the helper starts. The result says when this happened. A room that really
+is loud still fails as one: turned down, the probe has to stand clear of what
+is left.
+
 When a built-in microphone array offers two or more channels, every channel is
 analyzed independently and their raw recordings are never mixed. The responses
 are combined with a robust median, and disagreement between microphones is
@@ -371,6 +384,7 @@ created outside it and stay behind:
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
 | `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps |
+| `~/.local/share/omarchy-speaker-calibrator/microphone-volume-restore.json` | exists only during a measurement that lowered the microphone's input level: what to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
 | `~/Downloads/omarchy-tuning-*/` | vendor tunings you exported |
 
