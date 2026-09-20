@@ -122,6 +122,22 @@ class PublicPayloadTests(unittest.TestCase):
         self.assertEqual(kept, {"verdict": "pass", "target_error_before_db": 5.5,
                                 "target_error_after_db": 1.8, "model_error_db": 0.8})
 
+    def test_rebuilding_a_public_profile_gives_the_same_profile(self):
+        # The registry rebuilds every upload with this same function, and both
+        # sides name a profile by its content, so this has to be a fixed point.
+        public = share.public_payload(shared(), VERIFIED)
+        self.assertEqual(public["profile"]["quality"]["warning_count"], 2)
+        claimed = public["public"]["verification"]
+        again = share.public_payload(json.loads(json.dumps(public)), {
+            "usable": True, "verdict": claimed["verdict"], "model_error_db": claimed["model_error_db"],
+            "target_error_db": {"before": claimed["target_error_before_db"], "after": claimed["target_error_after_db"]}})
+        self.assertEqual(again, public)
+        self.assertEqual(share.profile_id(again), share.profile_id(public))
+        self.assertEqual(share.objective_score(again), share.objective_score(public))
+        hostile = json.loads(json.dumps(public))
+        hostile["profile"]["quality"]["warning_count"] = -10 ** 9
+        self.assertEqual(share.public_payload(hostile)["profile"]["quality"]["warning_count"], 0)
+
     def test_the_microphone_is_a_kind_never_a_name(self):
         kinds = {}
         for internal, calibrated in ((True, False), (False, False), (False, True)):

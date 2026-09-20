@@ -148,10 +148,19 @@ def public_payload(shared, verification=None):
     version = str(source.get("plugin_version") or shared.get("plugin_version") or "")
     profile["plugin_version"] = version if VERSION.fullmatch(version) else "0.0.0"
     quality = source.get("quality") if isinstance(source.get("quality"), dict) else {}
+    # The warnings themselves are sentences and stay at home; how many there
+    # were travels.  A profile that is already public carries only the count,
+    # and rebuilding it must give the same profile again: the registry
+    # rebuilds every upload, and the two sides name a profile by its content.
+    if isinstance(quality.get("warnings"), list):
+        warning_count = len(quality["warnings"])
+    else:
+        counted = quality.get("warning_count")
+        warning_count = int(counted) if _finite(counted) and 0 <= counted <= 64 else 0
     profile["quality"] = {
         "accepted": quality.get("accepted") is True,
         "verdict": quality.get("verdict") if quality.get("verdict") in ("pass", "warning") else "warning",
-        "warning_count": len(quality.get("warnings") or []) if isinstance(quality.get("warnings"), list) else 0,
+        "warning_count": min(64, warning_count),
         "metrics": _numbers_only(quality.get("metrics") or {}),
     }
     microphone = source.get("microphone") if isinstance(source.get("microphone"), dict) else {}
