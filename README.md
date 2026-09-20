@@ -297,6 +297,29 @@ sound worse than it started.
 - Existing tuning files are backed up before replacement, and failed or
   clipped measurements are saved for diagnosis but cannot be installed.
 
+## Calibrations shared for your machine
+
+A calibration belongs to one model's speakers, so one measured on the same
+model is worth having. When other people have shared one for your model, the
+panel lists them above the Calibrate button, best first, each with how it was
+measured and its score. One press loads one as a preview, level matched against
+what you had, and you keep it or go back. Nothing about a shared profile can
+choose your speaker output or step outside the limits the optimizer works
+under.
+
+The score runs from 0 to 100 and comes from the file: a calibrated measuring
+microphone counts for more than an external one, which counts for more than the
+built-in ones, since those measure the sound at their own position; a result
+that was checked with **Check the calibration** counts, and how close it came;
+a repeatable measurement counts. A thumbs-up on a profile's page from someone
+it works for adds a little. The
+[registry](https://github.com/thefreshoffice/omarchy-speaker-profiles) has a
+page per machine with every profile's graph.
+
+To share yours, press **Share with everyone** under Advanced. Checking the
+calibration first raises its score. A new upload for the same machine and kind
+of microphone takes the place of your earlier one.
+
 ## Sharing a calibration
 
 A calibration is specific to one model's speakers, so it can be handed to
@@ -364,11 +387,38 @@ terminal, `speaker-calibrate.py export-json` and
 
 ## What leaves your machine
 
-Nothing. There is no API, no telemetry, no update check and no account. The
-plugin never opens a socket.
+Nothing, until you press a button that says so. There is no telemetry, no
+update check and no account of ours. Two things can reach the internet, both
+to one public repository on GitHub,
+[omarchy-speaker-profiles](https://github.com/thefreshoffice/omarchy-speaker-profiles),
+and neither happens by itself:
 
-An exported calibration is a file in your Downloads folder and goes nowhere
-unless you send it; loading one reads a file from that folder and nothing else.
+- **Looking for calibrations shared for your machine.** The panel asks once
+  whether it may. After a yes it requests one small file, the list for your
+  model (`index/<vendor>/<product>.json`), over HTTPS from
+  `raw.githubusercontent.com`, about once a day, and a profile's own file when
+  you load it. The request carries no cookie, no credential and no identifier;
+  GitHub sees your address and which model's list was asked for, as any web
+  server would. After a no, or **Stop looking online**, nothing is requested.
+- **Sharing your calibration.** Only when you press **Share with everyone**,
+  which the first time shows what it sends: the filters, the measured and
+  corrected curves, how the measurement went, and your machine's model as its
+  firmware names it (vendor, product, SKU, board). It never contains your user
+  name, a path, a device name or serial, a recording, or free text of any
+  kind. With the GitHub command line tool signed in, the plugin hands that tool
+  the profile and the tool submits it under your account; the plugin never sees
+  your token. Without the tool, the profile goes to your clipboard and the
+  registry's form opens in your browser. Either way it is published under your
+  GitHub account and under CC0.
+
+What comes back is treated as data from a stranger: a size limit on every read,
+no redirects followed, no proxy taken from the environment, every row of a list
+rebuilt field by field before it is shown, and a loaded profile held to exactly
+the rules of a file someone handed you, below.
+
+An exported calibration is a file in your Downloads folder, with its graph as
+an SVG beside it, and goes nowhere unless you send it; loading one reads a file
+from that folder and nothing else.
 
 The microphone is opened only while a measurement is running. The recordings
 stay on disk under `~/.local/share/omarchy-speaker-calibrator/` and are never
@@ -399,7 +449,7 @@ created outside it and stay behind:
 | `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Disable removes it |
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
-| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps |
+| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared) and `registry-cache.json` (the last list for your model) |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-volume-restore.json` | exists only during a measurement that lowered the microphone's input level: what to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
 | `~/Downloads/omarchy-tuning-*/` | vendor tunings you exported |
