@@ -28,8 +28,6 @@ Panel {
   property string loudnessMode: "protected"
   property string channelTrimMode: "off"
   property bool advanced: false
-  // Share asks once, the first time, by showing what it sends.
-  property bool shareConfirm: false
   // Words for one row of the registry's list for this machine.
   function registryLabel(entry) {
     return "Load: measured with " + (entry.microphone_kind === "built-in microphone" ? "the built-in microphones"
@@ -64,7 +62,8 @@ Panel {
     // the calibration the panel exists to give.
     scroller.contentY = 0
     service.refresh()
-    root.shareConfirm = false
+    // A question Share asked the last time the panel was open is not still being asked.
+    if (service.shareStatus !== null && service.shareStatus.state === "confirm") service.shareStatus = null
   }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
@@ -1632,6 +1631,65 @@ Panel {
 
           PanelSeparator { foreground: root.foreground }
 
+          // Sharing sits here, in plain sight, because a calibration that works
+          // is worth more to the next person with this machine than to anyone.
+          // Nothing about it happens before the press: even asking the GitHub
+          // tool whether it is signed in reaches GitHub.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: service.status.enabled === true
+              && service.status.profile !== null && service.status.profile !== undefined
+
+            ActionRow {
+              width: parent.width
+              icon: "󰖟"
+              readonly property string sharedUrl: String((service.registry || {}).shared_url || "")
+              readonly property bool asking: service.shareStatus !== null && service.shareStatus.state === "confirm"
+              label: service.busy && service.phase === "share" ? "Sharing…"
+                : sharedUrl !== "" ? "Shared with everyone  ·  open its page"
+                : asking ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
+                : "Share this calibration with everyone"
+              description: sharedUrl !== ""
+                ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
+                : asking ? "It would score " + Number(service.shareStatus.score || 0) + " of 100 in the registry"
+                : "For everyone with " + String((service.status.hardware || {}).label || "this machine")
+                  + ": it shows up in their panel, with its graph and a score"
+              enabled: !service.busy
+              onClicked: {
+                if (sharedUrl !== "") service.openRegistryPage(sharedUrl)
+                else service.share(asking)
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.shareStatus !== null && service.shareStatus.state === "confirm"
+              width: parent.width
+              text: "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
+                + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
+                + "It does not contain your user name, any path, any device name or serial, or any recording. "
+                + (service.shareStatus !== null && service.shareStatus.one_press === true
+                   ? "Press again to upload it."
+                   : "The GitHub tool is not signed in here, so pressing again copies the profile and opens a "
+                     + "form in your browser to paste it into.")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.shareNote !== ""
+              width: parent.width
+              text: service.shareNote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            PanelSeparator { foreground: root.foreground }
+          }
+
           Toggle {
             width: parent.width
             label: "Advanced"
@@ -1643,10 +1701,7 @@ Panel {
               root.advanced = !root.advanced
               // Every time, not just the first: measuring with another
               // microphone changes what there is to compare.
-              if (root.advanced) {
-                service.loadMicrophones()
-                if (service.status.enabled && service.status.profile) service.shareStatusCheck()
-              }
+              if (root.advanced) service.loadMicrophones()
             }
           }
 
@@ -1863,54 +1918,6 @@ Panel {
                 + " to your Downloads folder"
               enabled: !service.busy
               onClicked: service.exportProfile()
-            }
-            ActionRow {
-              visible: service.status.enabled
-                && service.status.profile !== null && service.status.profile !== undefined
-              width: parent.width
-              icon: "󰖟"
-              readonly property var share: service.shareStatus || ({})
-              label: service.busy && (service.phase === "shareupload" || service.phase === "sharebrowser") ? "Sharing…"
-                : share.uploaded ? "Shared with everyone  ·  open its page"
-                : service.shareStatus && share.one_press !== true ? "Share with everyone via the browser"
-                : "Share with everyone"
-              description: share.uploaded
-                ? "Others with " + String((service.status.hardware || {}).label || "this machine") + " find it in their panel"
-                : "Publishes this calibration for everyone with " + String((service.status.hardware || {}).label || "this machine")
-                  + (service.shareStatus ? "  ·  it would score " + Number(share.score || 0) + " of 100" : "")
-              enabled: !service.busy
-              onClicked: {
-                if (share.uploaded) service.openRegistryPage(share.uploaded)
-                else if (!service.shareStatus) service.shareStatusCheck()
-                else if (share.explained !== true && !root.shareConfirm) root.shareConfirm = true
-                else if (share.one_press === true) { root.shareConfirm = false; service.shareUpload() }
-                else { root.shareConfirm = false; service.shareBrowser() }
-              }
-            }
-            Text {
-              textFormat: Text.PlainText
-              visible: root.shareConfirm
-              width: parent.width
-              text: "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
-                + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
-                + "It does not contain your user name, any path, any device name or serial, or any recording. "
-                + (service.shareStatus && service.shareStatus.one_press === true
-                   ? "Press Share with everyone again to upload it."
-                   : "Press again: the profile is copied, a form opens in your browser, and you paste it there.")
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-            Text {
-              textFormat: Text.PlainText
-              visible: service.shareNote !== ""
-              width: parent.width
-              text: service.shareNote
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
             }
             ActionRow {
               visible: service.status.enabled

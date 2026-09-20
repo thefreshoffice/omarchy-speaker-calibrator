@@ -294,6 +294,60 @@ class ShareTests(ClientTestCase):
         self.assertTrue(result["url"].startswith(f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/new?template=profile.yml&title="))
         self.assertNotIn(" ", result["url"])
 
+    def test_the_button_asks_the_first_time_and_is_one_press_after_that(self):
+        self.install()
+        created = subprocess.CompletedProcess([], 0, stdout=f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/5\n", stderr="")
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
+             mock.patch.object(speaker_calibrate.subprocess, "run", return_value=created) as ran:
+            first = speaker_calibrate.share_press()
+            self.assertEqual((first["state"], first["one_press"]), ("confirm", True))
+            ran.assert_not_called()                                              # asked, nothing sent
+            second = speaker_calibrate.share_press(confirmed=True)
+            self.assertEqual(second["state"], "uploaded")
+            self.assertEqual(ran.call_count, 1)
+            third = speaker_calibrate.share_press()
+            self.assertEqual((third["state"], third["url"]), ("uploaded", second["url"]))
+            self.assertEqual(ran.call_count, 1)                                  # already shared: nothing sent again
+        # A later calibration, once the explanation has been seen, is one press.
+        self.install(created="2026-10-01T09:00:00+00:00")
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
+             mock.patch.object(speaker_calibrate.subprocess, "run", return_value=created) as ran:
+            self.assertEqual(speaker_calibrate.share_press()["state"], "uploaded")
+            self.assertEqual(ran.call_count, 1)
+
+    def test_without_the_tool_the_same_button_goes_by_the_browser(self):
+        self.install()
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=False), \
+             mock.patch.object(speaker_calibrate.subprocess, "run") as ran:
+            self.assertEqual(speaker_calibrate.share_press()["one_press"], False)
+            ran.assert_not_called()
+            pressed = speaker_calibrate.share_press(confirmed=True)
+        self.assertEqual(pressed["state"], "browser")
+        self.assertEqual(ran.call_args.args[0], ["/usr/bin/wl-copy"])
+
+    def test_the_status_knows_what_was_shared_without_asking_anyone(self):
+        self.install()
+        identifier = speaker_calibrate.public_profile()[1]
+        url = f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/9"
+        with mock.patch.object(speaker_calibrate, "gh_signed_in") as asked, \
+             mock.patch.object(speaker_calibrate, "registry_fetch") as fetched, \
+             mock.patch.object(speaker_calibrate.subprocess, "run") as ran:
+            self.assertIsNone(speaker_calibrate.status_registry()["shared_url"])
+            speaker_calibrate.write_registry_state(uploads={identifier: url})
+            self.assertEqual(speaker_calibrate.status_registry()["shared_url"], url)
+        for untouched in (asked, fetched, ran):
+            untouched.assert_not_called()
+
+    def test_the_panel_asks_nothing_of_github_before_a_press(self):
+        root = Path(speaker_calibrate.__file__).parent
+        panel, service = (root / "Panel.qml").read_text(), (root / "Service.qml").read_text()
+        self.assertNotIn("share-status-json", service)
+        self.assertNotIn("shareStatusCheck", panel + service)
+        self.assertEqual(panel.count("service.share("), 1)                       # only the button's own click
+        button = panel.index("Share this calibration with everyone")
+        self.assertLess(button, panel.index('label: "Advanced"'))                # in the main panel, above the switch
+        self.assertGreater(button, panel.index('"Calibrate again"'))
+
     def test_the_status_says_what_would_be_sent_without_sending_it(self):
         self.install()
         with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \

@@ -3214,6 +3214,29 @@ def share_upload():
             "message": "Shared. It is checked and published within a minute or two; the link shows how it went."}
 
 
+def share_press(confirmed=False):
+    """Everything the Share button does, decided on the press and never before it.
+
+    The first time it answers with what would be sent, and sends nothing;
+    pressed again it shares.  With the GitHub tool signed in that is an upload,
+    otherwise the profile goes to the clipboard for the registry's form.  Even
+    asking the tool whether it is signed in reaches GitHub, which is why none
+    of this runs when the panel merely opens.
+    """
+    public, identifier, _ = public_profile()
+    state = registry_state()
+    if identifier in state.get("uploads", {}):
+        return {"state": "uploaded", "url": state["uploads"][identifier], "id": identifier,
+                "message": "This calibration is already shared."}
+    one_press = gh_signed_in()
+    if not state.get("share_explained") and not confirmed:
+        return {"state": "confirm", "one_press": one_press, "id": identifier, "name": public["name"],
+                "score": share.objective_score(public)}
+    if one_press:
+        return {"state": "uploaded", **share_upload()}
+    return {"state": "browser", **share_for_browser()}
+
+
 def share_for_browser():
     """The browser way: the profile on the clipboard and the address of the form to paste it into."""
     import urllib.parse
@@ -4343,9 +4366,16 @@ def cached_status():
 
 def status_registry():
     try:
-        return registry_cached()
+        found = registry_cached()
     except Exception:            # the status must never fail over a cache file
         return {"consent": None, "profiles": []}
+    found["shared_url"] = None
+    try:
+        if found.get("uploads") and load_profile(PROFILE) is not None:
+            found["shared_url"] = found["uploads"].get(public_profile()[1])
+    except (SystemExit, Exception):
+        pass
+    return found
 
 
 def status_payload():
@@ -4576,6 +4606,8 @@ def main():
     load = sub.add_parser("registry-load-json", help="load one shared calibration as the last measurement")
     load.add_argument("--id", required=True)
     load.add_argument("--preview", action="store_true")
+    pressed = sub.add_parser("share-json", help="what the panel's Share button does")
+    pressed.add_argument("--confirmed", action="store_true", help="what it sends has been shown and agreed to")
     sub.add_parser("share-status-json", help="what sharing the playing calibration would send, and how")
     sub.add_parser("share-upload-json", help="share the playing calibration through the signed-in GitHub tool")
     sub.add_parser("share-browser-json", help="put the profile on the clipboard and name the form to paste it into")
@@ -4641,6 +4673,8 @@ def main():
         print(json.dumps(registry_lookup(True) if args.answer == "allowed" else registry_cached()))
     elif command == "registry-load-json":
         print(json.dumps(registry_load(args.id, args.preview)))
+    elif command == "share-json":
+        print(json.dumps(share_press(args.confirmed)))
     elif command == "share-status-json":
         print(json.dumps(share_status()))
     elif command == "share-upload-json":

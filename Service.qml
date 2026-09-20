@@ -42,11 +42,11 @@ Item {
   // lookup found them: { consent, profiles, checked_at, uploads }.  Looking
   // needs a yes given once; until then nothing is asked of anyone.
   property var registry: ({ consent: null, profiles: [] })
-  // What Share would send and how, once it has been asked for: { name, one_press, explained, uploaded, ... }.
+  // What the last press on Share answered: { state: "confirm" | "uploaded" | "browser", ... }.
+  // Nothing about sharing is asked of anyone before a press, the GitHub tool's sign-in included.
   property var shareStatus: null
   property string shareNote: ""
-  property bool _sharePending: false
-  // Which calibration the share status describes; another one playing makes it stale.
+  // Which calibration that answer describes; another one playing makes it stale.
   property string _shareFor: ""
   // The speaker and microphone picked by hand, as the helper keeps them
   // across a restart of the shell: { sink, mic, channel }.
@@ -64,7 +64,7 @@ Item {
   // What the panel starts by itself: opening it, refreshing, remembering a
   // pick.  None of these is an answer to a failure, so none of them may take
   // the failure off the screen; only something the user starts does that.
-  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember", "registry", "sharestatus"]
+  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember", "registry"]
   function start(operation, arguments) {
     if (busy || helperPath === "") return
     phase = operation
@@ -87,10 +87,9 @@ Item {
       : operation === "vendorrestore" ? "Bringing the calibration back…"
       : operation === "import" ? "Loading the shared calibration…"
       : operation === "refit" ? "Applying…"
-      : operation === "remember" || operation === "registry" || operation === "sharestatus" ? message
+      : operation === "remember" || operation === "registry" ? message
       : operation === "registryload" ? "Loading the shared calibration…"
-      : operation === "shareupload" ? "Sharing the calibration…"
-      : operation === "sharebrowser" ? "Copying the profile…" : "Working…"
+      : operation === "share" ? "Sharing the calibration…" : "Working…"
     _stdout = ""
     _stderr = ""
     _overflowed = false
@@ -202,12 +201,7 @@ Item {
     start("registry", ["registry-lookup-json", "--quiet"].concat(refresh ? ["--refresh"] : []))
   }
   function registryLoad(identifier) { start("registryload", ["registry-load-json", "--id", String(identifier), "--preview"]) }
-  function shareStatusCheck() {
-    if (busy) { _sharePending = true; return }
-    start("sharestatus", ["share-status-json"])
-  }
-  function shareUpload() { start("shareupload", ["share-upload-json"]) }
-  function shareBrowser() { start("sharebrowser", ["share-browser-json"]) }
+  function share(confirmed) { start("share", ["share-json"].concat(confirmed ? ["--confirmed"] : [])) }
   // Only ever the registry's own pages, whatever a reply says.
   function openRegistryPage(url) {
     var address = String(url || "")
@@ -321,13 +315,8 @@ Item {
 
   // Whatever the run was, if a refresh was asked for while it held the
   // process, do it now.
-  onBusyChanged: if (!busy && (_refreshPending || _micsPending || _rememberPending || _sharePending)) Qt.callLater(function () {
+  onBusyChanged: if (!busy && (_refreshPending || _micsPending || _rememberPending)) Qt.callLater(function () {
     if (root.busy) return
-    if (root._sharePending && !root._rememberPending && !root._refreshPending) {
-      root._sharePending = false
-      root.start("sharestatus", ["share-status-json"])
-      return
-    }
     if (root._rememberPending) {
       var remembered = root._rememberPending
       root._rememberPending = null
@@ -521,19 +510,18 @@ Item {
             root.status = Object.assign({}, root.status, { enabled: true, profile: fetched.proposal, bypass: false })
           root.message = fetched.message || "Loaded"
           Qt.callLater(root.refreshStatus)
-        } else if (root.phase === "sharestatus") {
-          root.shareStatus = JSON.parse(raw)
+        } else if (root.phase === "share") {
+          var pressed = JSON.parse(raw)
+          root.shareStatus = pressed
           root._shareFor = String((root.status.profile || {}).created_at || "")
-        } else if (root.phase === "shareupload") {
-          var sharedNow = JSON.parse(raw)
-          root.shareStatus = Object.assign({}, root.shareStatus || {}, { uploaded: sharedNow.url, explained: true })
-          root.shareNote = String(sharedNow.message || "Shared.")
-          root.message = "Shared with everyone"
-        } else if (root.phase === "sharebrowser") {
-          var forBrowser = JSON.parse(raw)
-          root.shareStatus = Object.assign({}, root.shareStatus || {}, { explained: true })
-          root.shareNote = String(forBrowser.message || "")
-          root.openRegistryPage(forBrowser.url)
+          root.shareNote = pressed.state === "confirm" ? "" : String(pressed.message || "")
+          if (pressed.state === "uploaded") {
+            root.registry = Object.assign({}, root.registry, { shared_url: pressed.url })
+            root.message = "Shared with everyone"
+          } else if (pressed.state === "browser") {
+            root.message = ""
+            root.openRegistryPage(pressed.url)
+          } else root.message = ""
         } else if (root.phase === "import") {
           var loaded = JSON.parse(raw)
           root.setProposal(loaded.proposal || null)
