@@ -164,6 +164,7 @@ class LevelSearchWithGainTests(GainTestCase):
         results = iter(outcomes)
         with mock.patch.object(speaker_calibrate, "load_dsp"), \
              mock.patch.object(speaker_calibrate, "refuse_silenced_devices"), \
+             mock.patch.object(speaker_calibrate, "refuse_playing_speakers"), \
              mock.patch.object(speaker_calibrate, "playing_applications", return_value=[]), \
              mock.patch.object(speaker_calibrate, "search_measurement_level",
                                side_effect=lambda *a, **k: dict(next(results)), create=True), \

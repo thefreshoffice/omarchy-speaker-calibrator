@@ -51,11 +51,17 @@ Item {
   readonly property int _maxError: 8192
   property bool _overflowed: false
 
+  // What the panel starts by itself: opening it, refreshing, remembering a
+  // pick.  None of these is an answer to a failure, so none of them may take
+  // the failure off the screen; only something the user starts does that.
+  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember"]
   function start(operation, arguments) {
     if (busy || helperPath === "") return
     phase = operation
-    error = ""
-    if (operation !== "remember") offer = null
+    if (_ownPhases.indexOf(operation) < 0) {
+      error = ""
+      offer = null
+    }
     message = operation === "measure"
       ? "Measuring — a short level check, then six sweeps, about 30 seconds. Keep quiet…"
       : operation === "compare" ? "Switching profiles…"

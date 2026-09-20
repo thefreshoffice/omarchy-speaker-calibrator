@@ -164,6 +164,7 @@ class LevelSearchErrorTests(unittest.TestCase):
              mock.patch.object(speaker_calibrate, "LEVEL_SEARCH_ABORT_STATUSES",
                                ("no-signal", "background-too-loud", "level-independent"), create=True), \
              mock.patch.object(speaker_calibrate, "refuse_silenced_devices"), \
+             mock.patch.object(speaker_calibrate, "refuse_playing_speakers"), \
              mock.patch.object(speaker_calibrate, "playing_applications", return_value=[]):
             speaker_calibrate.find_measurement_level(SINK["name"], ARRAY["name"], 0, 2)
 
@@ -345,7 +346,9 @@ class PanelSelectionTests(unittest.TestCase):
         service = (Path(speaker_calibrate.__file__).parent / "Service.qml").read_text()
         self.assertIn('typeof failure.error === "string"', service)
         self.assertIn('typeof offered.microphone === "string"', service)
-        self.assertIn('if (operation !== "remember") offer = null', service)
+        # Cleared together with the failure it belongs to, and by nothing the panel starts itself.
+        start = service.index("if (_ownPhases.indexOf(operation) < 0) {")
+        self.assertIn("offer = null", service[start:start + 120])
 
     def test_the_row_says_so(self):
         self.assertIn('modelData.available === false ? "  ·  nothing plugged in" : ""', self.source)
