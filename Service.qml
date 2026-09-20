@@ -12,9 +12,35 @@ Item {
   // curves, which have no business in every status refresh.
   property var micComparison: null
   property bool busy: process.running
+  // A switch that lands in a fraction of a second is not a wait, and the
+  // panel should not collapse or dim for it.  These are the quick phases;
+  // everything else (measuring, fitting, checking, installing, rendering)
+  // takes long enough that the panel says so while it runs.
+  readonly property var _quickPhases: ["relevel", "deepbass", "loudness", "bypass", "compare",
+                                        "status", "devices", "cache", "mics", "output",
+                                        "export", "vendor", "previewapply", "previewdiscard"]
+  // What the last export wrote and where, shown next to the buttons that did it.
+  property string exportNote: ""
+  readonly property bool working: busy && _quickPhases.indexOf(phase) < 0
+  // The proposal is reassigned only when its content changed, so the rows
+  // drawn from it are not rebuilt for a refresh that brought the same thing.
+  property string _proposalKey: ""
+  function setProposal(next) {
+    var value = (next === undefined) ? null : next
+    var key = JSON.stringify(value)
+    if (key === _proposalKey) return
+    _proposalKey = key
+    proposal = value
+  }
   property string phase: ""
   property string error: ""
   property string message: ""
+  // What a failure offers to do instead, when it offers anything:
+  // { microphone, description, channel }.  Gone as soon as something else runs.
+  property var offer: null
+  // The speaker and microphone picked by hand, as the helper keeps them
+  // across a restart of the shell: { sink, mic, channel }.
+  property var chosen: ({})
   property string _stdout: ""
   property string _stderr: ""
   // The helper is ours, but its output is still input to this process: the
@@ -25,10 +51,17 @@ Item {
   readonly property int _maxError: 8192
   property bool _overflowed: false
 
+  // What the panel starts by itself: opening it, refreshing, remembering a
+  // pick.  None of these is an answer to a failure, so none of them may take
+  // the failure off the screen; only something the user starts does that.
+  readonly property var _ownPhases: ["status", "devices", "cache", "mics", "remember"]
   function start(operation, arguments) {
     if (busy || helperPath === "") return
     phase = operation
-    error = ""
+    if (_ownPhases.indexOf(operation) < 0) {
+      error = ""
+      offer = null
+    }
     message = operation === "measure"
       ? "Measuring — a short level check, then six sweeps, about 30 seconds. Keep quiet…"
       : operation === "compare" ? "Switching profiles…"
@@ -37,7 +70,14 @@ Item {
       : operation === "refine" ? "Improving from the last check…"
       : operation === "deepbass" ? "Switching deep bass…"
       : operation === "loudness" ? "Switching loudness compensation…"
-      : operation === "refit" ? "Applying…" : "Working…"
+      : operation === "relevel" ? "Switching…"
+      : operation === "export" ? "Exporting the calibration…"
+      : operation === "vendor" ? "Rendering the Omarchy tuning…"
+      : operation === "vendortry" ? "Installing the exported tuning through Omarchy's own installer…"
+      : operation === "vendorrestore" ? "Bringing the calibration back…"
+      : operation === "import" ? "Loading the shared calibration…"
+      : operation === "refit" ? "Applying…"
+      : operation === "remember" ? message : "Working…"
     _stdout = ""
     _stderr = ""
     _overflowed = false
@@ -102,7 +142,7 @@ Item {
       var payload = JSON.parse(String(raw || ""))
       if (!payload || !payload.service) return false
       status = payload
-      proposal = payload.proposal || null
+      setProposal(payload.proposal || null)
       return true
     } catch (exception) {
       return false
@@ -142,15 +182,27 @@ Item {
     start("mics", ["microphone-comparison-json"])
   }
   function refreshStatus() { start("status", ["status-json"]) }
+  // Keep a hand-picked speaker and microphone across a restart.  The newest
+  // pick wins when several arrive while something else holds the process.
+  property var _rememberPending: null
+  function rememberSelection(sink, mic, channel) {
+    var arguments = ["remember-selection-json"]
+    if (sink) arguments.push("--sink", sink)
+    if (mic) arguments.push("--mic", mic)
+    arguments.push("--channel", String(Math.max(0, Number(channel) || 0)))
+    if (busy) { _rememberPending = arguments; return }
+    start("remember", arguments)
+  }
   // Measure; with install=true the result is installed and played as soon as
   // it passes, so one press does the whole job.
   function measure(sink, mic, channel, options, install) {
-    proposal = null
+    setProposal(null)
     var arguments = ["calibrate-json", "--sink", sink, "--mic", mic,
                      "--channel", String(channel)].concat(optionArguments(options))
     if (options.micCalibrationFile && options.micCalibrationFile.length > 0)
       arguments.push("--mic-cal-file", options.micCalibrationFile)
-    if (install) arguments.push("--install")
+    if (install === "preview") arguments.push("--preview")
+    else if (install) arguments.push("--install")
     start("measure", arguments)
   }
   // Re-fit the last recorded sweeps with different options, without playing
@@ -161,6 +213,23 @@ Item {
     start("refit", arguments)
   }
   function install() { start("install", ["install-proposal"]) }
+  // A new calibration is playing and waits: keep it, or go back.
+  function applyPreview() { start("previewapply", ["preview-apply-json"]) }
+  function discardPreview() { start("previewdiscard", ["preview-discard-json"]) }
+  // Bass and loudness without a refit: the fit already holds both answers.
+  function relevel(options) {
+    start("relevel", ["relevel-json", "--bass", options.bass || "normal",
+                      "--loudness", options.loudness || "protected"])
+  }
+  // Hand the calibration that is playing to someone, or take theirs in.  The
+  // name is one the helper listed from the Downloads folder; it checks it again.
+  function exportProfile() { start("export", ["export-json"]) }
+  // The same calibration in the layout Omarchy ships its own tunings in.
+  function exportVendor() { start("vendor", ["vendor-tuning-json"]) }
+  // Hear the rendered tuning as Omarchy installs it, and come back.
+  function vendorTry() { start("vendortry", ["vendor-try-json"]) }
+  function vendorRestore() { start("vendorrestore", ["vendor-restore-json"]) }
+  function importProfile(name) { start("import", ["import-json", "--file", String(name)]) }
   function disable() { start("disable", ["disable"]) }
   function compare() { start("compare", ["compare-toggle"]) }
   function bypass() { start("bypass", ["bypass-toggle"]) }
@@ -219,8 +288,14 @@ Item {
 
   // Whatever the run was, if a refresh was asked for while it held the
   // process, do it now.
-  onBusyChanged: if (!busy && (_refreshPending || _micsPending)) Qt.callLater(function () {
+  onBusyChanged: if (!busy && (_refreshPending || _micsPending || _rememberPending)) Qt.callLater(function () {
     if (root.busy) return
+    if (root._rememberPending) {
+      var remembered = root._rememberPending
+      root._rememberPending = null
+      root.start("remember", remembered)
+      return
+    }
     if (root._refreshPending) {
       root._refreshPending = false
       root.start("devices", ["devices-json"])
@@ -256,6 +331,18 @@ Item {
         return
       }
       if (exitCode !== 0) {
+        // A failure that offers something arrives as one JSON document.
+        try {
+          var failure = JSON.parse(raw)
+          if (failure && typeof failure.error === "string") {
+            var offered = failure.offer
+            root.offer = (offered && typeof offered.microphone === "string") ? offered : null
+            root.error = failure.error
+            root.message = ""
+            root.phase = ""
+            return
+          }
+        } catch (notJson) {}
         root.error = err || raw || "Operation failed"
         root.message = ""
         root.phase = ""
@@ -264,11 +351,17 @@ Item {
       try {
         if (root.phase === "devices") {
           var devices = JSON.parse(raw)
+          root.chosen = devices.chosen || ({})
           root.sinks = devices.sinks || []
           root.microphones = devices.microphones || []
           root.message = ""
           root.phase = ""
           Qt.callLater(root.refreshStatus)
+          return
+        }
+        if (root.phase === "remember") {
+          root.chosen = (JSON.parse(raw) || {}).chosen || root.chosen
+          root.phase = ""
           return
         }
         if (root.phase === "output") {
@@ -304,7 +397,7 @@ Item {
         if (root.phase === "status") {
           var statusPayload = JSON.parse(raw)
           root.status = statusPayload
-          root.proposal = statusPayload.proposal || null
+          root.setProposal(statusPayload.proposal || null)
           // A background refresh has nothing to report; leaving "Working…" on
           // screen makes an idle panel look busy.
           if (root.message === "Working…") root.message = ""
@@ -314,12 +407,15 @@ Item {
           // is on screen no longer describes what is stored.
           if (root.micComparison) root._micsPending = true
           var result = JSON.parse(raw)
-          root.proposal = result
+          root.setProposal(result)
           var accepted = result.quality && result.quality.accepted
           if (accepted && result.installed) {
             root.status = Object.assign({}, root.status, { enabled: true, profile: result, bypass: false })
             var refinement = ((result.measurement || {}).refinement) || {}
-            root.message = root.phase === "measure" ? "Calibrated and playing: " + root.simpleLabel(result)
+            root.message = root.phase === "measure"
+              ? (result.previewing
+                 ? "New calibration measured and playing. Apply it, or keep the previous one?"
+                 : "Calibrated and playing: " + root.simpleLabel(result))
               : root.phase === "refine"
                 ? "Improved from the check, round " + refinement.iterations
                   + " · biggest change " + Number(refinement.largest_step_db || 0).toFixed(1)
@@ -341,6 +437,36 @@ Item {
           root.message = "Installed and playing: " + root.optionsLabel(installed)
             + (installed.activation === "restart" ? " · tuning restarted" : " · switched live")
           Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "relevel") {
+          var levelled = JSON.parse(raw)
+          root.status = Object.assign({}, root.status, { profile: levelled.profile, bypass: false })
+          if (levelled.proposal) root.setProposal(levelled.proposal)
+          root.message = levelled.message || ""
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "previewapply" || root.phase === "previewdiscard") {
+          var decided = JSON.parse(raw)
+          if (decided.profile) root.status = Object.assign({}, root.status, { profile: decided.profile, previewing: false, bypass: false })
+          root.message = decided.message || ""
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "export") {
+          var exported = JSON.parse(raw)
+          root.message = "Exported"
+          root.exportNote = exported.message || ""
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "vendor") {
+          var rendered = JSON.parse(raw)
+          root.message = "Rendered"
+          root.exportNote = rendered.message || ""
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "vendortry" || root.phase === "vendorrestore") {
+          var trial = JSON.parse(raw)
+          root.message = trial.message || ""
+          Qt.callLater(root.refreshStatus)
+        } else if (root.phase === "import") {
+          var loaded = JSON.parse(raw)
+          root.setProposal(loaded.proposal || null)
+          root.message = loaded.message || "Loaded"
+          Qt.callLater(root.refreshStatus)
         } else if (root.phase === "compare") {
           var compare = JSON.parse(raw)
           var playing = compare[compare.active]
@@ -358,7 +484,7 @@ Item {
             deepBass: bass.deep_bass !== undefined ? bass.deep_bass : root.status.deepBass
           })
           root.message = bass.message || ""
-          if (!bass.started) Qt.callLater(root.refreshStatus)
+          Qt.callLater(root.refreshStatus)
         } else if (root.phase === "loudness") {
           var loudness = JSON.parse(raw)
           root.status = Object.assign({}, root.status, {

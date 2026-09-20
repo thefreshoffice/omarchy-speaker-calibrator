@@ -424,6 +424,13 @@ class LevelSearchTests(unittest.TestCase):
         probe = analyse_level_probe(self.probe_capture(0.0), self.rate)
         self.assertLess(probe["prominence_db"], 3.0)
 
+    def test_digital_silence_is_reported_without_numeric_warnings(self):
+        with np.errstate(divide="raise", invalid="raise"):
+            probe = analyse_level_probe(np.zeros((self.rate, 3)), self.rate)
+        self.assertEqual(probe["prominence_db"], 0.0)
+        self.assertEqual(probe["clipped_samples"], 0)
+        self.assertEqual(probe["tonal_blocks"], 0)
+
     def test_plan_raises_a_quiet_probe_proportionally(self):
         probe = {"peak_dbfs": -32.0, "noise_dbfs": -80.0, "prominence_db": 40.0, "clipped_samples": 0}
         plan = plan_probe_level(-24.0, probe, (-36.0, -6.0))

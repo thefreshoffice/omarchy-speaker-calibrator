@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import stat
 import subprocess
 import sys
 import unittest
@@ -213,7 +214,7 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "bass_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
             "input_gain_linear": 0.5,
         }
-        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        controls = speaker_calibrate.graph_controls(fit)
         self.assertEqual(controls["ls_l:Freq"], 300.0)
         self.assertEqual(controls["ls_r:Gain"], -3.0)
         self.assertEqual(controls["bs_l:Freq"], 500.0)
@@ -222,13 +223,13 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertEqual(controls["p2_l:Gain"], 0.0)
         self.assertEqual(controls["hs_l:Freq"], 4000.0)
         self.assertEqual(controls["hs_r:Gain"], -4.0)
-        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit, bass_enhancer=False)
+        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit)
         self.assertIn('name = bs_l label = bq_lowshelf control = { "Freq" = 500 "Q" = 0.707 "Gain" = 3 }', graph)
         # A 0.10.0 profile stored the bass shelf as low_shelf.
         legacy = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.5],
                   "low_shelf": {"frequency_hz": 500, "q": 0.707, "gain_db": 3.0},
                   "input_gain_linear": 0.5}
-        legacy_controls = speaker_calibrate.graph_controls(legacy, bass_enhancer=False)
+        legacy_controls = speaker_calibrate.graph_controls(legacy)
         self.assertEqual(legacy_controls["bs_l:Gain"], 3.0)
         self.assertEqual(legacy_controls["ls_l:Gain"], 0.0)
 
@@ -334,11 +335,19 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "gains_db": [-2.5, 0.75],
             "input_gain_linear": 0.812345,
         }
-        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit, bass_enhancer=False)
+        graph = speaker_calibrate.filter_config("alsa_output.synthetic", fit)
         self.assertIn('"Freq" = 1000 "Q" = 1 "Gain" = -2.5', graph)
         self.assertIn('"Freq" = 2500 "Q" = 1.2 "Gain" = 0.75', graph)
         self.assertIn('"g_in" = 0.812345', graph)
-        self.assertIn('Calibrated Speakers — Protected', graph)
+        # One ASCII name everywhere: pactl's JSON output renders any non-ASCII
+        # string as "(null)", which Omarchy's switcher then shows (issue #1).
+        self.assertTrue(graph.isascii())
+        self.assertIn('node.description = "Calibrated Speakers"', graph)
+        self.assertIn('media.name = "Calibrated Speakers"', graph)
+        capture = graph[graph.index("capture.props"):graph.index("playback.props")]
+        self.assertIn('node.nick = "Calibrated Speakers"', capture)
+        self.assertIn('node.description = "Calibrated Speakers"', capture)
+        self.assertNotIn("Protected", graph)
         # The graph keeps its full fixed shape so profiles can be applied live.
         self.assertIn('name = p12_l label = bq_peaking', graph)
         self.assertIn('name = ls_r label = bq_lowshelf', graph)
@@ -347,6 +356,34 @@ class CalibrationOptimizerTests(unittest.TestCase):
         self.assertIn('{ output = "bal_r:Out" input = "limiter:in_r" }', graph)
         self.assertIn('name = bal_l label = linear control = { "Mult" = 1 "Add" = 0 }', graph)
 
+    def test_the_limiter_does_not_follow_a_bass_cycle(self):
+        # One cycle of 60 Hz lasts 17 ms.  On LSP's default 5 ms the limiter's
+        # gain rides the waveform and modulates everything played with it,
+        # which was heard as clipping with a player at 120 %.  Lookahead and
+        # attack go together: the attack cannot outrun the lookahead.  Ten
+        # milliseconds cured 60 Hz and did nothing for 100 Hz, whose cycle is
+        # exactly that long; fifteen covers the bass range, measured with a
+        # microphone in front of the speakers.
+        timing = speaker_calibrate.limiter_timing_controls()
+        self.assertEqual(timing, {"limiter:lk": 15.0, "limiter:at": 15.0})
+        self.assertGreater(timing["limiter:lk"], 1000.0 / 80.0)      # longer than a cycle of 80 Hz
+        self.assertEqual(timing["limiter:lk"], timing["limiter:at"])
+        fit = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.0], "input_gain_linear": 0.8}
+        graph = speaker_calibrate.filter_config("alsa_output.pci-test.analog-stereo", fit)
+        limiter = graph[graph.index("limiter_stereo"):]
+        limiter = limiter[:limiter.index("}")]
+        for setting in ('"lk" = 15.0', '"at" = 15.0', '"alr" = 0', '"boost" = 0', '"th" = 0.891'):
+            self.assertIn(setting, limiter)
+        # The slow level regulation would clean it up too, by turning everything down.
+        self.assertNotIn('"alr" = 1', graph)
+
+    def test_a_running_graph_gets_the_timing_from_the_tracker_s_first_write(self):
+        tracker_source = (Path(speaker_calibrate.__file__).parent / "loudness-tracker.py").read_text()
+        first = tracker_source[tracker_source.index("        else:\n            # The first write after a start"):]
+        first = first[:first.index("for index, controls in enumerate(writes):")]
+        self.assertIn("limiter_timing_controls", first)
+        self.assertIn("writes = [dict(target, **timing)]", first)
+
     def test_graph_controls_fill_every_fixed_slot(self):
         fit = {
             "centers_hz": [1000, 2500],
@@ -354,12 +391,16 @@ class CalibrationOptimizerTests(unittest.TestCase):
             "gains_db": [-2.5, 0.75],
             "input_gain_linear": 0.812345,
         }
-        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        controls = speaker_calibrate.graph_controls(fit)
         slots = speaker_calibrate.PEAKING_SLOTS
         # Per channel: two high-passes, three shelves, the parametric slots,
         # and the balance trim's two controls; plus the limiter's input gain
         # and the compensator's six, which are not per channel.
-        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6)
+        # ... plus the deep-bass path: three corners, a gain and its offset per channel,
+        # and the limiter's lookahead and attack.
+        self.assertEqual(len(controls), 2 * (2 * 2 + 3 + 3 + 3 * slots + 3 + 2) + 1 + 6 + 10 + 2)
+        self.assertEqual(controls["limiter:lk"], 15.0)
+        self.assertEqual(controls["limiter:at"], 15.0)
         self.assertEqual(controls["bs_l:Gain"], 0.0)
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Add"], 0.0)
@@ -377,21 +418,21 @@ class CalibrationOptimizerTests(unittest.TestCase):
                 "q": [1.0] * (slots + 1),
                 "gains_db": [-1.0] * (slots + 1),
                 "input_gain_linear": 1.0,
-            }, bass_enhancer=False)
+            })
 
     def test_graph_parks_the_second_highpass_when_one_stage_is_enough(self):
         base = {"centers_hz": [1000], "q": [1.0], "gains_db": [-2.0], "input_gain_linear": 0.9}
         one = speaker_calibrate.graph_controls(dict(
-            base, highpass={"frequency_hz": 160.0, "q": 0.707, "stages": 1}), bass_enhancer=False)
+            base, highpass={"frequency_hz": 160.0, "q": 0.707, "stages": 1}))
         self.assertEqual(one["hp1_l:Freq"], 160.0)
         self.assertEqual(one["hp2_l:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
         self.assertEqual(one["hp2_r:Freq"], speaker_calibrate.PARKED_HIGHPASS_HZ)
         two = speaker_calibrate.graph_controls(dict(
-            base, highpass={"frequency_hz": 80.0, "q": 0.707, "stages": 2}), bass_enhancer=False)
+            base, highpass={"frequency_hz": 80.0, "q": 0.707, "stages": 2}))
         self.assertEqual(two["hp1_r:Freq"], 80.0)
         self.assertEqual(two["hp2_r:Freq"], 80.0)
         # A profile from before the high-pass was measured keeps its old chain.
-        legacy = speaker_calibrate.graph_controls(base, bass_enhancer=False)
+        legacy = speaker_calibrate.graph_controls(base)
         self.assertEqual(legacy["hp1_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
         self.assertEqual(legacy["hp2_l:Freq"], speaker_calibrate.DEFAULT_HIGHPASS_HZ)
 
@@ -574,7 +615,7 @@ class BypassTests(unittest.TestCase):
 
     def test_the_match_reaches_the_graph_as_input_gain(self):
         controls = speaker_calibrate.transparent_controls(
-            bass_enhancer=False, level_match_db=-8.6
+            level_match_db=-8.6
         )
         self.assertAlmostEqual(controls["limiter:g_in"], 10 ** (-8.6 / 20.0), places=5)
         # Everything else is still flat, so only the level differs.
@@ -585,11 +626,11 @@ class BypassTests(unittest.TestCase):
     def test_a_measurement_flattens_without_the_match(self):
         # The speaker has to be measured as it is, not as the correction
         # leaves it, so the flattening used for a calibration is unity.
-        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        controls = speaker_calibrate.transparent_controls()
         self.assertEqual(controls["limiter:g_in"], 1.0)
 
     def test_transparent_controls_pass_audio_through(self):
-        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        controls = speaker_calibrate.transparent_controls()
         self.assertEqual(controls["limiter:g_in"], 1.0)
         for name, value in controls.items():
             if name.endswith(":Gain"):
@@ -597,7 +638,7 @@ class BypassTests(unittest.TestCase):
             if name.startswith("hp") and name.endswith(":Freq"):
                 self.assertEqual(value, 10.0, name)
         self.assertEqual(set(controls), set(speaker_calibrate.graph_controls(
-            {"filters": [], "input_gain_linear": 1.0}, bass_enhancer=False
+            {"filters": [], "input_gain_linear": 1.0}
         )))
 
 
@@ -714,7 +755,7 @@ class RawMeasurementTests(unittest.TestCase):
         installed = module.graph_controls({
             "filters": [{"type": "peaking", "frequency_hz": 800.0, "q": 1.0, "gain_db": -6.0}],
             "input_gain_linear": 0.9,
-        }, bass_enhancer=False)
+        })
         applied = []
         try:
             module.service_active = lambda: True
@@ -722,9 +763,7 @@ class RawMeasurementTests(unittest.TestCase):
             module.compare_state = lambda: {"active": "current", "bypass": False}
             module.live_controls = lambda node_id: dict(installed, **{"limiter:grgv_l": 1.0})
             module.apply_controls_live = lambda controls: applied.append(dict(controls)) or True
-            module.transparent_controls = lambda bass_enhancer=None: original_transparent(
-                bass_enhancer=False
-            )
+            module.transparent_controls = lambda: original_transparent()
             with module.correction_silenced() as silenced:
                 self.assertTrue(silenced)
                 self.assertEqual(applied[-1]["p1_l:Gain"], 0.0)
@@ -744,7 +783,8 @@ class RawMeasurementTests(unittest.TestCase):
         )}
         running = {
             "hp1_l:Freq": 195.8, "p1_l:Gain": -7.0, "limiter:g_in": 1.66,
-            "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
+            "hb_out_l:Mult": 2.830895, "hb_out_r:Mult": 2.830895, "hb_lp_l:Freq": 195.8,
+            "hb_out_l:Add": -1.415448, "hb_out_r:Add": -1.415448,
             "loudcomp:enabled": 0.0,
         }
         applied = []
@@ -759,14 +799,13 @@ class RawMeasurementTests(unittest.TestCase):
             for name, value in saved.items():
                 setattr(module, name, value)
         self.assertEqual(len(applied), 2)
-        self.assertEqual(applied[0]["bass:bypass"], 1.0)
-        self.assertEqual(applied[0]["bass:amt"], 0.0)
-        # Only the add-on is touched: the filters under test stay as they are.
+        self.assertEqual(applied[0]["hb_out_l:Mult"], 0.0)
+        self.assertEqual(applied[0]["hb_out_r:Mult"], 0.0)
+        # Only the deep-bass gain is touched: the filters under test stay as they are.
         self.assertNotIn("p1_l:Gain", applied[0])
         self.assertNotIn("limiter:g_in", applied[0])
-        self.assertEqual(applied[1], {
-            "bass:bypass": 0.0, "bass:amt": 1.45, "bass:ceil": 195.8,
-        })
+        self.assertEqual(applied[1], {"hb_out_l:Mult": 2.830895, "hb_out_r:Mult": 2.830895,
+                                      "hb_out_l:Add": -1.415448, "hb_out_r:Add": -1.415448})
 
     def test_nothing_is_muted_when_nothing_is_inventing_sound(self):
         module = speaker_calibrate
@@ -778,7 +817,8 @@ class RawMeasurementTests(unittest.TestCase):
             module.service_active = lambda: True
             module.tuning_node_id = lambda: 7
             module.live_controls = lambda node_id: {
-                "bass:bypass": 1.0, "bass:amt": 0.0, "loudcomp:enabled": 0.0,
+                "hb_out_l:Mult": 0.0, "hb_out_r:Mult": 0.0,
+                "hb_out_l:Add": 0.0, "hb_out_r:Add": 0.0, "loudcomp:enabled": 0.0,
             }
             module.apply_controls_live = lambda controls: touched.append(controls) or True
             with module.added_sound_silenced() as muted:
@@ -902,167 +942,50 @@ class RefinementTests(unittest.TestCase):
         self.assertLess(cut_at(second, 1500.0), cut_at(first, 1500.0) - 2.0)
 
 
-class BassEnhancerTests(unittest.TestCase):
+class HarmonicBassTests(unittest.TestCase):
+    """Deep bass built into the graph, in PipeWire's own nodes."""
     fit = {
         "filters": [{"type": "peaking", "frequency_hz": 900.0, "q": 1.2, "gain_db": -5.0}],
         "highpass": {"frequency_hz": 185.0, "q": 0.707, "stages": 1},
         "input_gain_linear": 0.9,
     }
 
-    def bundle(self, folder, *, ports=None, uri=None):
-        """A pretend LV2 bundle, complete or deliberately broken."""
-        module = speaker_calibrate
-        ports = module.BASS_ENHANCER_PORTS if ports is None else ports
-        directory = Path(folder) / "bankstown.lv2"
-        directory.mkdir(parents=True)
-        body = f"<{uri or module.BASS_ENHANCER_URI}> a lv2:Plugin ;\n"
-        body += "".join(f'    lv2:port [ lv2:symbol "{port}" ] ;\n' for port in ports)
-        (directory / "bankstown.ttl").write_text(body)
-        return directory
-
-    def with_paths(self, folder):
-        module = speaker_calibrate
-        original = module.BASS_ENHANCER_SEARCH_PATHS
-        module.BASS_ENHANCER_SEARCH_PATHS = (str(folder),)
-        return original
-
-    def test_a_complete_bundle_is_detected(self):
-        module = speaker_calibrate
-        with tempfile.TemporaryDirectory() as folder:
-            directory = self.bundle(folder)
-            original = self.with_paths(folder)
-            try:
-                status = module.bass_enhancer_status()
-            finally:
-                module.BASS_ENHANCER_SEARCH_PATHS = original
-        self.assertTrue(status["usable"])
-        self.assertTrue(status["installed"])
-        self.assertEqual(status["path"], str(directory))
-        self.assertEqual(status["missing_ports"], [])
-
-    def test_a_build_missing_ports_is_refused(self):
-        module = speaker_calibrate
-        with tempfile.TemporaryDirectory() as folder:
-            self.bundle(folder, ports=("in_l", "in_r", "out_l", "out_r", "bypass"))
-            original = self.with_paths(folder)
-            try:
-                status = module.bass_enhancer_status()
-            finally:
-                module.BASS_ENHANCER_SEARCH_PATHS = original
-        self.assertTrue(status["installed"])
-        self.assertFalse(status["usable"])
-        self.assertIn("amt", status["missing_ports"])
-
-    def test_nothing_installed_reports_nothing(self):
-        module = speaker_calibrate
-        with tempfile.TemporaryDirectory() as folder:
-            original = self.with_paths(folder)
-            try:
-                status = module.bass_enhancer_status()
-            finally:
-                module.BASS_ENHANCER_SEARCH_PATHS = original
-        self.assertFalse(status["installed"])
-        self.assertFalse(status["usable"])
-
-    def test_the_graph_never_mentions_an_absent_add_on(self):
-        graph = speaker_calibrate.filter_config(
-            "alsa_output.x", self.fit, bass_enhancer=False, deep_bass=False
-        )
-        self.assertNotIn("bankstown", graph)
-        self.assertNotIn("bass:", graph)
-        # Without the add-on the compensator is what the sound enters through.
-        self.assertIn('inputs  = [ "loudcomp:in_l" "loudcomp:in_r" ]'.replace("  ", " "),
-                      graph.replace("  ", " "))
-        self.assertIn('{ output = "loudcomp:out_l" input = "hp1_l:In" }', graph)
-        controls = speaker_calibrate.graph_controls(self.fit, bass_enhancer=False)
-        self.assertFalse([name for name in controls if name.startswith("bass:")])
-
-    def test_the_add_on_is_wired_in_front_of_the_high_pass(self):
-        graph = speaker_calibrate.filter_config(
-            "alsa_output.x", self.fit, bass_enhancer=True, deep_bass=True
-        )
-        self.assertIn(speaker_calibrate.BASS_ENHANCER_URI, graph)
-        self.assertIn('{ output = "bass:out_l" input = "loudcomp:in_l" }', graph)
-        self.assertIn('{ output = "bass:out_r" input = "loudcomp:in_r" }', graph)
-        self.assertIn('"bass:in_l"', graph)
-        self.assertIn('"bass:in_r"', graph)
-        # The links are what order a filter chain, not the order the nodes
-        # happen to be declared in: sound enters the add-on, so it sees the
-        # bass before anything shapes or removes it.
-        self.assertIn('"bass:in_l"', graph)
-        self.assertIn('{ output = "loudcomp:out_l" input = "hp1_l:In" }', graph)
-        self.assertNotIn('input = "bass:in_l" }', graph)
+    def test_the_path_sits_ahead_of_the_compensator_in_every_graph(self):
+        graph = speaker_calibrate.filter_config("alsa_output.x", self.fit, deep_bass=True)
+        for needle in ('name = hb_in_l', 'name = hb_mix_r', 'label = exp', 'label = log',
+                       '{ output = "hb_mix_l:Out" input = "loudcomp:in_l" }',
+                       '{ output = "hb_cl_r:Out" input = "hb_mix_r:In 1" }',
+                       'inputs = [ "hb_in_l:In" "hb_in_r:In" ]'):
+            self.assertIn(needle, graph, needle)
+        self.assertNotIn("type = lv2 name = bass", graph)
+        self.assertNotIn("chadmed", graph)
+        for line in graph.splitlines():
+            if "label = linear" in line:
+                self.assertNotIn('"Mult" = -', line, line)
 
     def test_its_band_follows_the_measured_knee(self):
-        controls = speaker_calibrate.graph_controls(
-            self.fit, bass_enhancer=True, deep_bass=True
-        )
-        self.assertEqual(controls["bass:ceil"], 185.0)
-        self.assertEqual(controls["bass:final_hp"], 185.0)
-        self.assertEqual(controls["bass:floor"], speaker_calibrate.BASS_ENHANCER_FLOOR_HZ)
-        self.assertEqual(controls["bass:bypass"], 0.0)
-        self.assertEqual(controls["bass:amt"], speaker_calibrate.BASS_ENHANCER_AMOUNT)
+        controls = speaker_calibrate.graph_controls(self.fit, deep_bass=True)
+        self.assertEqual(controls["hb_lp_l:Freq"], 185.0)
+        self.assertEqual(controls["hb_fh_r:Freq"], 185.0)
+        self.assertEqual(controls["hb_fl_l:Freq"], 555.0)
+        self.assertAlmostEqual(controls["hb_out_l:Mult"],
+                               2.0 * speaker_calibrate.HARMONIC_SCALE * speaker_calibrate.HARMONIC_AMOUNT, places=6)
+        settings = speaker_calibrate.harmonic_settings(400.0)
+        self.assertEqual(settings["ceil_hz"], speaker_calibrate.HARMONIC_MAX_HZ)
 
-    def test_switching_it_off_only_changes_controls(self):
-        on = speaker_calibrate.graph_controls(self.fit, bass_enhancer=True, deep_bass=True)
-        off = speaker_calibrate.graph_controls(self.fit, bass_enhancer=True, deep_bass=False)
+    def test_switching_it_off_changes_one_control_per_channel_and_nothing_else(self):
+        on = speaker_calibrate.graph_controls(self.fit, deep_bass=True)
+        off = speaker_calibrate.graph_controls(self.fit, deep_bass=False)
         self.assertEqual(set(on), set(off))
-        self.assertEqual(off["bass:bypass"], 1.0)
-        self.assertEqual(off["bass:amt"], 0.0)
-        # Everything that is not the add-on is untouched, so it applies live.
-        self.assertEqual(
-            {k: v for k, v in on.items() if not k.startswith("bass:")},
-            {k: v for k, v in off.items() if not k.startswith("bass:")},
-        )
+        self.assertEqual(off["hb_out_l:Mult"], 0.0)
+        self.assertEqual(off["hb_out_r:Mult"], 0.0)
+        self.assertEqual({k: v for k, v in on.items() if not k.startswith("hb_out_")},
+                         {k: v for k, v in off.items() if not k.startswith("hb_out_")})
+        self.assertEqual(speaker_calibrate.transparent_controls()["hb_out_r:Mult"], 0.0)
 
-    def test_a_corner_above_the_plugin_limit_is_clamped(self):
-        fit = dict(self.fit, highpass={"frequency_hz": 400.0, "q": 0.707, "stages": 1})
-        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=True, deep_bass=True)
-        self.assertEqual(controls["bass:ceil"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
-        self.assertEqual(controls["bass:final_hp"], speaker_calibrate.BASS_ENHANCER_MAX_HZ)
-
-    def install_command_with(self, stdout, returncode=0):
-        module = speaker_calibrate
-        original = module.run
-        class Result:
-            pass
-        result = Result()
-        result.returncode = returncode
-        result.stdout = stdout
-        try:
-            module.run = lambda *args, **kwargs: result
-            return module.bass_enhancer_install_command()
-        finally:
-            module.run = original
-
-    def test_a_repository_copy_is_preferred_over_a_source_build(self):
-        command, repository = self.install_command_with(
-            "Repository      : omarchy\nName            : bankstown\n"
-        )
-        self.assertEqual(command, "omarchy pkg add bankstown")
-        self.assertEqual(repository, "omarchy")
-
-    def test_any_repository_counts_not_just_omarchy(self):
-        command, repository = self.install_command_with(
-            "Repository      : extra\nName            : bankstown\n"
-        )
-        self.assertEqual(command, "omarchy pkg add bankstown")
-        self.assertEqual(repository, "extra")
-
-    def test_it_falls_back_to_the_pinned_build_when_no_repository_has_it(self):
-        command, repository = self.install_command_with("", returncode=1)
-        self.assertEqual(command.split()[0], "/usr/bin/bash")
-        self.assertTrue(command.endswith("/bass-enhancer/install.sh"), command)
-        self.assertIsNone(repository)
-
-    def test_bypassing_the_calibration_matches_the_running_shape(self):
-        with_addon = speaker_calibrate.transparent_controls(bass_enhancer=True)
-        without = speaker_calibrate.transparent_controls(bass_enhancer=False)
-        self.assertEqual(with_addon["bass:bypass"], 1.0)
-        self.assertEqual(
-            set(with_addon) - set(without),
-            {name for name in with_addon if name.startswith("bass:")},
-        )
+    def test_the_status_says_it_is_built_in(self):
+        status = speaker_calibrate.harmonic_bass_status()
+        self.assertTrue(status["usable"]); self.assertTrue(status["builtin"]); self.assertIsNone(status["package"])
 
 
 class ChannelTrimTests(unittest.TestCase):
@@ -1143,17 +1066,17 @@ class ChannelTrimTests(unittest.TestCase):
             "input_gain_linear": 0.9,
             "channel_trim": {"applied": True, "left_db": -2.0, "right_db": 0.0},
         }
-        controls = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        controls = speaker_calibrate.graph_controls(fit)
         self.assertAlmostEqual(controls["bal_l:Mult"], 10 ** (-2.0 / 20.0), places=5)
         self.assertEqual(controls["bal_r:Mult"], 1.0)
         graph = speaker_calibrate.filter_config(
-            "alsa_output.x", fit, bass_enhancer=False
+            "alsa_output.x", fit
         )
         self.assertIn('name = bal_l label = linear control = { "Mult" = 0.7943', graph)
 
     def test_a_profile_without_a_trim_is_unity(self):
         controls = speaker_calibrate.graph_controls(
-            {"filters": [], "input_gain_linear": 1.0}, bass_enhancer=False
+            {"filters": [], "input_gain_linear": 1.0}
         )
         self.assertEqual(controls["bal_l:Mult"], 1.0)
         self.assertEqual(controls["bal_r:Mult"], 1.0)
@@ -1336,9 +1259,9 @@ class LoudnessCompensationTests(unittest.TestCase):
 
     def test_the_graph_always_carries_it_so_it_can_be_switched_live(self):
         fit = {"filters": [], "input_gain_linear": 1.0}
-        off = speaker_calibrate.graph_controls(fit, bass_enhancer=False)
+        off = speaker_calibrate.graph_controls(fit)
         on = speaker_calibrate.graph_controls(
-            fit, bass_enhancer=False, loudness_compensation=True, sink_volume_db=-12.0
+            fit, loudness_compensation=True, sink_volume_db=-12.0
         )
         self.assertEqual(set(off), set(on))
         self.assertEqual(off["loudcomp:enabled"], 0.0)
@@ -1353,7 +1276,7 @@ class LoudnessCompensationTests(unittest.TestCase):
         )
 
     def test_bypassing_the_calibration_also_flattens_it(self):
-        controls = speaker_calibrate.transparent_controls(bass_enhancer=False)
+        controls = speaker_calibrate.transparent_controls()
         self.assertEqual(controls["loudcomp:enabled"], 0.0)
         self.assertEqual(controls["loudcomp:input"], 1.0)
 
@@ -1383,6 +1306,37 @@ class MicrophoneCandidateTests(unittest.TestCase):
         self.assertFalse(speaker_calibrate.is_physical_sink("bluez_output.80_C3_BA_81_E7_90.1"))
         self.assertTrue(speaker_calibrate.is_physical_sink("alsa_output.pci-0000_00_1f.3.analog-stereo"))
 
+    def test_monitor_and_spdif_outputs_are_not_the_laptop_s_speakers(self):
+        names = {
+            "alsa_output.pci-0000_00_1f.3.analog-stereo": True,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo": False,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo-extra1": False,
+            "alsa_output.pci-0000_00_1f.3.iec958-stereo": False,
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI1__sink": False,
+            "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink": True,
+            "alsa_output.usb-Sennheiser_BTD_700-02.analog-stereo": False,
+        }
+        sinks = [{"name": name, "description": name, "sample_specification": "s32le 2ch 48000Hz"}
+                 for name in names]
+
+        def pactl(kind):
+            return sinks if kind == "sinks" else []
+
+        default = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=pactl), \
+             mock.patch.object(speaker_calibrate, "run", return_value=default):
+            listed = {item["name"]: item["internal"]
+                      for item in speaker_calibrate.devices_payload()["sinks"]}
+        self.assertEqual(listed, names)
+        # A monitor's speakers start as quietly as any other external output.
+        for name, built_in in names.items():
+            self.assertAlmostEqual(
+                speaker_calibrate.default_sweep_level(name),
+                speaker_calibrate.INTERNAL_SPEAKER_LEVEL_DBFS if built_in
+                else speaker_calibrate.EXTERNAL_SPEAKER_LEVEL_DBFS)
+        self.assertTrue(speaker_calibrate.is_built_in("alsa_input.pci-0000_00_1f.3.analog-stereo"))
+        self.assertFalse(speaker_calibrate.is_built_in("alsa_input.usb-Usb_Microphone-00.mono-fallback"))
+
     def test_devices_identify_pipewire_s_default_microphone(self):
         sources = [
             {"name": "alsa_input.pci-card.HiFi__Mic2__source",
@@ -1404,6 +1358,69 @@ class MicrophoneCandidateTests(unittest.TestCase):
             [item["description"] for item in microphones if item["default"]],
             ["Digital Microphone"],
         )
+
+    def test_asahi_devices_default_to_protected_speakers_and_internal_array(self):
+        devices = {
+            "sinks": [
+                {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+                {"name": "audio_effect.j413-convolver", "sample_specification": "float32le 2ch 48000Hz"},
+                {"name": "alsa_output.platform-sound.RawSpeakers"},
+                {"name": "audio_effect.unrelated"},
+                {"name": "omarchy_speaker_tuning"},
+            ],
+            "sources": [
+                {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"},
+                {"name": "alsa_input.platform-sound.HiFi__Headset__source"},
+                {"name": "omarchy_speaker_tuning.monitor"},
+            ],
+        }
+        with mock.patch.object(speaker_calibrate, "pactl_json", side_effect=devices.__getitem__):
+            payload = speaker_calibrate.devices_payload()
+        self.assertEqual([d["name"] for d in payload["sinks"]], [
+            "alsa_output.platform-sound.HiFi__Headphones__sink", "audio_effect.j413-convolver",
+        ])
+        self.assertEqual([d["internal"] for d in payload["sinks"]], [False, True])
+        self.assertEqual([(d["internal"], d["channels"]) for d in payload["microphones"]], [
+            (True, 3), (False, 1),
+        ])
+
+    def test_a_shared_calibration_never_lands_on_asahi_s_raw_speakers(self):
+        # The raw device sits behind the sink that carries the speaker
+        # protection; an import on a machine without a profile picks a speaker
+        # by itself and must pick from the same list the panel offers.
+        sinks = [
+            {"name": "alsa_output.platform-sound.RawSpeakers"},
+            {"name": "alsa_output.platform-sound.HiFi__Headphones__sink"},
+            {"name": "omarchy_speaker_tuning"},
+            {"name": "audio_effect.j413-convolver", "description": "MacBook Air J413 Speakers"},
+        ]
+        with mock.patch.object(speaker_calibrate, "load_profile", return_value=None), \
+             mock.patch.object(speaker_calibrate, "pactl_json", return_value=sinks):
+            self.assertEqual(speaker_calibrate.local_speaker()["name"], "audio_effect.j413-convolver")
+
+    def test_built_in_means_the_same_on_every_kind_of_machine(self):
+        for name, built_in in {
+            "audio_effect.j413-convolver": True,
+            "alsa_input.platform-sound.RawMics": True,
+            "alsa_output.platform-sound.RawSpeakers": False,
+            "alsa_output.platform-sound.HiFi__Headphones__sink": False,
+            "alsa_input.platform-sound.HiFi__Headset__source": False,
+            "effect_output.j413-mic": False,
+            "alsa_output.pci-0000_00_1f.3.analog-stereo": True,
+            "alsa_output.pci-0000_00_1f.3.hdmi-stereo": False,
+            "alsa_input.pci-0000_00_1f.3.analog-stereo": True,
+        }.items():
+            self.assertEqual(speaker_calibrate.is_built_in(name), built_in, name)
+
+    def test_asahi_array_can_measure_all_channels(self):
+        sink = {"name": "audio_effect.j413-convolver"}
+        mic = {"name": "alsa_input.platform-sound.RawMics", "sample_specification": "float32le 3ch 48000Hz"}
+        with mock.patch.object(speaker_calibrate, "physical_sinks", return_value=[sink]), \
+             mock.patch.object(speaker_calibrate, "microphones", return_value=[mic]), \
+             mock.patch.object(speaker_calibrate, "build_profile", return_value={"measured": True}) as measure:
+            result = speaker_calibrate.calibrate_noninteractive(sink["name"], mic["name"], "all", "neutral")
+        self.assertEqual(result, {"measured": True})
+        measure.assert_called_once_with(sink, mic, "all", "neutral", None, "protected", "normal", "off")
 
 
 class MeasurementSupportTests(unittest.TestCase):
@@ -1654,40 +1671,865 @@ class CheckAndProfileLabelTests(unittest.TestCase):
                 )
 
 
-class PinnedBassEnhancerTests(unittest.TestCase):
-    root = Path(__file__).resolve().parents[1]
+class SharedCalibrationTests(unittest.TestCase):
+    """Exporting a calibration and loading one that somebody shared."""
 
-    def test_the_pkgbuild_and_script_name_the_helper_s_revision(self):
-        pkgbuild = (self.root / "bass-enhancer" / "PKGBUILD").read_text()
-        script = (self.root / "bass-enhancer" / "install.sh").read_text()
-        commit = speaker_calibrate.BASS_ENHANCER_COMMIT
-        tree = speaker_calibrate.BASS_ENHANCER_TREE
-        version = speaker_calibrate.BASS_ENHANCER_VERSION
-        self.assertRegex(commit, r"^[0-9a-f]{40}$")
-        self.assertRegex(tree, r"^[0-9a-f]{40}$")
-        self.assertIn(f"_commit={commit}\n", pkgbuild)
-        self.assertIn("#commit=${_commit}", pkgbuild)
-        self.assertIn(f"pkgver={version}\n", pkgbuild)
-        self.assertRegex(pkgbuild, r"sha256sums=\('[0-9a-f]{64}'\)")
-        self.assertNotIn("SKIP", pkgbuild)
-        self.assertIn(f"COMMIT={commit}\n", script)
-        self.assertIn(f"TREE={tree}\n", script)
-        self.assertIn(f"VERSION={version}\n", script)
+    OURS = {"sys_vendor": "SLIMBOOK", "product_name": "Executive", "product_version": "",
+            "product_sku": "EXE14", "board_name": "EXE14", "label": "SLIMBOOK Executive"}
 
-    def test_nothing_that_runs_asks_the_aur_or_skips_confirmation(self):
-        for name in ("speaker-calibrate.py", "Panel.qml", "Service.qml",
-                     "bass-enhancer/install.sh", "bass-enhancer/PKGBUILD"):
-            text = (self.root / name).read_text()
-            for phrase in ("pkg aur", "--noconfirm", "yay", "aur.archlinux.org"):
-                self.assertNotIn(phrase, text, f"{phrase!r} in {name}")
+    def profile(self, **changes):
+        base = {
+            "schema_version": 5, "plugin_version": "1.1.0", "created_at": "2026-09-16T10:00:00+00:00",
+            "speaker": {"name": "alsa_output.pci-test.analog-stereo", "description": "Built-in Audio"},
+            "microphone": {"name": "alsa_input.usb-test", "description": "Usb Microphone", "channel": 0,
+                           "internal": False, "calibration_file": "/home/someone/mic.txt"},
+            "voicing": "neutral", "loudness": "matched", "bass": "full", "deep_bass": "on",
+            "loudness_compensation": "on",
+            "quality": {"accepted": True, "verdict": "pass", "warnings": [], "guidance": []},
+            "fit": {"filter_count": 2, "input_gain_linear": 0.8, "makeup_db": 2.0,
+                    "filters": [{"type": "peaking", "frequency_hz": 600.0, "q": 2.6, "gain_db": -8.5},
+                                {"type": "peaking", "frequency_hz": 2500.0, "q": 1.0, "gain_db": -6.0}],
+                    "highpass": {"frequency_hz": 190.0, "q": 0.707, "stages": 1},
+                    "bass_shelf": {"frequency_hz": 200.0, "q": 0.707, "gain_db": 3.0}},
+        }
+        base.update(changes)
+        return base
 
-    def test_without_a_repository_the_shipped_script_is_the_install_command(self):
-        with mock.patch.object(speaker_calibrate, "package_repository", return_value=None):
-            command, repository = speaker_calibrate.bass_enhancer_install_command()
-        self.assertIsNone(repository)
-        self.assertEqual(command.split()[0], "/usr/bin/bash")
-        self.assertTrue(command.endswith("/bass-enhancer/install.sh"), command)
-        self.assertTrue((self.root / "bass-enhancer" / "install.sh").exists())
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        root = Path(self.folder.name)
+        self.downloads = root / "Downloads"; self.downloads.mkdir()
+        self.data = root / "data"; self.data.mkdir(mode=0o700)
+        self.patches = [
+            mock.patch.object(speaker_calibrate, "DATA", self.data),
+            mock.patch.object(speaker_calibrate, "PROFILE", self.data / "active-profile.json"),
+            mock.patch.object(speaker_calibrate, "PROPOSAL", self.data / "proposed-profile.json"),
+            mock.patch.object(speaker_calibrate, "share_directory", lambda: self.downloads),
+            mock.patch.object(speaker_calibrate, "hardware_id", lambda: dict(self.OURS)),
+            mock.patch.object(speaker_calibrate, "pactl_json",
+                              lambda kind: [{"name": "alsa_output.pci-test.analog-stereo", "description": "Built-in Audio"}]),
+            mock.patch.object(speaker_calibrate, "plugin_version", lambda: "1.1.0"),
+        ]
+        for patch in self.patches:
+            patch.start()
+        self.addCleanup(self.folder.cleanup)
+        for patch in self.patches:
+            self.addCleanup(patch.stop)
+
+    def install_active(self, profile=None):
+        (self.data / "active-profile.json").write_text(json.dumps(profile or self.profile()))
+
+    def test_export_names_the_machine_and_carries_no_paths(self):
+        self.install_active()
+        result = speaker_calibrate.export_profile()
+        path = self.downloads / result["file"]
+        self.assertTrue(path.exists())
+        self.assertEqual(path.name, "slimbook-executive-external-mic-2026-09-16.speaker-calibration.json")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        # The Downloads folder itself is left as it was.
+        self.assertEqual(stat.S_IMODE(self.downloads.stat().st_mode), 0o755)
+        payload = json.loads(path.read_text())
+        self.assertEqual(payload["format"], speaker_calibrate.SHARE_FORMAT)
+        self.assertEqual(payload["name"], "SLIMBOOK Executive · external mic · 2026-09-16")
+        self.assertEqual(payload["hardware"]["product_sku"], "EXE14")
+        self.assertEqual(payload["hardware"]["speaker"], "alsa_output.pci-test.analog-stereo")
+        self.assertIs(payload["profile"]["microphone"]["calibration_file"], True)
+        self.assertNotIn("/home/", path.read_text())
+
+    def test_a_shared_file_is_listed_loaded_and_matched(self):
+        self.install_active()
+        exported = speaker_calibrate.export_profile()
+        listed = speaker_calibrate.shared_profiles()
+        self.assertEqual([entry["file"] for entry in listed], [exported["file"]])
+        self.assertTrue(listed[0]["valid"])
+        self.assertEqual(listed[0]["matches"], {"machine": True, "speakers": True})
+        result = speaker_calibrate.import_profile(name=exported["file"])
+        self.assertIsNone(result["warning"])
+        proposal = json.loads((self.data / "proposed-profile.json").read_text())
+        self.assertEqual(proposal["imported"]["file"], exported["file"])
+        self.assertEqual(proposal["imported"]["matches"], {"machine": True, "speakers": True})
+        self.assertEqual(proposal["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
+        self.assertTrue(proposal["quality"]["accepted"])
+
+    def test_other_hardware_is_warned_about_and_pointed_at_these_speakers(self):
+        self.install_active()
+        exported = speaker_calibrate.export_profile()
+        theirs = {**self.OURS, "sys_vendor": "Dell Inc.", "product_name": "XPS 14", "product_sku": "0DB9",
+                  "label": "Dell Inc. XPS 14"}
+        with mock.patch.object(speaker_calibrate, "hardware_id", lambda: theirs), \
+             mock.patch.object(speaker_calibrate, "pactl_json",
+                               lambda kind: [{"name": "alsa_output.pci-xps.analog-stereo", "description": "XPS speakers"}]):
+            (self.data / "active-profile.json").unlink()
+            listed = speaker_calibrate.shared_profiles()
+            self.assertEqual(listed[0]["matches"], {"machine": False, "speakers": False})
+            result = speaker_calibrate.import_profile(name=exported["file"])
+        self.assertIn("made on SLIMBOOK Executive; this is Dell Inc. XPS 14", result["warning"])
+        self.assertEqual(result["proposal"]["speaker"]["name"], "alsa_output.pci-xps.analog-stereo")
+        self.assertFalse(result["proposal"]["imported"]["matches"]["machine"])
+        self.assertEqual(result["proposal"]["deep_bass"], "on")
+        self.assertEqual(result["proposal"]["loudness_compensation"], "on")
+
+    def test_hardware_matching_prefers_the_sku(self):
+        matches = speaker_calibrate.hardware_matches
+        self.assertTrue(matches({"product_sku": "A", "product_name": "X"}, {"product_sku": "A", "product_name": "Y"}))
+        self.assertFalse(matches({"product_sku": "A", "product_name": "X"}, {"product_sku": "B", "product_name": "X"}))
+        self.assertTrue(matches({"sys_vendor": "Slimbook", "product_name": "Executive"},
+                                {"sys_vendor": "SLIMBOOK", "product_name": "executive", "product_sku": "Z"}))
+        self.assertFalse(matches({"sys_vendor": "Slimbook"}, {"sys_vendor": "Slimbook"}))
+
+    def write_shared(self, name, payload):
+        (self.downloads / name).write_text(json.dumps(payload))
+
+    def shared(self, **fit_changes):
+        profile = self.profile()
+        profile["fit"].update(fit_changes)
+        return {"format": speaker_calibrate.SHARE_FORMAT, "name": "x", "hardware": dict(self.OURS), "profile": profile}
+
+    def test_values_outside_the_protective_envelope_are_refused(self):
+        valid = speaker_calibrate.valid_shared_payload
+        valid(self.shared())
+        for changes, reason in (
+            ({"filters": [{"type": "peaking", "frequency_hz": 600.0, "q": 1.0, "gain_db": 30.0}]}, "gain"),
+            ({"filters": [{"type": "peaking", "frequency_hz": 50000.0, "q": 1.0, "gain_db": -3.0}]}, "frequency"),
+            ({"filters": [{"type": "allpass", "frequency_hz": 600.0, "q": 1.0, "gain_db": -3.0}]}, "unknown type"),
+            ({"filters": [{"type": "peaking", "frequency_hz": 600.0, "q": 1.0, "gain_db": -3.0}] * 13}, "filters are expected"),
+            ({"highpass": {"frequency_hz": 5000.0}}, "high-pass"),
+            ({"channel_trim": {"left_db": 12.0, "right_db": 0.0}}, "trim"),
+            ({"input_gain_linear": 9.0}, "input gain"),
+            ({"input_gain_linear": float("nan")}, "not finite"),
+        ):
+            with self.assertRaisesRegex(ValueError, reason, msg=str(changes)):
+                valid(self.shared(**changes))
+        rejected = self.shared(); rejected["profile"]["quality"]["accepted"] = False
+        with self.assertRaisesRegex(ValueError, "quality"):
+            valid(rejected)
+        with self.assertRaisesRegex(ValueError, "not a shared"):
+            valid({"format": "something-else/1"})
+
+    INJECTION = 'x" } } } ] context.exec = [ { path = "/usr/bin/sh" args = "-c id" } ] j = [ { a = { b = { c = "'
+
+    def test_a_speaker_name_inside_the_file_never_reaches_the_configuration(self):
+        # The file claims this machine's speakers in its hardware record, which
+        # is what the import compares, and hides another name in the profile,
+        # which is what used to be installed.
+        hostile = self.shared()
+        hostile["hardware"]["speaker"] = "alsa_output.pci-test.analog-stereo"
+        hostile["profile"]["speaker"] = {"name": self.INJECTION, "description": "Built-in Audio"}
+        self.write_shared("hostile.speaker-calibration.json", hostile)
+        result = speaker_calibrate.import_profile(name="hostile.speaker-calibration.json")
+        self.assertTrue(result["matches"]["speakers"])
+        self.assertEqual(result["proposal"]["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
+        self.assertNotIn("context.exec", (self.data / "proposed-profile.json").read_text())
+
+    def test_no_writer_of_configuration_accepts_a_name_pipewire_would_not_give(self):
+        fit = self.profile()["fit"]
+        for name in (self.INJECTION, "-rf", "", "a b", "sink'$(id)", None, 7):
+            with self.assertRaises(SystemExit, msg=repr(name)):
+                speaker_calibrate.filter_config(name, fit)
+            with self.assertRaises(SystemExit, msg=repr(name)):
+                speaker_calibrate.trial_graph('target.object = "@SPEAKER_SINK@"', name)
+            with mock.patch.object(speaker_calibrate, "run") as ran:
+                with self.assertRaises(SystemExit, msg=repr(name)):
+                    speaker_calibrate.move_apps(name)
+                ran.assert_not_called()
+        for name in ("alsa_output.pci-0000_00_1f.3.analog-stereo", "audio_effect.j413-convolver",
+                     "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink",
+                     "alsa_output.usb-Sennheiser_BTD_700_09B88CA972B269AB3C08-02.analog-stereo"):
+            self.assertEqual(speaker_calibrate.checked_sink_name(name), name)
+
+    def test_a_raw_device_behind_a_protected_sink_is_not_a_match(self):
+        asahi = self.shared()
+        asahi["hardware"]["speaker"] = "alsa_output.platform-sound.RawSpeakers"
+        self.write_shared("asahi.speaker-calibration.json", asahi)
+        sinks = [{"name": "alsa_output.platform-sound.RawSpeakers"},
+                 {"name": "audio_effect.j413-convolver", "description": "MacBook Air J413 Speakers"}]
+        with mock.patch.object(speaker_calibrate, "pactl_json", lambda kind: sinks):
+            result = speaker_calibrate.import_profile(name="asahi.speaker-calibration.json")
+        self.assertFalse(result["matches"]["speakers"])
+        self.assertEqual(result["proposal"]["speaker"]["name"], "audio_effect.j413-convolver")
+
+    def test_the_date_is_a_date_or_the_file_is_refused(self):
+        valid = speaker_calibrate.valid_shared_payload
+        for when in ("2026-09-16", "2026-09-16T10:00:00+00:00", "2026-09-16T10:00:00.123456Z"):
+            shared = self.shared(); shared["profile"]["created_at"] = when
+            valid(shared)
+        for when in ('$(id)      ', '";rm -rf ~', "2026-09-1`", "", None, 20260916):
+            shared = self.shared(); shared["profile"]["created_at"] = when
+            with self.assertRaisesRegex(ValueError, "date", msg=repr(when)):
+                valid(shared)
+
+    def test_files_built_to_break_the_parser_do_not_break_the_panel(self):
+        crafted = {
+            "deep.speaker-calibration.json": "[" * 200000,
+            "huge-number.speaker-calibration.json": json.dumps(self.shared()).replace("600.0", "9" * 400, 1),
+            "hardware-list.speaker-calibration.json": json.dumps({**self.shared(), "hardware": [1, 2]}),
+            "speaker-dict.speaker-calibration.json": json.dumps(
+                {**self.shared(), "hardware": {**self.OURS, "speaker": {"a": 1}}}),
+        }
+        for name, text in crafted.items():
+            (self.downloads / name).write_text(text)
+        rows = speaker_calibrate.shared_profiles()
+        self.assertEqual(sorted(row["file"] for row in rows), sorted(crafted))
+        self.assertFalse(any(row["valid"] for row in rows))
+        for name in crafted:
+            with self.assertRaises(SystemExit, msg=name):
+                speaker_calibrate.import_profile(name=name)
+
+    def test_a_calibration_too_large_for_a_status_reply_is_refused(self):
+        bulky = self.shared()
+        bulky["profile"]["measurement"] = {"curve": [[float(i)] * 8 for i in range(4000)]}
+        with self.assertRaisesRegex(ValueError, "larger than any"):
+            speaker_calibrate.valid_shared_payload(bulky)
+
+    def test_the_listing_shows_only_names_the_import_accepts(self):
+        self.write_shared("fine.speaker-calibration.json", self.shared())
+        self.write_shared("-dash first.speaker-calibration.json", self.shared())
+        self.write_shared("semi;colon.speaker-calibration.json", self.shared())
+        self.assertEqual([row["file"] for row in speaker_calibrate.shared_profiles()],
+                         ["fine.speaker-calibration.json"])
+
+    def test_the_export_carries_no_path_and_no_device_serial(self):
+        profile = self.profile()
+        profile["microphone"]["name"] = "alsa_input.usb-Sennheiser_BTD_700_09B88CA972B269AB3C08-02.mono-fallback"
+        profile["measurement"] = {"microphone_calibration": {
+            "path": "/home/someone/Documents/umik-7091234.txt", "points": 512, "kind": "frequency-response"}}
+        self.install_active(profile)
+        text = (self.downloads / speaker_calibrate.export_profile()["file"]).read_text()
+        for private in ("/home/", "someone", "7091234", "09B88CA972B269AB3C08"):
+            self.assertNotIn(private, text)
+        exported = json.loads(text)["profile"]
+        self.assertEqual(exported["measurement"]["microphone_calibration"], {"points": 512, "kind": "frequency-response"})
+        self.assertEqual(exported["microphone"]["description"], "Usb Microphone")
+        # And what it wrote can be read back by the same plugin.
+        speaker_calibrate.valid_shared_payload(json.loads(text))
+
+    def test_disable_also_ends_an_exported_tuning_on_trial(self):
+        self.install_active()
+        with mock.patch.object(speaker_calibrate, "run"), \
+             mock.patch.object(speaker_calibrate, "move_apps"), \
+             mock.patch.object(speaker_calibrate, "forget_loudness_tracker"), \
+             mock.patch.object(speaker_calibrate, "stop_trial_host") as stopped:
+            speaker_calibrate.disable()
+        stopped.assert_called_once_with()
+
+    def test_bad_names_symlinks_and_oversized_files_are_refused(self):
+        with self.assertRaises(SystemExit):
+            speaker_calibrate.import_profile(name="../etc/passwd.speaker-calibration.json")
+        with self.assertRaises(SystemExit):
+            speaker_calibrate.import_profile(name="nope")
+        victim = Path(self.folder.name) / "victim.json"; victim.write_text(json.dumps(self.shared()))
+        (self.downloads / "link.speaker-calibration.json").symlink_to(victim)
+        with self.assertRaises(SystemExit):
+            speaker_calibrate.import_profile(name="link.speaker-calibration.json")
+        self.assertEqual(speaker_calibrate.shared_profiles(), [])
+        self.write_shared("big.speaker-calibration.json", self.shared())
+        with mock.patch.object(speaker_calibrate, "SHARE_LIMIT_BYTES", 100):
+            with self.assertRaises(SystemExit):
+                speaker_calibrate.import_profile(name="big.speaker-calibration.json")
+            listed = speaker_calibrate.shared_profiles()
+        self.assertEqual([entry["valid"] for entry in listed], [False])
+
+
+class LevelVariantTests(CalibrationOptimizerTests):
+    """The bass and loudness switches without a refit."""
+
+    def fitted(self, bass, loudness):
+        response = -6.0 * np.exp(-((np.log(self.frequencies / 700.0)) ** 2) / 0.4) \
+            - 12.0 * (self.frequencies < 150.0) * (150.0 - self.frequencies) / 150.0
+        return optimize_peq(self.measurement(response), "neutral", internal_mic=False,
+                            bass=bass, loudness=loudness)
+
+    def test_every_combination_is_stored_and_the_chosen_one_is_the_fit(self):
+        fit = self.fitted("full", "matched")
+        self.assertEqual(set(fit["variants"]), {f"{b}/{l}" for b in ("normal", "full")
+                                                for l in ("protected", "balanced", "matched")})
+        chosen = fit["variants"]["full/matched"]
+        for field in ("bass_shelf", "headroom_db", "boost_budget", "loudness_loss_db", "makeup_db",
+                      "net_input_gain_db", "input_gain_linear", "predicted_response_db",
+                      "correction_response_db", "weighted_rmse_after_db"):
+            self.assertEqual(fit[field], chosen[field], field)
+        self.assertIsNone(fit["variants"]["normal/matched"]["bass_shelf"])
+        self.assertEqual(fit["variants"]["normal/protected"]["makeup_db"], 0.0)
+
+    def test_a_stored_variant_is_what_a_refit_with_that_setting_gives(self):
+        first = self.fitted("full", "matched")
+        refit = self.fitted("normal", "protected")
+        self.assertEqual(first["filters"], refit["filters"])
+        variant = first["variants"]["normal/protected"]
+        for field in ("bass_shelf", "headroom_db", "makeup_db", "net_input_gain_db",
+                      "input_gain_linear", "correction_response_db", "predicted_response_db",
+                      "weighted_rmse_after_db", "boost_budget"):
+            self.assertEqual(refit[field], variant[field], field)
+
+    def test_an_older_profile_gets_the_same_answer_on_the_fly(self):
+        fit = self.fitted("full", "matched")
+        measurement = self.measurement(np.zeros(self.frequencies.size))
+        measurement["frequency_hz"] = self.frequencies.tolist()
+        profile = {"fit": {k: v for k, v in fit.items() if k != "variants"}, "measurement": measurement,
+                   "bass": "full", "loudness": "matched", "safety": {}}
+        computed = speaker_calibrate.level_variant_for(profile, "normal", "protected")
+        stored = fit["variants"]["normal/protected"]
+        for field in ("headroom_db", "makeup_db", "net_input_gain_db", "input_gain_linear"):
+            self.assertAlmostEqual(computed[field], stored[field], places=2, msg=field)
+        self.assertIsNone(computed["bass_shelf"])
+        self.assertLess(np.max(np.abs(np.asarray(computed["correction_response_db"])
+                                      - np.asarray(stored["correction_response_db"]))), 0.01)
+        speaker_calibrate.apply_level_variant(profile, "normal", "protected")
+        self.assertEqual(profile["bass"], "normal")
+        self.assertEqual(profile["loudness"], "protected")
+        self.assertEqual(profile["fit"]["input_gain_linear"], computed["input_gain_linear"])
+        self.assertEqual(profile["safety"]["input_trim_db"], -computed["headroom_db"])
+        self.assertEqual(profile["safety"]["makeup_gain_db"], 0.0)
+
+
+class VendorTuningTests(SharedCalibrationTests):
+    """A calibration rendered as an Omarchy vendor tuning."""
+
+    def test_coefficients_agree_with_the_magnitude_responses(self):
+        from calibration_optimizer import (chain_response, group_delay_swing_ms, _peaking_response_db,
+                                           _lowshelf_response_db, _highshelf_response_db, _highpass_response_db)
+        f = np.geomspace(20.0, 20000.0, 300)
+        for kind, freq, q, gain, reference in (
+            ("peaking", 600.0, 2.6, -8.5, _peaking_response_db(f, 600.0, 2.6, -8.5, 48000)),
+            ("lowshelf", 200.0, 0.707, 3.0, _lowshelf_response_db(f, 200.0, 0.707, 3.0, 48000)),
+            ("highshelf", 6000.0, 1.5, -1.3, _highshelf_response_db(f, 6000.0, 1.5, -1.3, 48000)),
+            ("highpass", 190.0, 0.707, 0.0, _highpass_response_db(f, 190.0, 0.707, 48000)),
+        ):
+            magnitude = 20.0 * np.log10(np.abs(chain_response([(kind, freq, q, gain)], f, 48000)))
+            self.assertLess(float(np.max(np.abs(magnitude - reference))), 1e-6, kind)
+        self.assertEqual(group_delay_swing_ms([], 48000), 0.0)
+        swing = group_delay_swing_ms([("highpass", 60.9, 1.0, 0.0)] * 2 + [("peaking", 83.4, 1.8, -8.0)], 48000)
+        self.assertGreater(swing, 1.0)
+        self.assertLess(swing, 30.0)
+
+    def test_sections_follow_omarchy_s_order_and_drop_idle_ones(self):
+        fit = self.profile()["fit"]
+        fit["filters"].append({"type": "peaking", "frequency_hz": 300.0, "q": 1.0, "gain_db": 0.0})
+        fit["filters"].append({"type": "highshelf", "frequency_hz": 8000.0, "q": 0.7, "gain_db": -2.0})
+        fit["highpass"]["stages"] = 2
+        sections = speaker_calibrate.vendor_sections(fit)
+        self.assertEqual([kind for kind, *_ in sections],
+                         ["highpass", "highpass", "lowshelf", "peaking", "peaking", "highshelf"])
+        self.assertEqual([round(freq) for _, freq, *_ in sections], [190, 190, 200, 600, 2500, 8000])
+
+    def test_the_rendered_tuning_has_what_omarchy_checks_for(self):
+        self.install_active(self.profile(deep_bass="off"))
+        fake_metrics = {"bass_group_delay_swing_ms": 2.5, "limiter_headroom_db": 1.2, "peak_dbfs": -2.2,
+                        "dynamic_range_delta_lu": 0.3, "signal": "pink noise"}
+        with mock.patch.object(speaker_calibrate, "vendor_metrics", lambda *a, **k: fake_metrics):
+            result = speaker_calibrate.vendor_tuning()
+        folder = Path(result["directory"])
+        self.assertEqual(folder, self.downloads / "omarchy-tuning-slimbook-executive")
+        self.assertEqual(sorted(result["files"]), ["README.txt", "filter-chain.conf", "tuning.conf"])
+        chain = (folder / "filter-chain.conf").read_text()
+        for needle in ('name = s0_l', 'name = s0_r', 'label = bq_highpass', 'label = bq_lowshelf', 'label = bq_peaking',
+                       'name   = limiter', '"alr"   = 0', '"boost" = 0', '"g_in"  = 0.8000', '"th"    = 0.891',
+                       'node.name   = "omarchy_speaker_tuning"', 'target.object = "@SPEAKER_SINK@"',
+                       'node.dont-move = true', 'node.dont-fallback = true', 'inputs  = [ "s0_l:In" "s0_r:In" ]',
+                       'outputs = [ "limiter:out_l" "limiter:out_r" ]', '{ output = "s3_l:Out" input = "limiter:in_l" }'):
+            self.assertIn(needle, chain, needle)
+        self.assertNotIn("bankstown", chain)
+        self.assertNotIn("loud_comp", chain)
+        tuning = (folder / "tuning.conf").read_text()
+        for needle in ('match_sku=("EXE14")', "sink_pattern='^alsa_output.pci-test.analog-stereo$'",
+                       'description="SLIMBOOK Executive speakers"', 'bass_group_delay_swing_ms="2.5"',
+                       'limiter_headroom_db="1.2"', 'dynamic_range_delta_lu="0.3"', 'validated_by=""',
+                       'derived_from="Omarchy Speaker Calibrator'):
+            self.assertIn(needle, tuning, needle)
+
+    def test_deep_bass_becomes_bankstown_s_recipe_in_built_in_nodes(self):
+        self.install_active(self.profile(deep_bass="on"))
+        fake_metrics = {"bass_group_delay_swing_ms": 2.5, "limiter_headroom_db": 1.2, "peak_dbfs": -2.2,
+                        "dynamic_range_delta_lu": 0.3, "signal": "pink noise"}
+        with mock.patch.object(speaker_calibrate, "vendor_metrics", lambda *a, **k: fake_metrics):
+            result = speaker_calibrate.vendor_tuning()
+        chain = (Path(result["directory"]) / "filter-chain.conf").read_text()
+        for needle in ('name = hb_in_l  label = copy', 'name = hb_cl_l  label = clamp        control = { "Min" = -10 "Max" = 10 }',
+                       'label = bq_lowpass   control = { "Freq" = 190 "Q" = 0.707 }',   # ceil at the knee
+                       'label = bq_lowpass   control = { "Freq" = 570 "Q" = 0.707 }',   # three times the knee
+                       '"Mult" = 3.5 "Add" = 0', 'label = exp          control = { "Base" = 0.367879441 }',
+                       'label = log          control = { "Base" = 2.718281828 "M1" = 1 "M2" = 1 }',
+                       'inputs  = [ "hb_in_l:In" "hb_in_r:In" ]',
+                       '{ output = "hb_cl_l:Out" input = "hb_mix_l:In 1" }', '{ output = "hb_fl_r:Out" input = "hb_mix_r:In 2" }',
+                       '{ output = "hb_mix_l:Out" input = "s0_l:In" }', "own recipe, in built-in nodes"):
+            self.assertIn(needle, chain, needle)
+        scale = speaker_calibrate.HARMONIC_SCALE * speaker_calibrate.HARMONIC_AMOUNT
+        self.assertIn(f'"Mult" = {2 * scale:.6f} "Add" = {-scale:.6f}', chain)
+        # No negative multiplier anywhere: PipeWire's linear node drops the sign.
+        for line in chain.splitlines():
+            if "label = linear" in line:
+                self.assertNotIn('"Mult" = -', line, line)
+        # The node chain's arithmetic is a tanh with no constant left over: the
+        # last stage computes 2 s - 1 == tanh(u), so silence in is silence out
+        # and a graph that starts from zero state has nothing to step through.
+        u = np.linspace(-17.0, 17.0, 2001)
+        s = np.exp(-np.log(1.0 + np.exp(-2.0 * u)))
+        self.assertLess(float(np.max(np.abs(2.0 * s - 1.0 - np.tanh(u)))), 1e-6)
+        controls = speaker_calibrate.harmonic_controls(190.0, True)
+        self.assertAlmostEqual(controls["hb_out_l:Add"], -0.5 * controls["hb_out_l:Mult"], places=5)
+        off = speaker_calibrate.harmonic_controls(190.0, False)
+        self.assertEqual((off["hb_out_l:Mult"], off["hb_out_l:Add"]), (0.0, 0.0))
+        tuning = (Path(result["directory"]) / "tuning.conf").read_text()
+        self.assertIn("Deep bass is included", tuning)
+
+    def test_metrics_come_from_a_simulated_pass_through_the_chain(self):
+        sections = speaker_calibrate.vendor_sections(self.profile()["fit"])
+        with mock.patch.object(speaker_calibrate, "VENDOR_SIMULATION_SECONDS", 2.0):
+            metrics = speaker_calibrate.vendor_metrics(sections, 0.8, 48000)
+            harmonics = speaker_calibrate.vendor_harmonics(self.profile(deep_bass="on"))
+            with_bass = speaker_calibrate.vendor_metrics(sections, 0.8, 48000, harmonics=harmonics)
+        self.assertEqual(harmonics["ceil_hz"], 190.0)
+        self.assertGreater(with_bass["peak_dbfs"], metrics["peak_dbfs"] - 0.01)
+        self.assertGreater(metrics["bass_group_delay_swing_ms"], 0.0)
+        self.assertLess(metrics["peak_dbfs"], 0.0)
+        self.assertAlmostEqual(metrics["limiter_headroom_db"], -1.0 - metrics["peak_dbfs"], places=1)
+        self.assertIn("pink noise", metrics["signal"])
+        if metrics["dynamic_range_delta_lu"] is not None:
+            self.assertLess(abs(metrics["dynamic_range_delta_lu"]), 10.0)
+
+
+class InstallDefaultsTests(unittest.TestCase):
+    def test_a_new_calibration_follows_the_volume_by_default(self):
+        self.assertEqual(speaker_calibrate.LOUDNESS_COMPENSATION_DEFAULT, "on")
+
+    def test_installing_starts_or_stops_the_tracker_to_match_the_profile(self):
+        calls = []
+        patches = [
+            mock.patch.object(speaker_calibrate, "install_profile", lambda profile, graph: "live"),
+            mock.patch.object(speaker_calibrate, "filter_config", lambda *a, **k: "graph"),
+            mock.patch.object(speaker_calibrate, "sink_volume_db", lambda sink: 0.0),
+            mock.patch.object(speaker_calibrate, "listening_sink", lambda profile: "sink"),
+            mock.patch.object(speaker_calibrate, "start_loudness_tracker", lambda: calls.append("start")),
+            mock.patch.object(speaker_calibrate, "stop_loudness_tracker", lambda: calls.append("stop")),
+        ]
+        for patch in patches:
+            patch.start(); self.addCleanup(patch.stop)
+        base = {"quality": {"accepted": True}, "fit": {"filters": []}, "speaker": {"name": "s"}}
+        speaker_calibrate.install_now({**base, "loudness_compensation": "on"})
+        speaker_calibrate.install_now({**base, "loudness_compensation": "off"})
+        self.assertEqual(calls, ["start", "stop"])
+
+
+class PreviewDecisionTests(unittest.TestCase):
+    """A new calibration plays and waits; apply or keep the previous."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory(); root = Path(self.folder.name)
+        self.data = root / "data"; self.data.mkdir(0o700)
+        self.paths = {name: self.data / f"{name}.json" for name in ("active-profile", "previous-profile", "held-profile", "held-previous", "compare-state")}
+        self.activated = []
+        def fake_install_now(profile):
+            # What the real one does to the files: the current moves to previous, the new becomes current.
+            current = speaker_calibrate.load_profile(speaker_calibrate.PROFILE)
+            if current is not None:
+                speaker_calibrate.write_atomic(speaker_calibrate.PREVIOUS_PROFILE, json.dumps(current))
+            speaker_calibrate.write_atomic(speaker_calibrate.PROFILE, json.dumps(profile))
+            self.activated.append(("install", profile["created_at"])); return dict(profile, installed=True)
+        patches = [
+            mock.patch.object(speaker_calibrate, "DATA", self.data),
+            mock.patch.object(speaker_calibrate, "PROFILE", self.paths["active-profile"]),
+            mock.patch.object(speaker_calibrate, "PREVIOUS_PROFILE", self.paths["previous-profile"]),
+            mock.patch.object(speaker_calibrate, "HELD_PROFILE", self.paths["held-profile"]),
+            mock.patch.object(speaker_calibrate, "HELD_PREVIOUS", self.paths["held-previous"]),
+            mock.patch.object(speaker_calibrate, "COMPARE_STATE", self.paths["compare-state"]),
+            mock.patch.object(speaker_calibrate, "install_now", fake_install_now),
+            mock.patch.object(speaker_calibrate, "reinstall_profile", lambda profile: self.activated.append(("reinstall", profile["created_at"])) or "live"),
+            mock.patch.object(speaker_calibrate, "compare_toggle", lambda: self.activated.append(("compare", None))),
+        ]
+        for patch in patches:
+            patch.start(); self.addCleanup(patch.stop)
+        self.addCleanup(self.folder.cleanup)
+
+    def profile(self, stamp):
+        return {"created_at": stamp, "fit": {"filters": []}, "speaker": {"name": "s"}, "quality": {"accepted": True}}
+
+    def test_the_first_calibration_installs_and_nothing_waits(self):
+        result = speaker_calibrate.preview_install(self.profile("first"))
+        self.assertNotIn("previewing", result)
+        self.assertFalse(speaker_calibrate.previewing())
+
+    def test_keeping_the_previous_puts_both_slots_back(self):
+        self.paths["active-profile"].write_text(json.dumps(self.profile("old"))); self.paths["previous-profile"].write_text(json.dumps(self.profile("older")))
+        result = speaker_calibrate.preview_install(self.profile("new"))
+        self.assertTrue(result["previewing"]); self.assertTrue(speaker_calibrate.previewing())
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PROFILE)["created_at"], "new")
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "old")
+        # A second measurement while waiting keeps the original held copies.
+        speaker_calibrate.preview_install(self.profile("newer"))
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.HELD_PROFILE)["created_at"], "old")
+        decided = speaker_calibrate.preview_discard()
+        self.assertEqual(decided["profile"]["created_at"], "old")
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PROFILE)["created_at"], "old")
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "older")
+        self.assertFalse(speaker_calibrate.previewing())
+        self.assertEqual(self.activated[-1], ("reinstall", "old"))
+
+    def test_applying_keeps_the_new_one_and_the_old_one_under_switch_profile(self):
+        self.paths["active-profile"].write_text(json.dumps(self.profile("old")))
+        speaker_calibrate.preview_install(self.profile("new"))
+        speaker_calibrate.write_compare_state({"active": "previous", "bypass": False})
+        decided = speaker_calibrate.preview_apply()
+        self.assertEqual(decided["profile"]["created_at"], "new")
+        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "old")
+        self.assertFalse(speaker_calibrate.previewing())
+        self.assertIn(("compare", None), self.activated)
+        with self.assertRaises(SystemExit):
+            speaker_calibrate.preview_apply()
+
+
+class VendorTrialTests(unittest.TestCase):
+    """Telling whose graph plays, and staging Omarchy's tree for a trial."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory(); root = Path(self.folder.name)
+        self.data = root / "data"; self.data.mkdir(0o700)
+        self.share = root / "omarchy"
+        (self.share / "bin").mkdir(parents=True); (self.share / "bin" / "omarchy-hw-match").write_text("#!/bin/sh\n")
+        (self.share / "default" / "audio" / "tunings" / "dell-xps-2026").mkdir(parents=True)
+        (self.share / "default" / "audio" / "tunings" / "dell-xps-2026" / "tuning.conf").write_text("match_sku=(x)\n")
+        (self.share / "default" / "audio" / "filter-chain-host.conf").write_text("host\n")
+        (self.share / "default" / "systemd" / "user").mkdir(parents=True)
+        (self.share / "default" / "systemd" / "user" / "omarchy-speaker-tuning.service").write_text("[Unit]\n")
+        self.patches = [
+            mock.patch.object(speaker_calibrate, "DATA", self.data),
+            mock.patch.object(speaker_calibrate, "FRAGMENT", self.data / "90-tuning.conf"),
+            mock.patch.object(speaker_calibrate, "VENDOR_TRIAL", self.data / "vendor-trial.json"),
+            mock.patch.object(speaker_calibrate, "VENDOR_OVERLAY", self.data / "omarchy-path"),
+            mock.patch.object(speaker_calibrate, "OMARCHY_SHARE", self.share),
+        ]
+        for patch in self.patches:
+            patch.start(); self.addCleanup(patch.stop)
+        self.addCleanup(self.folder.cleanup)
+
+    def test_whose_graph_is_playing(self):
+        fragment = self.data / "90-tuning.conf"
+        self.assertEqual(speaker_calibrate.graph_kind(), "none")
+        fragment.write_text("# Generated by Omarchy Speaker Calibrator. Boosts...\ncontext.modules = []\n")
+        self.assertEqual(speaker_calibrate.graph_kind(), "calibrator")
+        fragment.write_text("# SLIMBOOK Executive speaker tuning.\n#\n# Fitted by the Omarchy Speaker Calibrator 1.1.0 from...\n")
+        self.assertEqual(speaker_calibrate.graph_kind(), "vendor-trial")
+        fragment.write_text("# Dell XPS 14 / XPS 16 (2026) speaker tuning.\ncontext.modules = []\n")
+        self.assertEqual(speaker_calibrate.graph_kind(), "other")
+        (self.data / "vendor-trial.json").write_text('{"slug": "x"}')
+        self.assertFalse(speaker_calibrate.vendor_trial_active())
+        fragment.write_text("# x speaker tuning.\n# Fitted by the Omarchy Speaker Calibrator\n")
+        self.assertTrue(speaker_calibrate.vendor_trial_active())
+
+    def test_a_trial_beside_the_calibration_gets_its_own_names_and_the_real_target(self):
+        chain = ('capture.props = { node.name = "omarchy_speaker_tuning" }\n'
+                 'playback.props = { node.name = "omarchy_speaker_tuning_output" target.object = "@SPEAKER_SINK@" }\n'
+                 'node.description = "Laptop Speakers"\n')
+        graph = speaker_calibrate.trial_graph(chain, "alsa_output.pci-test.analog-stereo")
+        self.assertIn('node.name = "omarchy_speaker_trial" ', graph)
+        self.assertIn('node.name = "omarchy_speaker_trial_output"', graph)
+        self.assertIn('target.object = "alsa_output.pci-test.analog-stereo"', graph)
+        self.assertNotIn("omarchy_speaker_tuning", graph)
+        self.assertNotIn("@SPEAKER_SINK@", graph)
+        self.assertIn("omarchy-speaker-trial.conf", speaker_calibrate.TRIAL_UNIT_TEXT)
+        self.assertNotIn("omarchy-speaker-tuning.conf", speaker_calibrate.TRIAL_UNIT_TEXT)
+
+    def test_the_overlay_links_omarchy_and_holds_only_the_rendered_tuning(self):
+        rendered = {"slug": "slimbook-executive", "tuning": 'description="x"\n', "chain": "context.modules = []\n"}
+        overlay = speaker_calibrate.build_vendor_overlay(rendered)
+        self.assertTrue((overlay / "bin").is_symlink())
+        self.assertEqual((overlay / "bin").resolve(), (self.share / "bin").resolve())
+        self.assertTrue((overlay / "default" / "systemd").is_symlink())
+        self.assertTrue((overlay / "default" / "audio" / "filter-chain-host.conf").is_symlink())
+        tunings = overlay / "default" / "audio" / "tunings"
+        self.assertFalse(tunings.is_symlink())
+        self.assertEqual(sorted(p.name for p in tunings.iterdir()), ["slimbook-executive"])
+        conf = tunings / "slimbook-executive" / "tuning.conf"
+        self.assertFalse(conf.is_symlink())
+        self.assertEqual(conf.read_text(), 'description="x"\n')
+        # Rebuilt from scratch on every trial.
+        speaker_calibrate.build_vendor_overlay({**rendered, "slug": "other-machine"})
+        self.assertEqual(sorted(p.name for p in tunings.iterdir()), ["other-machine"])
+
+
+
+class FakeRecorder:
+    """Stands in for the pw-record Popen object."""
+
+    def __init__(self, *, hangs=False):
+        self.signals = []
+        self.killed = False
+        self.hangs = hangs
+        self.waits = 0
+
+    def poll(self):
+        return None if not self.signals and not self.killed else 0
+
+    def send_signal(self, signum):
+        self.signals.append(signum)
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        if self.hangs and not self.killed:
+            raise subprocess.TimeoutExpired("pw-record", timeout)
+        return 0
+
+
+class PluginDirectoryHygieneTests(unittest.TestCase):
+    """The helper must never write into the plugin directory (issue #2)."""
+
+    def test_importing_the_helper_switches_bytecode_writing_off(self):
+        self.assertTrue(sys.dont_write_bytecode)
+        source = Path(speaker_calibrate.__file__).read_text()
+        self.assertLess(source.index("sys.dont_write_bytecode = True"),
+                        source.index("from calibration_io import"))
+
+    def test_tracker_does_the_same_before_loading_the_helper(self):
+        source = (Path(speaker_calibrate.__file__).parent / "loudness-tracker.py").read_text()
+        self.assertLess(source.index("sys.dont_write_bytecode = True"), source.index("HELPER ="))
+
+
+class RecorderCleanupTests(unittest.TestCase):
+    """A cancelled or failed measurement leaves no pw-record behind (issue #1)."""
+
+    def test_playback_failure_still_stops_the_recorder(self):
+        recorder = FakeRecorder()
+        with mock.patch.object(speaker_calibrate.subprocess, "Popen", return_value=recorder) as popen, \
+                mock.patch.object(speaker_calibrate, "run", side_effect=subprocess.CalledProcessError(1, "pw-play")), \
+                mock.patch.object(speaker_calibrate.time, "sleep"):
+            with self.assertRaises(subprocess.CalledProcessError):
+                speaker_calibrate.record_while_playing(
+                    "alsa_output.synthetic", "mic", 1, Path("/tmp/p.wav"), Path("/tmp/r.wav"), 0, 0)
+        self.assertEqual(recorder.signals, [speaker_calibrate.signal.SIGINT])
+        self.assertEqual(recorder.waits, 1)
+        # The recorder is told to follow the helper if the helper is killed outright.
+        self.assertIs(popen.call_args.kwargs["preexec_fn"], speaker_calibrate.die_with_parent)
+
+    def test_a_recorder_that_ignores_sigint_is_killed(self):
+        recorder = FakeRecorder(hangs=True)
+        speaker_calibrate.stop_recorder(recorder)
+        self.assertEqual(recorder.signals, [speaker_calibrate.signal.SIGINT])
+        self.assertTrue(recorder.killed)
+
+    def test_an_already_finished_recorder_is_not_signalled(self):
+        recorder = FakeRecorder()
+        recorder.killed = True  # poll() reports it gone
+        speaker_calibrate.stop_recorder(recorder)
+        self.assertEqual(recorder.signals, [])
+
+    def test_sigterm_becomes_a_normal_exit(self):
+        with self.assertRaises(SystemExit) as caught:
+            speaker_calibrate.exit_on_terminate(speaker_calibrate.signal.SIGTERM, None)
+        self.assertEqual(caught.exception.code, 143)
+
+
+
+def load_tracker():
+    path = Path(speaker_calibrate.__file__).parent / "loudness-tracker.py"
+    spec = importlib.util.spec_from_file_location("loudness_tracker", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class LoudnessRampTests(unittest.TestCase):
+    """A volume change reaches the graph as a short ramp, not one jump."""
+
+    def test_a_small_change_is_one_write_of_the_whole_target(self):
+        start = speaker_calibrate.loudness_controls(-20.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(-20.3, True, 1.0)
+        self.assertEqual(speaker_calibrate.loudness_ramp(start, target), [target])
+
+    def test_a_volume_step_is_walked_in_half_decibel_writes(self):
+        # Levels above the compensator's floor, where a step still moves it;
+        # in this range the contour level moves twice as far as the volume.
+        start = speaker_calibrate.loudness_controls(-8.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(-7.25, True, 1.0)
+        ramp = speaker_calibrate.loudness_ramp(start, target)
+        self.assertEqual(len(ramp), 3)
+        self.assertEqual(ramp[-1], target)
+        for write in ramp[:-1]:
+            self.assertEqual(set(write), {"loudcomp:volume", "limiter:g_in"})
+        volumes = [start["loudcomp:volume"]] + [w["loudcomp:volume"] for w in ramp]
+        gains = [start["limiter:g_in"]] + [w["limiter:g_in"] for w in ramp]
+        for before, after in zip(volumes, volumes[1:]):
+            self.assertAlmostEqual(after - before, 0.5, places=2)
+        # The make-up walks in decibels too, so the two never drift apart.
+        for before, after in zip(gains, gains[1:]):
+            self.assertAlmostEqual(20 * np.log10(after / before), 20 * np.log10(target["limiter:g_in"] / start["limiter:g_in"]) / 3, places=3)
+
+    def test_a_large_jump_takes_bigger_steps_instead_of_lagging(self):
+        start = speaker_calibrate.loudness_controls(-15.0, True, 1.0)
+        target = speaker_calibrate.loudness_controls(0.0, True, 1.0)
+        ramp = speaker_calibrate.loudness_ramp(start, target)
+        self.assertEqual(len(ramp), speaker_calibrate.LOUDNESS_RAMP_MAX_WRITES)
+        self.assertEqual(ramp[-1], target)
+
+
+class FakeTrackerHelper:
+    """The slice of the helper the tracker touches, with writes recorded."""
+
+    def __init__(self):
+        self.writes = []
+        self.loudness_controls = speaker_calibrate.loudness_controls
+        self.loudness_ramp = speaker_calibrate.loudness_ramp
+
+    def tuning_node_id(self):
+        return 7
+
+    def write_controls(self, node, controls):
+        self.writes.append((node, dict(controls)))
+        return True
+
+
+class TrackerRampTests(unittest.TestCase):
+    def setUp(self):
+        self.module = load_tracker()
+        self.helper = FakeTrackerHelper()
+        self.tracker = self.module.Tracker(self.helper)
+        self.tracker.node = 7
+        self.tracker.input_gain = 1.0
+
+    def test_the_first_level_is_applied_in_one_write(self):
+        with mock.patch.object(self.module.time, "sleep"):
+            self.assertTrue(self.tracker.apply(-20.0))
+        self.assertEqual(len(self.helper.writes), 1)
+        self.assertEqual(self.tracker.applied_db, -20.0)
+
+    def test_a_later_level_is_ramped_from_the_applied_one(self):
+        self.tracker.applied_db = -8.0
+        with mock.patch.object(self.module.time, "sleep") as sleep:
+            self.assertTrue(self.tracker.apply(-6.5))
+        expected = speaker_calibrate.loudness_ramp(
+            speaker_calibrate.loudness_controls(-8.0, True, 1.0),
+            speaker_calibrate.loudness_controls(-6.5, True, 1.0))
+        self.assertGreater(len(expected), 1)
+        self.assertEqual([w for _, w in self.helper.writes], expected)
+        self.assertEqual(sleep.call_count, len(expected) - 1)
+        self.assertEqual(self.tracker.applied_db, -6.5)
+
+    def test_switching_off_is_immediate(self):
+        self.tracker.applied_db = -20.0
+        with mock.patch.object(self.module.time, "sleep"):
+            self.assertTrue(self.tracker.apply(0.0, enabled=False))
+        self.assertEqual(len(self.helper.writes), 1)
+        self.assertIsNone(self.tracker.applied_db)
+
+    def test_a_burst_of_volume_events_is_applied_once(self):
+        import os
+        read_end, write_end = os.pipe()
+        os.write(write_end, b"Event 'change' on sink #59\n" * 5)
+        os.close(write_end)
+
+        class FakeSubscription:
+            stdout = os.fdopen(read_end, "rb", buffering=0)
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+            def kill(self): pass
+
+        followed = []
+        self.tracker.follow_volume = lambda: followed.append(True) or True
+        with mock.patch.object(self.module.subprocess, "Popen", return_value=FakeSubscription()):
+            self.assertFalse(self.tracker.watch())  # the subscription ended
+        self.assertEqual(followed, [True])
+
+
+
+class MicrophoneArchiveIdentityTests(unittest.TestCase):
+    """One record is kept per kind; the panel must know which device made it."""
+
+    def test_the_summary_carries_the_device_name_when_the_record_has_it(self):
+        directory = Path(tempfile.mkdtemp())
+        (directory / "external.json").write_text(json.dumps({
+            "kind": "external", "created_at": "2026-09-16T20:55:00+00:00",
+            "microphone": "Usb Microphone Mono",
+            "microphone_name": "alsa_input.usb-Usb_Microphone-00.mono-fallback",
+            "calibration_file": None, "verdict": "warning",
+        }))
+        (directory / "internal.json").write_text(json.dumps({
+            "kind": "internal", "created_at": "2026-09-09T20:26:00+00:00",
+            "microphone": "Built-in Audio Analog Stereo", "calibration_file": None, "verdict": "pass",
+        }))
+        saved = speaker_calibrate.MICROPHONE_ARCHIVE
+        speaker_calibrate.MICROPHONE_ARCHIVE = directory
+        try:
+            found = speaker_calibrate.archived_microphones()
+        finally:
+            speaker_calibrate.MICROPHONE_ARCHIVE = saved
+        self.assertEqual(found["external"]["name"], "alsa_input.usb-Usb_Microphone-00.mono-fallback")
+        self.assertEqual(found["external"]["microphone"], "Usb Microphone Mono")
+        # A record from before the name was kept: the panel falls back to the label.
+        self.assertEqual(found["internal"]["name"], "")
+        self.assertEqual(found["internal"]["warnings"], [])
+
+    def test_the_summary_carries_the_reasons_for_a_warning(self):
+        directory = Path(tempfile.mkdtemp())
+        (directory / "external.json").write_text(json.dumps({
+            "kind": "external", "created_at": "2026-09-16T20:45:00+00:00", "microphone": "m",
+            "microphone_name": "n", "calibration_file": None, "verdict": "warning",
+            "warnings": ["The accepted test signal peaked at only -21.5 dBFS.", "<b>x</b>", 7],
+        }))
+        saved = speaker_calibrate.MICROPHONE_ARCHIVE
+        speaker_calibrate.MICROPHONE_ARCHIVE = directory
+        try:
+            found = speaker_calibrate.archived_microphones()
+        finally:
+            speaker_calibrate.MICROPHONE_ARCHIVE = saved
+        reasons = found["external"]["warnings"]
+        self.assertEqual(reasons[0], "The accepted test signal peaked at only -21.5 dBFS.")
+        self.assertEqual(len(reasons), 2)
+        self.assertNotIn("<", reasons[1])
+
+    def test_the_panel_matches_a_row_to_its_own_record_only(self):
+        source = (Path(speaker_calibrate.__file__).parent / "Panel.qml").read_text()
+        note = source[source.index("function microphoneRecord"):source.index("function calibrationMicrophone")]
+        self.assertIn("record.name === entry.name", note)
+        self.assertIn("record.microphone === entry.description", note)
+        self.assertIn("active.name === entry.name", note)
+        self.assertNotIn("active.internal === entry.internal", note)
+        self.assertIn("record.warnings", note)
+
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    """The panel must not forget a hand-picked device when its lists refresh."""
+
+    def setUp(self):
+        self.source = (Path(speaker_calibrate.__file__).parent / "Panel.qml").read_text()
+        start = self.source.index("function selectDevices()")
+        self.select = self.source[start:self.source.index("\n  }\n", start)]
+
+    def test_a_refresh_no_longer_reselects_the_built_in_devices(self):
+        self.assertNotIn("selectInternalDevices", self.source)
+        self.assertIn("function onMicrophonesChanged() { root.selectDevices() }", self.source)
+        self.assertIn("function onSinksChanged() { root.selectDevices() }", self.source)
+
+    def test_the_order_is_hand_pick_then_the_calibration_then_built_in(self):
+        chosen = self.select.index("deviceIndex(service.microphones, root.chosenMic)")
+        calibrated = self.select.index("(profile.microphone || {}).name")
+        builtin = self.select.index("firstInternal(service.microphones)")
+        self.assertLess(chosen, calibrated)
+        self.assertLess(calibrated, builtin)
+        chosen = self.select.index("deviceIndex(service.sinks, root.chosenSink)")
+        calibrated = self.select.index("(profile.speaker || {}).name")
+        builtin = self.select.index("firstInternal(service.sinks)")
+        self.assertLess(chosen, calibrated)
+        self.assertLess(calibrated, builtin)
+
+    def test_pipewire_s_default_decides_between_built_in_microphones_only(self):
+        calibrated = self.select.index("(profile.microphone || {}).name")
+        default = self.select.index("defaultInternal(service.microphones)")
+        builtin = self.select.index("firstInternal(service.microphones)")
+        self.assertLess(calibrated, default)
+        self.assertLess(default, builtin)
+        start = self.source.index("function defaultInternal(list)")
+        helper = self.source[start:self.source.index("\n  }\n", start)]
+        # A dock's webcam as the default source must not displace the laptop's
+        # own microphone without being picked.
+        self.assertIn("list[index].default === true && list[index].internal === true", helper)
+        self.assertNotIn("defaultInternal(service.sinks)", self.select)
+
+    def test_a_click_is_remembered_by_name(self):
+        self.assertIn("root.chosenMic = modelData.name", self.source)
+        self.assertIn("root.chosenSink = modelData.name", self.source)
+        self.assertIn("root.chosenChannel = currentIndex", self.source)
 
 
 if __name__ == "__main__":

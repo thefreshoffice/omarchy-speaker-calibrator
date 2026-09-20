@@ -621,12 +621,16 @@ def _quality_summary(
             "corrections shrink where the noise floor is close."
         )
         guidance.append("Reduce background noise or raise the level, then measure again.")
+    # Neither of these is a defect in the measurement, and each would hold
+    # for every measurement made this way, so a verdict that carried them
+    # could never say "pass" and would hide the warnings that do vary.
+    # They are advice, and go where advice goes.
     if internal_mic:
-        warnings.append(
-            "Built-in microphone mode is a relative estimate; chassis coupling and unknown mic response remain."
+        guidance.append(
+            "Built-in microphone mode is a relative estimate; chassis coupling and the unknown "
+            "microphone response remain. An external measuring microphone is more reliable."
         )
     elif calibration is None:
-        warnings.append("No microphone calibration file was supplied.")
         guidance.append("For final tuning, load the serial-number calibration file for this microphone.")
     if background_dbfs > -35.0:
         warnings.append(f"Recorded background level is high ({background_dbfs:.1f} dBFS).")
@@ -1284,8 +1288,8 @@ def analyse_level_probe(
     prominences = [dbfs(loud[index]) - dbfs(noise[index]) for index in range(channels)]
     best = int(np.argmax(prominences))
 
-    crest_db = 20.0 * np.log10(region_peak / np.maximum(region_rms, 1e-12))
-    tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
+    crest_db = 20.0 * np.log10(np.maximum(region_peak, 1e-12) / np.maximum(region_rms, 1e-12))
+    tonal = (region_peak > 0.0) & (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
     tonal_peak = float(np.max(region_peak[tonal])) if np.any(tonal) else 0.0
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
     loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]

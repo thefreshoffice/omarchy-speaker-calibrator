@@ -27,16 +27,29 @@ much bass, and leaving its make-up behind would be heard as too loud.
 """
 
 import importlib.util
+import select
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+# Loading the helper compiles it, and the bytecode must not land in the plugin
+# directory: Omarchy's shell reloads the plugin on any change there. Same rule,
+# same place as in the helper itself.
+sys.dont_write_bytecode = True
+
 HELPER = Path(__file__).resolve().parent / "speaker-calibrate.py"
 # Below this the change is inaudible and not worth a round of control writes.
 VOLUME_EPSILON_DB = 0.4
 RETRY_SECONDS = 2.0
+# Between the writes of one ramp; a write itself takes about fifteen.
+RAMP_INTERVAL_SECONDS = 0.02
+# A held volume key fires a change every forty milliseconds or so. Applying
+# each one is heard as a crackle, so a burst is followed to its end and the
+# level it ended at is applied once; the limit keeps a slider drag responsive.
+SETTLE_SECONDS = 0.12
+SETTLE_LIMIT_SECONDS = 0.6
 
 
 def load_helper():
@@ -83,10 +96,23 @@ class Tracker:
         node = self.find_node()
         if node is None:
             return False
-        controls = self.helper.loudness_controls(volume_db, enabled, self.input_gain)
-        if not self.helper.write_controls(node, controls):
-            self.node = None
-            return False
+        target = self.helper.loudness_controls(volume_db, enabled, self.input_gain)
+        if enabled and self.applied_db is not None:
+            # Known start, so the change can be walked rather than jumped.
+            start = self.helper.loudness_controls(self.applied_db, True, self.input_gain)
+            writes = self.helper.loudness_ramp(start, target)
+        else:
+            # The first write after a start also carries the limiter's timing:
+            # a graph loaded from a file written by an older version still has
+            # the limiter on the defaults that were audible on bass.
+            timing = getattr(self.helper, "limiter_timing_controls", dict)()
+            writes = [dict(target, **timing)]
+        for index, controls in enumerate(writes):
+            if index:
+                time.sleep(RAMP_INTERVAL_SECONDS)
+            if not self.helper.write_controls(node, controls):
+                self.node = None
+                return False
         self.applied_db = volume_db if enabled else None
         return True
 
@@ -140,18 +166,36 @@ class Tracker:
     def watch(self):
         """Follow every sink change for as long as the subscription lives."""
         try:
+            # Unbuffered, so that select() below sees exactly what is unread.
             events = subprocess.Popen(
-                ["pactl", "subscribe"], stdout=subprocess.PIPE, text=True
+                ["pactl", "subscribe"], stdout=subprocess.PIPE, bufsize=0
             )
         except OSError:
             return False
         try:
-            for line in events.stdout:
+            out = events.stdout
+            while True:
+                line = out.readline()
+                if not line:
+                    return False
                 if not self.running:
                     return True
-                if "on sink" in line and not self.follow_volume():
+                if b"on sink" not in line:
+                    continue
+                # Let a burst of changes end before acting on it.
+                ended = False
+                deadline = time.monotonic() + SETTLE_LIMIT_SECONDS
+                while time.monotonic() < deadline:
+                    ready, _, _ = select.select([out], [], [], SETTLE_SECONDS)
+                    if not ready:
+                        break
+                    if not out.readline():
+                        ended = True
+                        break
+                if not self.follow_volume():
                     return False
-            return False
+                if ended:
+                    return False
         finally:
             events.terminate()
             try:

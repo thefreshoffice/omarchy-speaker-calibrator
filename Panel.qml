@@ -32,6 +32,11 @@ Panel {
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
   property int micIndex: -1
+  // The devices picked by hand, by name.  A row index means nothing once the
+  // list is fetched again, and it is fetched every time the panel opens.
+  property string chosenSink: ""
+  property string chosenMic: ""
+  property int chosenChannel: 0
 
   function open() {
     root.controller.show()
@@ -79,18 +84,65 @@ Panel {
     var mic = service.microphones[root.micIndex]
     return mic ? mic.internal === true : true
   }
-  // Zero-knowledge default: the laptop's own speakers and microphones.
-  function selectInternalDevices() {
-    var sink = -1
-    for (var sinkIndex = 0; sinkIndex < service.sinks.length; sinkIndex++)
-      if (service.sinks[sinkIndex].internal === true) { sink = sinkIndex; break }
-    root.sinkIndex = sink >= 0 ? sink : (service.sinks.length > 0 ? 0 : -1)
-    var mic = -1
-    for (var defaultIndex = 0; defaultIndex < service.microphones.length; defaultIndex++)
-      if (service.microphones[defaultIndex].default === true) { mic = defaultIndex; break }
-    for (var micIndex = 0; micIndex < service.microphones.length; micIndex++)
-      if (mic < 0 && service.microphones[micIndex].internal === true) { mic = micIndex; break }
-    root.micIndex = mic >= 0 ? mic : (service.microphones.length > 0 ? 0 : -1)
+  function deviceIndex(list, name) {
+    if (!name) return -1
+    for (var index = 0; index < list.length; index++)
+      if (list[index].name === name) return index
+    return -1
+  }
+  // A headset jack is listed as a microphone whether or not anything is in
+  // it, on some laptops as a built-in one.  PipeWire says when a jack is
+  // empty, and an empty one is never the automatic choice.
+  function firstInternal(list) {
+    for (var index = 0; index < list.length; index++)
+      if (list[index].internal === true && list[index].available !== false) return index
+    for (var any = 0; any < list.length; any++)
+      if (list[any].internal === true) return any
+    return list.length > 0 ? 0 : -1
+  }
+  // A laptop can expose an unplugged analog jack beside its real microphone
+  // array, in either order.  PipeWire's default settles which built-in one
+  // works; a default that is not built in (a dock's webcam, a headset) is
+  // left to be picked by hand.
+  function defaultInternal(list) {
+    for (var index = 0; index < list.length; index++)
+      if (list[index].default === true && list[index].internal === true
+          && list[index].available !== false) return index
+    return -1
+  }
+  // Which rows are selected, decided afresh whenever the lists or the status
+  // arrive: the device picked by hand while it is connected, else the one the
+  // calibration in use was made with, else the laptop's own (PipeWire's
+  // default microphone when it is one of them).  Re-selecting
+  // the built-in devices on every refresh forgot the choice each time the
+  // panel was opened.
+  function selectDevices() {
+    var profile = service.status.profile || {}
+    // A pick made before the shell was restarted counts as a pick.
+    var kept = service.chosen || {}
+    if (root.chosenSink === "" && kept.sink) root.chosenSink = kept.sink
+    if (root.chosenMic === "" && kept.mic) {
+      root.chosenMic = kept.mic
+      root.chosenChannel = Math.max(0, Number(kept.channel) || 0)
+    }
+    var sink = deviceIndex(service.sinks, root.chosenSink)
+    if (sink < 0) sink = deviceIndex(service.sinks, (profile.speaker || {}).name)
+    if (sink < 0) sink = firstInternal(service.sinks)
+    root.sinkIndex = sink
+    var mic = deviceIndex(service.microphones, root.chosenMic)
+    if (mic < 0) mic = deviceIndex(service.microphones, (profile.microphone || {}).name)
+    if (mic < 0) mic = defaultInternal(service.microphones)
+    if (mic < 0) mic = firstInternal(service.microphones)
+    var before = root.micIndex >= 0 && service.microphones[root.micIndex]
+      ? service.microphones[root.micIndex].name : ""
+    var after = mic >= 0 ? service.microphones[mic].name : ""
+    root.micIndex = mic
+    // A different microphone has different channels; the same one keeps its
+    // channel, which the refreshed list would otherwise reset.
+    if (before !== "" && before !== after) root.chosenChannel = 0
+    Qt.callLater(function () {
+      channelBox.currentIndex = Math.max(0, Math.min(root.chosenChannel, channelBox.count - 1))
+    })
   }
 
   // ---- options -------------------------------------------------------------
@@ -102,10 +154,18 @@ Panel {
     return service.proposal !== null && service.proposal !== undefined
       && service.proposal.measurement !== undefined
   }
-  // A saved measurement is re-fitted and applied at once, so a toggle is heard
-  // immediately.  Without one the options simply wait for the next calibration.
+  // The two switches move only the bass shelf and the make-up gain, which the
+  // fit already holds for every combination, so they are applied live, in a
+  // fraction of a second.  A different voicing or channel trim changes the fit
+  // itself and goes through a refit; without any measurement the options
+  // simply wait for the next calibration.
   function applyOptions() {
-    if (root.hasMeasurement()) service.refit(root.options(), true)
+    var profile = service.status.profile
+    if (profile && service.status.enabled
+        && (profile.voicing || "neutral") === root.voicingMode
+        && (profile.channel_trim || "off") === root.channelTrimMode)
+      service.relevel(root.options())
+    else if (root.hasMeasurement()) service.refit(root.options(), true)
   }
   function adoptOptions(profile) {
     if (!profile) return
@@ -117,50 +177,50 @@ Panel {
 
   // One line under the Deep bass switch: what it is, or what pressing it does.
   function deepBassDescription() {
-    var addon = service.status.bassEnhancer || {}
-    if (addon.installed === true && addon.usable !== true)
-      return "The installed add-on is not the one this expects, so it is left out."
-    if (addon.usable !== true)
-      return "Your speakers are too small to make low notes at all. This plays their "
-        + "harmonics instead, and your ear fills in the note that is missing. "
-        + "It needs a small free add-on"
-        + (addon.source && addon.source !== "AUR" ? " from the " + addon.source + " repository" : "")
-        + "; press to install it."
     return service.status.deepBass === "on"
       ? "On. Low notes are suggested by their harmonics, which these speakers can play."
-      : "Off. Press to hear low notes suggested by their harmonics."
-  }
-  // Shown before anything is installed, and only when the package would be
-  // built from source rather than installed from a curated repository.
-  function bassWarningText() {
-    var addon = service.status.bassEnhancer || {}
-    if (addon.usable === true) return ""
-    if (addon.source && addon.source !== "pinned-source") return ""
-    var pin = addon.pin || {}
-    return "This add-on is not one of Omarchy's own packages. It is built from source "
-      + "on your machine, from one fixed upstream release that this plugin names by "
-      + "its exact commit (bankstown " + String(pin.version || "") + ", "
-      + String(pin.commit || "").slice(0, 12) + ") and checks before building; "
-      + "nothing is taken from the AUR. Building needs the Rust toolchain from "
-      + "Omarchy's own repositories, installed if it is missing, and pacman asks for "
-      + "your password in a terminal window. You can read the source first at "
-      + "github.com/chadmed/bankstown."
+      : "Off. Your speakers are too small to make low notes at all; on, this plays their "
+        + "harmonics instead and your ear fills in the note that is missing."
   }
   // "Recalibrate" says nothing about which microphone did the one in use.
   // Each row now carries its own history: whether it has measured at all,
   // when, and whether that measurement is the calibration playing right now.
-  function microphoneNote(entry) {
+  // One record is kept per kind, so with several external microphones
+  // connected it belongs to one of them: the device it names, or for a
+  // record from before the device was kept, the one with its label.
+  function microphoneRecord(entry) {
     var archive = (service.status.microphones || {})
     var record = entry.internal ? archive.internal : archive.external
+    if (!record) return null
+    var ownRecord = record.name ? record.name === entry.name
+                                : record.microphone === entry.description
+    return ownRecord ? record : null
+  }
+  function microphoneNote(entry) {
+    var record = microphoneRecord(entry)
     if (!record) return "Never measured"
-    // One short line that fits: a date, whether this is the calibration
-    // playing, and a word about its quality only when there is one to say.
+    // One short line that fits: a date and whether this is the calibration
+    // playing.  The verdict follows as its own word, because it is a button.
     var when = Qt.formatDate(new Date(record.created_at), "d MMM yyyy")
     var active = ((service.status.profile || {}).microphone || {})
     var parts = ["Measured " + when]
-    if (active.internal === entry.internal) parts.push("the calibration in use")
-    if (record.verdict && record.verdict !== "pass") parts.push(record.verdict)
+    if (active.name === entry.name) parts.push("the calibration in use")
     return parts.join("  ·  ")
+  }
+  // A verdict other than pass, as one word; its reasons wait behind a click
+  // on it, so the caption stays one line until someone asks.
+  function microphoneVerdict(entry) {
+    var record = microphoneRecord(entry)
+    if (!record || !record.verdict || record.verdict === "pass") return ""
+    return record.verdict
+  }
+  function microphoneReasons(entry) {
+    var record = microphoneRecord(entry)
+    if (!record) return ""
+    var reasons = (record.warnings || []).filter(function (text) { return text })
+    // An older record kept only the word.
+    if (!reasons.length) return "No reasons were kept for this measurement; measure again to see them."
+    return reasons.join("\n")
   }
   // A check is only a check when it is made with the microphone the
   // calibration was made with, on the same channels: another microphone
@@ -185,6 +245,35 @@ Panel {
         + String(mic.description || mic.name) + "), which is not connected"
     return "Measure again with the " + kind + " this calibration was made with, "
       + "through the corrected output, and compare it with the plan"
+  }
+  // A loaded calibration says where it came from, and whether that is here.
+  function importedNote() {
+    var imported = service.proposal ? service.proposal.imported : null
+    if (!imported) return ""
+    var matches = imported.matches || {}
+    var file = String(imported.file || "a shared file")
+    var from = String((imported.hardware || {}).label || "another machine")
+    if (matches.machine === true)
+      return "Loaded from " + file + ", made on this model (" + from + ")"
+        + (matches.speakers === true ? "." : ", through a different speaker device; it now points at yours.")
+    return "Loaded from " + file + ". It was made on " + from + "; this is "
+      + String(imported.this_machine || "a different machine")
+      + ". Speakers differ between models, so it may sound wrong here. Install it to try; "
+      + "Switch profile brings your own back."
+  }
+  function importedMismatch() {
+    var imported = service.proposal ? service.proposal.imported : null
+    return !!(imported && imported.matches && imported.matches.machine !== true)
+  }
+  function sharedDescription(entry) {
+    if (!entry || entry.valid !== true)
+      return "Cannot be loaded: " + String((entry || {}).reason || "not a calibration file")
+    var matches = entry.matches || {}
+    var parts = []
+    if (entry.microphone) parts.push(String(entry.microphone))
+    if (entry.created_at) parts.push(String(entry.created_at).slice(0, 10))
+    parts.push(matches.machine === true ? "made on this model" : "made on another model, warning on load")
+    return parts.join("  ·  ")
   }
   function currentOutputName() {
     return service.status.defaultSinkDescription
@@ -330,7 +419,15 @@ Panel {
       + "down you play. The loudness stays the same either way; only the tone moves."
   }
   function heroMeta() {
-    if (service.busy) return service.message
+    if (service.working) return service.message
+    if (service.status.previewing === true)
+      return "A new calibration is playing and waits for your decision below."
+    if (service.status.vendorTrial === true)
+      return service.status.graph === "vendor-trial"
+        ? "Playing the exported Omarchy tuning through Omarchy's own installer; the calibration "
+          + "is stopped. Back to the calibration returns it."
+        : "Your music plays through the exported tuning, beside the calibration: the plain "
+          + "chain with its built-in deep bass, no compensation. Back to the calibration moves it back."
     if (!service.status.enabled) {
       // The commonest reason is the simplest: the sound went somewhere else.
       if (service.status.profile && service.status.service === "active")
@@ -584,7 +681,9 @@ Panel {
     implicitHeight: Math.max(Style.space(44), actionContent.implicitHeight + Style.space(16))
     color: Style.controlFill(false, _hot && enabled, root.foreground, Color.accent)
     borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal", root.foreground, Color.accent)
-    opacity: enabled ? 1.0 : 0.55
+    // Disabled rows dim, except during a quick switch: a quarter of a second
+    // of dimming reads as a flicker, and the click is simply ignored then.
+    opacity: enabled || (service.busy && !service.working) ? 1.0 : 0.55
     Behavior on color { ColorAnimation { duration: 100 } }
 
     Row {
@@ -875,14 +974,16 @@ Panel {
         root.adoptOptions(service.status.profile)
         root._optionsAdopted = true
       }
+      // The calibration's own devices are a default only once it is known.
+      root.selectDevices()
       eqCanvas.requestPaint()
       microphoneCanvas.requestPaint()
     }
     // New curves land in a canvas that is already showing, and a canvas in a
     // window that was closed and opened again comes back empty: paint on both.
     function onMicComparisonChanged() { microphoneCanvas.requestPaint() }
-    function onSinksChanged() { root.selectInternalDevices() }
-    function onMicrophonesChanged() { root.selectInternalDevices(); channelBox.currentIndex = 0 }
+    function onSinksChanged() { root.selectDevices() }
+    function onMicrophonesChanged() { root.selectDevices() }
     function onProposalChanged() { responseCanvas.requestPaint() }
   }
 
@@ -946,11 +1047,36 @@ Panel {
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
           }
+          // When the microphone that was picked hears nothing and the laptop
+          // has its own, the failure offers that one.  One press, for this
+          // measurement only: the pick stays what it was.
+          Button {
+            readonly property int offeredIndex: service.offer
+              ? root.deviceIndex(service.microphones, service.offer.microphone) : -1
+            visible: service.error !== "" && offeredIndex >= 0 && root.sinkIndex >= 0
+            width: parent.width
+            bordered: true
+            iconText: "󰍬"
+            // The label comes from the panel's own device list, never from the reply.
+            text: offeredIndex >= 0
+              ? "Measure with " + service.microphones[offeredIndex].description + " instead" : ""
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            enabled: !service.busy
+            onClicked: {
+              var mic = service.microphones[offeredIndex]
+              var channel = (mic.internal === true && Number(mic.channels || 1) > 1) ? "all" : 0
+              service.measure(service.sinks[root.sinkIndex].name, mic.name, channel, root.options(), "preview")
+            }
+          }
 
           Text {
             textFormat: Text.PlainText
-            visible: service.message !== "" && !service.busy
+            // Always present and at least one line tall, so a message coming
+            // and going never moves the rest of the panel: while something
+            // runs it says what, afterwards it says how it went.
             width: parent.width
+            height: Math.max(implicitHeight, Style.font.bodySmall * 1.45)
             text: service.message
             color: root.dim
             font.family: root.fontFamily
@@ -958,9 +1084,65 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          Column {
+            visible: service.status.previewing === true
+            width: parent.width
+            spacing: Style.space(6)
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "A new calibration was measured and is playing now"
+                + (service.status.profile && service.status.profile.created_at
+                   ? " (" + String(service.status.profile.created_at).slice(11, 16) + " UTC)" : "")
+                + ". Nothing is final yet: apply it, or keep the one you had. Hear the previous one "
+                + "switches between the two."
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
+            ActionRow {
+              width: parent.width
+              icon: "󰄾"
+              label: service.busy && service.phase === "previewapply" ? "Applying…" : "Apply the new calibration"
+              description: "Keeps it; the previous one stays available under Switch profile"
+              enabled: !service.busy
+              onClicked: service.applyPreview()
+            }
+            ActionRow {
+              width: parent.width
+              icon: "󰅖"
+              label: service.busy && service.phase === "previewdiscard" ? "Restoring…" : "Keep the previous calibration"
+              description: "Puts it back; the new measurement stays as the last measurement"
+              enabled: !service.busy
+              onClicked: service.discardPreview()
+            }
+            ActionRow {
+              visible: service.status.compare !== undefined && service.status.compare !== null
+                && service.status.compare.available === true
+              width: parent.width
+              icon: "󰓦"
+              label: service.busy && service.phase === "compare" ? "Switching…"
+                : ((service.status.compare || {}).active === "previous" ? "Hear the new one" : "Hear the previous one")
+              description: "Switches live between the two, level matched"
+              enabled: !service.busy
+              onClicked: service.compare()
+            }
+          }
+
+          ActionRow {
+            visible: service.status.vendorTrial === true
+            width: parent.width
+            icon: "󰓦"
+            label: service.busy && service.phase === "vendorrestore" ? "Coming back…" : "Back to the calibration"
+            description: "Moves the music back to the calibration, with its compensation; nothing restarts"
+            enabled: !service.busy
+            onClicked: service.vendorRestore()
+          }
+
           Text {
             textFormat: Text.PlainText
-            visible: !service.busy && service.proposal !== null && service.proposal !== undefined
+            visible: !service.working && service.proposal !== null && service.proposal !== undefined
               && service.proposal.quality !== undefined && service.proposal.quality.accepted === false
             width: parent.width
             text: root.qualityIssuesText() + (root.qualityGuidanceText() !== "" ? "\n" + root.qualityGuidanceText() : "")
@@ -972,7 +1154,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            visible: !service.busy && service.status.verification !== undefined
+            visible: !service.working && service.status.verification !== undefined
               && service.status.verification !== null
             width: parent.width
             text: service.status.verification && service.status.verification.stale
@@ -998,10 +1180,11 @@ Panel {
               label: "Loudness"
               description: "Fuller sound with more bass, like the loudness button on a stereo."
               checked: root.bassMode === "full"
-              enabled: !service.busy
+              enabled: !service.working
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: {
+                if (service.busy) return
                 root.bassMode = root.bassMode === "full" ? "normal" : "full"
                 root.applyOptions()
               }
@@ -1012,10 +1195,11 @@ Panel {
               label: "Make it louder"
               description: "Gives back the volume the correction takes away. At full volume the limiter works harder."
               checked: root.loudnessMode !== "protected"
-              enabled: !service.busy
+              enabled: !service.working
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: {
+                if (service.busy) return
                 root.loudnessMode = root.loudnessMode === "protected" ? "matched" : "protected"
                 root.applyOptions()
               }
@@ -1026,34 +1210,10 @@ Panel {
               label: "Deep bass"
               description: root.deepBassDescription()
               checked: service.status.deepBass === "on"
-                && ((service.status.bassEnhancer || {}).usable === true)
-              enabled: !service.busy
+              enabled: !service.working
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: service.deepBass()
-            }
-
-            RowLayout {
-              visible: root.bassWarningText() !== ""
-              width: parent.width
-              spacing: Style.space(8)
-              Text {
-                textFormat: Text.PlainText
-                Layout.alignment: Qt.AlignTop
-                text: "󰀪"
-                color: bar ? bar.urgent : Color.urgent
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.icon
-              }
-              Text {
-                textFormat: Text.PlainText
-                Layout.fillWidth: true
-                text: root.bassWarningText()
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
+              onClicked: if (!service.busy) service.deepBass()
             }
 
             // Headphones or a speaker taking the default output is the
@@ -1099,10 +1259,10 @@ Panel {
                 ? "Off — the plain speakers" + root.bypassMatchText()
                 : "On — switch off to hear the speakers as they were" + root.bypassMatchText()
               checked: !service.status.bypass
-              enabled: !service.busy
+              enabled: !service.working
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: service.bypass()
+              onClicked: if (!service.busy) service.bypass()
             }
 
             Column {
@@ -1156,17 +1316,21 @@ Panel {
             onClicked: {
               var sink = service.sinks[root.sinkIndex]
               var mic = service.microphones[root.micIndex]
-              service.measure(sink.name, mic.name, root.selectedChannelValue(), root.options(), true)
+              service.measure(sink.name, mic.name, root.selectedChannelValue(), root.options(), "preview")
             }
           }
 
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
-            color: root.dim
+            text: service.error !== "" ? service.error
+              : "Measures the speakers with the microphone and corrects their sound. Keep the room quiet for about 30 seconds; the result installs itself when the measurement passes."
+            // A failure is said here as well as under the header: whoever
+            // pressed the button above is looking at this line, and the header
+            // is a screen further up.
+            color: service.error !== "" ? (bar ? bar.urgent : Color.urgent) : root.dim
             font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
+            font.pixelSize: service.error !== "" ? Style.font.body : Style.font.bodySmall
             wrapMode: Text.WordWrap
           }
 
@@ -1226,7 +1390,11 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
-                onClicked: root.sinkIndex = index
+                onClicked: {
+                  root.sinkIndex = index
+                  root.chosenSink = modelData.name
+                  service.rememberSelection(root.chosenSink, root.chosenMic, root.chosenChannel)
+                }
               }
             }
             Text {
@@ -1265,8 +1433,11 @@ Panel {
               // measured belongs under it, the way every other labelled
               // control in this panel is built, not crammed into the label.
               Column {
+                id: microphoneRow
                 width: parent.width
                 spacing: Style.space(2)
+                // The reasons for a verdict are shown on request only.
+                property bool reasonsShown: false
 
                 Button {
                   width: parent.width
@@ -1278,25 +1449,67 @@ Panel {
                     + (modelData.internal
                         ? "  ·  built-in" + (Number(modelData.channels || 1) > 1 ? ", " + modelData.channels + " mics" : "")
                         : "  ·  external")
+                    + (modelData.available === false ? "  ·  nothing plugged in" : "")
+                    + (modelData.silenced ? "  ·  " + (modelData.silenced === "is muted" ? "muted" : "volume at zero") : "")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !service.busy
-                  onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                  onClicked: {
+                    root.micIndex = index
+                    root.chosenMic = modelData.name
+                    root.chosenChannel = 0
+                    channelBox.currentIndex = 0
+                    service.rememberSelection(root.chosenSink, root.chosenMic, 0)
+                  }
+                }
+
+                // Flush with every other line in the section, so the panel
+                // has one left edge rather than several.  It reads as this
+                // device's caption because it sits tight under it: the gap
+                // inside a row is a third of the gap between rows.
+                Flow {
+                  width: parent.width
+                  spacing: 0
+
+                  Text {
+                    textFormat: Text.PlainText
+                    bottomPadding: microphoneRow.reasonsShown ? 0 : Style.space(3)
+                    text: root.microphoneNote(modelData)
+                      + (root.microphoneVerdict(modelData) !== "" ? "  ·  " : "")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  // The verdict is the handle: click it for the reasons.
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: root.microphoneVerdict(modelData) !== ""
+                    bottomPadding: microphoneRow.reasonsShown ? 0 : Style.space(3)
+                    text: root.microphoneVerdict(modelData)
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.underline: true
+
+                    MouseArea {
+                      anchors.fill: parent
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: microphoneRow.reasonsShown = !microphoneRow.reasonsShown
+                    }
+                  }
                 }
 
                 Text {
                   textFormat: Text.PlainText
+                  visible: microphoneRow.reasonsShown && root.microphoneVerdict(modelData) !== ""
                   width: parent.width
-                  // Flush with every other line in the section, so the panel
-                  // has one left edge rather than several.  It reads as this
-                  // device's caption because it sits tight under it: the gap
-                  // inside a row is a third of the gap between rows.
                   bottomPadding: Style.space(3)
-                  text: root.microphoneNote(modelData)
+                  text: root.microphoneReasons(modelData)
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+                  wrapMode: Text.WordWrap
                 }
               }
             }
@@ -1308,10 +1521,11 @@ Panel {
               width: parent.width
               text: (service.status.unusableMicrophones || []).join(", ")
                 + ((service.status.unusableMicrophones || []).length > 1
-                    ? " are connected but cannot measure. A Bluetooth headset microphone is mono, "
-                    : " is connected but cannot measure. A Bluetooth headset microphone is mono, ")
-                + "narrowband, and processed inside the headset, so it describes the headset "
-                + "rather than your speakers."
+                    ? " are not supported as measurement inputs. "
+                    : " is not supported as a measurement input. ")
+                + "A headset or voice microphone is processed before it arrives, so it "
+                + "describes that processing rather than your speakers. Select the built-in "
+                + "microphone array or a wired or USB microphone."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1418,6 +1632,10 @@ Panel {
                 Layout.fillWidth: true
                 model: root.channelOptions()
                 enabled: !service.busy
+                onActivated: {
+                  root.chosenChannel = currentIndex
+                  service.rememberSelection(root.chosenSink, root.chosenMic, currentIndex)
+                }
               }
 
               Text {
@@ -1440,10 +1658,10 @@ Panel {
               label: "Loudness compensation"
               description: root.loudnessCompensationDescription()
               checked: service.status.loudnessCompensation === "on"
-              enabled: !service.busy && service.status.enabled
+              enabled: !service.working && service.status.enabled
               foreground: root.foreground
               fontFamily: root.fontFamily
-              onClicked: service.loudnessCompensation()
+              onClicked: if (!service.busy) service.loudnessCompensation()
             }
 
             Text {
@@ -1528,6 +1746,100 @@ Panel {
               }
             }
 
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader {
+              id: sharedHeader
+              text: "SHARED CALIBRATIONS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: "Export the calibration that is playing to your Downloads folder and hand the file "
+                + "to someone with the same machine. A shared file dropped into Downloads appears "
+                + "below; loading it makes it the last measurement, ready to install, and says so "
+                + "when it was made on other hardware."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            ActionRow {
+              visible: service.status.enabled
+                && service.status.profile !== null && service.status.profile !== undefined
+              width: parent.width
+              icon: "󰁨"
+              label: service.busy && service.phase === "export" ? "Exporting…" : "Export this calibration"
+              description: "Saves a file named after " + String((service.status.hardware || {}).label || "this machine")
+                + " to your Downloads folder"
+              enabled: !service.busy
+              onClicked: service.exportProfile()
+            }
+            ActionRow {
+              visible: service.status.enabled
+                && service.status.profile !== null && service.status.profile !== undefined
+              width: parent.width
+              icon: "󰁨"
+              label: service.busy && service.phase === "vendor" ? "Rendering…" : "Export as an Omarchy tuning"
+              description: "Writes tuning.conf and filter-chain.conf in the layout Omarchy ships under "
+                + "default/audio/tunings, to your Downloads folder, ready for a pull request"
+              enabled: !service.busy
+              onClicked: service.exportVendor()
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.exportNote !== ""
+              width: parent.width
+              text: service.exportNote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            ActionRow {
+              visible: service.status.vendorTrial === true
+                || (service.status.enabled && service.status.vendorExport !== undefined
+                    && service.status.vendorExport !== null)
+              width: parent.width
+              icon: "󰓦"
+              label: service.busy && service.phase === "vendortry" ? "Starting…"
+                : service.busy && service.phase === "vendorrestore" ? "Coming back…"
+                : service.status.vendorTrial === true ? "Back to the calibration"
+                : "Hear the exported tuning"
+              description: service.status.vendorTrial === true
+                ? "The exported tuning is playing beside the calibration; this moves the music back"
+                : "Renders the tuning again, starts it as a second output beside the calibration and moves "
+                  + "your music onto it without a break: the plain chain with its built-in deep bass, no compensation"
+              enabled: !service.busy
+              onClicked: service.status.vendorTrial === true ? service.vendorRestore() : service.vendorTry()
+            }
+            Repeater {
+              model: service.status.sharedProfiles || []
+              ActionRow {
+                width: parent.width
+                icon: "󰓦"
+                label: modelData.valid === true
+                  ? (service.busy && service.phase === "import" ? "Loading…"
+                     : "Load: " + String(modelData.hardware || modelData.name || modelData.file))
+                  : String(modelData.file)
+                description: root.sharedDescription(modelData)
+                enabled: !service.busy && modelData.valid === true
+                onClicked: service.importProfile(modelData.file)
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: !(service.status.sharedProfiles && service.status.sharedProfiles.length > 0)
+              width: parent.width
+              text: "No shared calibration files in your Downloads folder yet."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            PanelSeparator { foreground: root.foreground }
             PanelSeparator { foreground: root.foreground }
             PanelSectionHeader { text: "ACTIONS"; foreground: root.foreground; fontFamily: root.fontFamily }
 
@@ -1645,6 +1957,17 @@ Panel {
                 model: root.measurementRows()
                 DetailRow { width: parent.width; key: modelData.key; value: modelData.value }
               }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: root.importedNote() !== ""
+              width: parent.width
+              text: root.importedNote()
+              color: root.importedMismatch() ? (bar ? bar.urgent : Color.urgent) : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Column {
@@ -1982,14 +2305,9 @@ Panel {
               DetailRow {
                 width: parent.width
                 key: "Deep bass"
-                value: ((service.status.bassEnhancer || {}).usable === true)
-                  ? "bankstown add-on installed at " + String((service.status.bassEnhancer || {}).path)
-                    + "; makes harmonics from below the high-pass corner and keeps them above it"
-                  : "optional bankstown add-on, not installed; "
-                    + (((service.status.bassEnhancer || {}).source || "pinned-source") !== "pinned-source"
-                        ? "would come from the " + String((service.status.bassEnhancer || {}).source) + " repository"
-                        : "would be built from its pinned upstream commit")
-                    + "; nothing in the chain depends on it"
+                value: (service.status.deepBass === "on" ? "on" : "off")
+                  + "; built into the chain: what lies below the high-pass corner is saturated and its "
+                  + "harmonics between the corner and three times it are added back ahead of the EQ"
               }
             }
           }
