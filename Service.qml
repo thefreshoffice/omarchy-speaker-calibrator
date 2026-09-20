@@ -37,7 +37,13 @@ Item {
       : operation === "refine" ? "Improving from the last check…"
       : operation === "deepbass" ? "Switching deep bass…"
       : operation === "loudness" ? "Switching loudness compensation…"
-      : operation === "refit" ? "Applying…" : "Working…"
+      : operation === "refit" ? "Applying…"
+      : operation === "roomstart" ? "Starting room correction…"
+      : operation === "roommeasure"
+        ? "Measuring position " + roomPosition + " of " + roomPositions()
+          + ", about 30 seconds. Keep quiet…"
+      : operation === "roomfit" ? "Fitting the room correction to every position…"
+      : "Working…"
     _stdout = ""
     _stderr = ""
     _overflowed = false
@@ -176,6 +182,66 @@ Item {
   }
   function loudnessCompensation() { start("loudness", ["loudness-toggle"]) }
 
+  // A room correction run: the helper keeps the captures, the panel keeps
+  // where the user is in it.  Stage "place" waits for the microphone to be in
+  // position; "failed" offers retake or skip for the position just measured.
+  property var roomRun: null
+  property int roomPosition: 0
+  property string roomStage: ""
+  property var roomLastQuality: null
+  function roomPositions() { return roomRun ? Number(roomRun.positions) : 0 }
+  function roomStart(sink, mic, channel, options, positions) {
+    proposal = null
+    var arguments = ["room-start-json", "--sink", sink, "--mic", mic,
+                     "--channel", String(channel),
+                     "--positions", String(positions)].concat(optionArguments(options))
+    if (options.micCalibrationFile && options.micCalibrationFile.length > 0)
+      arguments.push("--mic-cal-file", options.micCalibrationFile)
+    start("roomstart", arguments)
+  }
+  function roomMeasure() {
+    start("roommeasure", ["room-measure-json", "--position", String(roomPosition)])
+  }
+  // A skipped position stays unmeasured and counts as not passed.
+  function roomNext() {
+    roomLastQuality = null
+    if (roomPosition < roomPositions()) {
+      roomPosition += 1
+      roomStage = "place"
+    } else {
+      // Stays on "fit" until the fit answers, so a refresh that took the
+      // process first leaves a button to finish with rather than nothing.
+      roomStage = "fit"
+      roomFit()
+    }
+  }
+  function roomFit() { start("roomfit", ["room-fit-json", "--install"]) }
+  function roomCancel() {
+    roomRun = null
+    roomPosition = 0
+    roomStage = ""
+    roomLastQuality = null
+  }
+  function roomResultMessage(profile) {
+    var measurement = profile.measurement || {}
+    var dropped = measurement.dropped_positions || []
+    var used = (measurement.positions || []).filter(function (position) {
+      return dropped.indexOf(position) < 0
+    })
+    var text = "Room correction used " + used.length + " of " + roomPositions()
+      + (roomPositions() === 1 ? " position" : " positions")
+    var skipped = roomPositions() - used.length - dropped.length
+    if (dropped.length > 0) text += " (failed: " + dropped.join(", ") + ")"
+    if (skipped > 0) text += " (" + skipped + " skipped)"
+    if (profile.installed) {
+      text += ". Installed and playing"
+      if (profile.activation === "restart") text += " · tuning restarted once"
+      return text + "."
+    }
+    var reasons = ((profile.quality || {}).warnings || []).concat((profile.quality || {}).failures || [])
+    return text + ". Not installed" + (reasons.length > 0 ? ": " + reasons[0] : ".")
+  }
+
   // One plain sentence about the last check.
   function verificationSummary(check) {
     if (!check) return ""
@@ -308,6 +374,33 @@ Item {
           // A background refresh has nothing to report; leaving "Working…" on
           // screen makes an idle panel look busy.
           if (root.message === "Working…") root.message = ""
+        }
+        else if (root.phase === "roomstart") {
+          root.roomRun = JSON.parse(raw)
+          root.roomPosition = 1
+          root.roomLastQuality = null
+          root.roomStage = "place"
+          root.message = ""
+        } else if (root.phase === "roommeasure") {
+          var position = JSON.parse(raw)
+          root.roomLastQuality = position.quality
+          if (position.retake) {
+            root.roomStage = "failed"
+            root.message = ""
+          } else {
+            root.message = "Position " + position.position + " of " + position.positions + " passed."
+            Qt.callLater(root.roomNext)
+          }
+        } else if (root.phase === "roomfit") {
+          if (root.micComparison) root._micsPending = true
+          var room = JSON.parse(raw)
+          root.proposal = room
+          root.message = root.roomResultMessage(room)
+          if (room.installed) {
+            root.status = Object.assign({}, root.status, { enabled: true, profile: room, bypass: false })
+            Qt.callLater(root.refreshStatus)
+          }
+          root.roomCancel()
         }
         else if (root.phase === "measure" || root.phase === "refit" || root.phase === "refine") {
           // A measurement is archived per microphone, so whatever comparison

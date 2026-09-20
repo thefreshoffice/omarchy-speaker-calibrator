@@ -33,7 +33,7 @@ DSP_NAMES = (
     "analyse_level_probe", "build_measurement_signal",
     "combine_microphone_measurements", "level_after_clipping",
     "level_search_advice", "parse_mic_calibration", "read_pcm16_wave_channels",
-    "search_measurement_level", "write_pcm16_wave",
+    "search_measurement_level", "spatial_average", "write_pcm16_wave",
 )
 OPTIMIZER_NAMES = (
     "apply_refinement", "optimize_peq", "refinement_residual", "verification_report",
@@ -137,6 +137,19 @@ LEVEL_PROBE_TAIL_SECONDS = 0.25
 LEVEL_SEARCH_ATTEMPTS = 4
 LEVEL_SEARCH_START_OFFSET_DB = -12.0
 LEVEL_SEARCH_BOUNDS_DB = (-24.0, 6.0)
+# Kept in step with calibration_optimizer.MODES, spelled out here so the
+# panel's fast paths need no numpy.
+QUICK_CALIBRATION = "quick-calibration"
+ROOM_CORRECTION = "room-correction"
+MODES = (QUICK_CALIBRATION, ROOM_CORRECTION)
+# Room correction reaches the bottom octave; the sweep level does not change.
+ROOM_SWEEP_START_HZ = 20.0
+ROOM_POSITIONS_DEFAULT = 5
+MISSING_CALIBRATION_WARNING = (
+    "No microphone calibration file: the correction also evens out the "
+    "microphone's own response."
+)
+ROOM_POSITIONS_LIMITS = (1, 9)
 
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "omarchy-speaker-calibrator"
@@ -145,6 +158,9 @@ FRAGMENT = CONFIG / "pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf"
 UNIT = CONFIG / "systemd/user/omarchy-speaker-tuning.service"
 PROFILE = DATA / "active-profile.json"
 PROPOSAL = DATA / "proposed-profile.json"
+# One room correction run at a time: its settings and one capture per
+# measurement position.  Starting a new run discards the previous captures.
+ROOM_RUN = DATA / "room-run"
 # The profile that the last install replaced, kept so the two can be swapped
 # in and out for a listening comparison.  Graphs are regenerated from a
 # profile's filters whenever it is activated, so only the profile is kept.
@@ -614,7 +630,7 @@ def devices_payload():
             "description": short_label(label(item)) or label(item),
             "channels": channel_count(item),
             "kind": kind,
-            "internal": name.startswith(("alsa_input.pci-", "alsa_output.pci-")),
+            "internal": is_built_in(name),
         }
     return {
         "sinks": [public(item, "speaker") for item in physical_sinks()],
@@ -623,7 +639,14 @@ def devices_payload():
 
 
 def label(item):
-    return item.get("description") or item.get("properties", {}).get("device.description") or item["name"]
+    properties = item.get("properties", {})
+    for value in (item.get("description"), properties.get("device.description")):
+        if short_label(value):
+            return value
+    # Some USB devices name themselves "(null)"; vendor and profile still say what it is.
+    parts = [short_label(properties.get(key))
+             for key in ("device.vendor.name", "device.profile.description")]
+    return " ".join(part for part in parts if part) or item["name"]
 
 
 def select(items, title, predicate=None):
@@ -731,7 +754,9 @@ LOUDNESS_MAKEUP_SHARE = 0.85
 LOUDNESS_SERVICE = "omarchy-speaker-loudness.service"
 LOUDNESS_TRACKER = "loudness-tracker.py"
 
-PEAKING_SLOTS = 12
+PEAKING_SLOTS = 20
+# The arrival delay line's length; 50 ms is 17 m of path difference.
+ARRIVAL_DELAY_MAX_SECONDS = 0.05
 DEFAULT_HIGHPASS_HZ = 55.0
 # A high-pass section is switched off by moving it below the audible band
 # rather than by removing it, so the graph keeps its fixed shape and a profile
@@ -745,6 +770,7 @@ SECTION_LABELS = {
     "hs": "bq_highshelf",
     # A plain gain, used to centre the stereo image when that is measurable.
     "bal": "linear",
+    "dly": "delay",
 }
 
 
@@ -757,7 +783,7 @@ def graph_sections():
     return (
         ["hp1", "hp2", "ls", "bs"]
         + [f"p{slot}" for slot in range(1, PEAKING_SLOTS + 1)]
-        + ["hs", "bal"]
+        + ["hs", "bal", "dly"]
     )
 
 
@@ -893,6 +919,11 @@ def graph_controls(fit_payload, *, bass_enhancer=None, deep_bass=False,
         gain_db = float((fit_payload.get("channel_trim") or {}).get(f"{'left' if side == 'l' else 'right'}_db", 0.0))
         controls[f"bal_{side}:Mult"] = round(10.0 ** (gain_db / 20.0), 6)
         controls[f"bal_{side}:Add"] = 0.0
+        # Profiles from before room correction carry no delay.
+        delay_ms = float((fit_payload.get("channel_delay_ms") or {}).get(
+            "left" if side == "l" else "right", 0.0))
+        controls[f"dly_{side}:Delay (s)"] = round(
+            np_free_clip(delay_ms / 1000.0, 0.0, ARRIVAL_DELAY_MAX_SECONDS), 6)
     if bass_enhancer:
         controls.update(bass_enhancer_controls(corner, deep_bass))
     # Last, because the compensation's make-up rides on the limiter's input
@@ -921,6 +952,14 @@ def filter_config(sink, fit_payload, *, bass_enhancer=None, deep_bass=False,
             name = f"{section}_{side}"
             kind = section.rstrip("0123456789")
             label = SECTION_LABELS[kind]
+            if kind == "dly":
+                nodes.append(
+                    f'{{ type = builtin name = {name} label = {label} control = '
+                    f'{{ "Delay (s)" = {controls[f"{name}:Delay (s)"]:.6f} }} '
+                    f'config = {{ "max-delay" = {ARRIVAL_DELAY_MAX_SECONDS} }} }}'
+                )
+                chain.append(name)
+                continue
             if kind == "bal":
                 settings = (
                     f'"Mult" = {_number(controls[f"{name}:Mult"])} '
@@ -1465,7 +1504,7 @@ def analyze_recording(
 
 def default_sweep_level(sink_name):
     """Built-in speakers get a louder sweep than external outputs."""
-    if sink_name.startswith("alsa_output.pci-"):
+    if is_built_in(sink_name):
         return INTERNAL_SPEAKER_LEVEL_DBFS
     return EXTERNAL_SPEAKER_LEVEL_DBFS
 
@@ -1546,17 +1585,24 @@ def find_measurement_level(sink_name, mic_name, channel, channels, level_sink=No
     return search
 
 
+def sweep_spec(level_dbfs, mode):
+    """The measurement sweep for this mode, at the chosen level."""
+    if mode == ROOM_CORRECTION:
+        return SweepSpec(level_dbfs=level_dbfs, start_hz=ROOM_SWEEP_START_HZ)
+    return SweepSpec(level_dbfs=level_dbfs)
+
+
 def capture_measurement(
     sink_name, mic_name, channel, mic_cal_file=None, *,
-    level_sink=None, sweeps=None, recording=None,
+    level_sink=None, sweeps=None, recording=None, mode=QUICK_CALIBRATION,
 ):
-    load_dsp()
     """Find a safe level, play the Phase 1 program, capture it, and analyze it.
 
     ``level_sink`` names the output the level default should be taken from,
     which differs from the played sink when measuring through the calibrated
     sink that fronts it.
     """
+    load_dsp()
     channels = next(
         (channel_count(item) for item in microphones() if item["name"] == mic_name), 1
     )
@@ -1572,7 +1618,7 @@ def capture_measurement(
     # has less time to ring up during it.  If the full capture clips anyway,
     # one quieter retry costs less than a rejected measurement.
     for attempt in range(2):
-        measurement_spec = SweepSpec(level_dbfs=level)
+        measurement_spec = sweep_spec(level, mode)
         program, schedule = build_measurement_signal(measurement_spec)
         write_pcm16_wave(sweeps, program, RATE)
         record_while_playing(
@@ -1622,10 +1668,14 @@ MICROPHONE_KIND_LABELS = {"internal": "internal mic", "external": "external mic"
 
 def profile_from_measurement(
     sink, mic, channel, voicing, measurement, loudness="protected", bass="normal",
-    channel_trim="off",
+    channel_trim="off", mode=QUICK_CALIBRATION,
 ):
     load_dsp()
     quality = measurement["quality"]
+    if mode == ROOM_CORRECTION and not measurement.get("microphone_calibration"):
+        quality["warnings"] = quality["warnings"] + [MISSING_CALIBRATION_WARNING]
+        if quality["verdict"] == "pass":
+            quality["verdict"] = "warning"
     internal_mic = mic["name"].startswith("alsa_input.pci-")
     fit_payload = None
     if quality["accepted"]:
@@ -1636,6 +1686,7 @@ def profile_from_measurement(
             loudness=loudness,
             bass=bass,
             channel_trim=channel_trim,
+            mode=mode,
         )
     profile = {
         "schema_version": 5,
@@ -1650,6 +1701,7 @@ def profile_from_measurement(
             "calibration_file": measurement["microphone_calibration"]["path"]
                 if measurement["microphone_calibration"] else None,
         },
+        "mode": mode,
         "voicing": voicing,
         "loudness": loudness,
         "bass": bass,
@@ -1844,7 +1896,7 @@ def microphone_comparison():
 
 def build_profile(
     sink, mic, channel, voicing, mic_cal_file=None, loudness="protected", bass="normal",
-    channel_trim="off",
+    channel_trim="off", mode=QUICK_CALIBRATION,
 ):
     if not is_physical_sink(sink["name"]):
         raise SystemExit(
@@ -1853,7 +1905,7 @@ def build_profile(
         )
     with correction_silenced() as silenced:
         measurement = capture_measurement(
-            sink["name"], mic["name"], channel, mic_cal_file
+            sink["name"], mic["name"], channel, mic_cal_file, mode=mode
         )
     measurement["measured_through"] = {
         "sink": sink["name"],
@@ -1861,7 +1913,7 @@ def build_profile(
         "correction_silenced_during_measurement": bool(silenced),
     }
     return profile_from_measurement(
-        sink, mic, channel, voicing, measurement, loudness, bass, channel_trim
+        sink, mic, channel, voicing, measurement, loudness, bass, channel_trim, mode
     )
 
 
@@ -1874,6 +1926,11 @@ def reanalyze_saved_capture(
     if not PROPOSAL.exists() or not recording.exists():
         raise SystemExit("No saved capture and proposal are available to reanalyze.")
     previous = json.loads(read_text_bounded(PROPOSAL) or '')
+    if previous.get("mode") == ROOM_CORRECTION:
+        # The saved recording holds only the last measurement position.
+        raise SystemExit(
+            "A room correction profile is refitted from its run; use room-fit-json."
+        )
     sink = previous["speaker"]
     mic = previous["microphone"]
     channel = parse_channel_selection(
@@ -1887,10 +1944,12 @@ def reanalyze_saved_capture(
             "The saved capture was recorded through the correction, so it cannot be "
             "refitted. Calibrate again."
         )
-    saved_level = previous_measurement.get("sweep", {}).get("level_dbfs")
+    saved_sweep = previous_measurement.get("sweep", {})
+    saved_level = saved_sweep.get("level_dbfs")
     measurement_spec = SweepSpec(
         level_dbfs=float(saved_level) if saved_level is not None
-        else default_sweep_level(sink["name"])
+        else default_sweep_level(sink["name"]),
+        start_hz=float(saved_sweep.get("start_hz", SweepSpec.start_hz)),
     )
     _, schedule = build_measurement_signal(measurement_spec)
     calibration_path = mic.get("calibration_file")
@@ -1922,6 +1981,7 @@ def reanalyze_saved_capture(
         loudness or previous.get("loudness", "protected"),
         bass or previous.get("bass", "normal"),
         channel_trim or previous.get("channel_trim", "off"),
+        previous.get("mode", QUICK_CALIBRATION),
     )
 
 
@@ -1934,10 +1994,48 @@ def parse_channel_selection(value):
         raise SystemExit("Microphone channel must be a zero-based number or 'all'.") from error
 
 
+# Digital outputs on the machine's own card carry sound out of it, often to
+# large speakers, so they are external however the card is attached.
+EXTERNAL_PCI_OUTPUTS = ("hdmi", "iec958")
+
+
+def is_built_in(name):
+    """True for the machine's own speakers and microphones."""
+    name = str(name)
+    if name.startswith("alsa_output.pci-"):
+        return not any(kind in name.lower() for kind in EXTERNAL_PCI_OUTPUTS)
+    return name.startswith("alsa_input.pci-")
+
+
+def room_correction_refusal(sink, mic):
+    """Why room correction cannot run with these devices, or None."""
+    if is_built_in(sink["name"]):
+        return ("Room correction needs an external speaker output; use quick "
+                "calibration for the built-in speakers.")
+    if is_built_in(mic["name"]):
+        return ("Room correction needs an external measurement microphone, not "
+                "the built-in one.")
+    return None
+
+
 def calibrate_noninteractive(
     sink_name, mic_name, channel, voicing, mic_cal_file=None, loudness="protected",
-    bass="normal", channel_trim="off",
+    bass="normal", channel_trim="off", mode=QUICK_CALIBRATION,
 ):
+    sink, mic, channel = measurement_devices(
+        sink_name, mic_name, channel, mic_cal_file, mode
+    )
+    try:
+        return build_profile(
+            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim,
+            mode,
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
+
+def measurement_devices(sink_name, mic_name, channel, mic_cal_file, mode):
+    """The chosen sink, microphone and channel, refused if they cannot measure."""
     sink = next((item for item in physical_sinks() if item["name"] == sink_name), None)
     mic = next((item for item in microphones() if item["name"] == mic_name), None)
     if sink is None or mic is None:
@@ -1949,9 +2047,147 @@ def calibrate_noninteractive(
         raise SystemExit("All-channel mode is available only for built-in microphone arrays.")
     if channel != "all" and (channel < 0 or channel >= channels):
         raise SystemExit(f"Microphone channel must be between 1 and {channels}.")
+    if mode == ROOM_CORRECTION:
+        refusal = room_correction_refusal(sink, mic)
+        if refusal:
+            raise SystemExit(refusal)
+    return sink, mic, channel
+
+
+def room_position_path(position):
+    return ROOM_RUN / f"position-{position}.json"
+
+
+def load_room_run():
     try:
-        return build_profile(
-            sink, mic, channel, voicing, mic_cal_file, loudness, bass, channel_trim
+        return json.loads(read_text_bounded(ROOM_RUN / "run.json") or "")
+    except (OSError, ValueError) as error:
+        raise SystemExit("No room correction run is in progress; start one first.") from error
+
+
+def start_room_run(
+    sink_name, mic_name, channel, voicing, mic_cal_file, loudness="protected",
+    bass="normal", channel_trim="off", positions=None,
+):
+    """Begin a room correction run of 1 to 9 measurement positions."""
+    positions = ROOM_POSITIONS_DEFAULT if positions is None else int(positions)
+    low, high = ROOM_POSITIONS_LIMITS
+    if not low <= positions <= high:
+        raise SystemExit(
+            f"A room correction run takes {low} to {high} measurement positions, "
+            f"not {positions}."
+        )
+    sink, mic, channel = measurement_devices(
+        sink_name, mic_name, channel, mic_cal_file, ROOM_CORRECTION
+    )
+    for stale in ROOM_RUN.glob("position-*.json"):
+        stale.unlink()
+    run = {
+        "mode": ROOM_CORRECTION,
+        "positions": positions,
+        "sink": sink["name"],
+        "microphone": mic["name"],
+        "channel": channel,
+        "mic_cal_file": mic_cal_file,
+        "voicing": voicing,
+        "loudness": loudness,
+        "bass": bass,
+        "channel_trim": channel_trim,
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    write_atomic(ROOM_RUN / "run.json", json.dumps(run, indent=2) + "\n")
+    return run
+
+
+def measure_room_position(position):
+    """Capture one measurement position of the current run and keep it."""
+    run = load_room_run()
+    if not 1 <= int(position) <= run["positions"]:
+        raise SystemExit(
+            f"This run has positions 1 to {run['positions']}, not {position}."
+        )
+    sink, mic, channel = measurement_devices(
+        run["sink"], run["microphone"], run["channel"], run["mic_cal_file"],
+        ROOM_CORRECTION,
+    )
+    try:
+        with correction_silenced() as silenced:
+            measurement = capture_measurement(
+                sink["name"], mic["name"], channel, run["mic_cal_file"],
+                mode=ROOM_CORRECTION,
+            )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    measurement["measured_through"] = {
+        "sink": sink["name"],
+        "corrected": False,
+        "correction_silenced_during_measurement": bool(silenced),
+    }
+    record = {"position": int(position), "measurement": measurement}
+    write_atomic(room_position_path(position), json.dumps(record) + "\n")
+    return {
+        "position": int(position),
+        "positions": run["positions"],
+        "quality": measurement["quality"],
+        # Measuring the same position again replaces this capture.
+        "retake": not measurement["quality"]["accepted"],
+    }
+
+
+def room_run_refusal(passed, positions):
+    """Why a run with these passing positions may not install, or None."""
+    if 1 not in passed:
+        return ("The seat position did not pass, and it alone sets the arrival "
+                "alignment; retake it before installing.")
+    if 2 * len(passed) < positions:
+        return (f"Only {len(passed)} of {positions} measurement positions passed; "
+                "at least half must pass before the profile installs.")
+    return None
+
+
+def fit_room_run():
+    """Fit the run's profile to the spatial average of its passing positions.
+
+    A failed or unmeasured position is left out of the average.  The profile
+    may install only when the seat position passed and at least half of all
+    positions did; otherwise it is kept for diagnosis with a failed verdict.
+    """
+    load_dsp()
+    run = load_room_run()
+    measurements = []
+    for position in range(1, run["positions"] + 1):
+        try:
+            record = json.loads(read_text_bounded(room_position_path(position)) or "")
+        except (OSError, ValueError):
+            continue
+        measurements.append({**record["measurement"], "position": position})
+    if not measurements:
+        raise SystemExit("No measurement position of this run has been measured yet.")
+    passing = [item for item in measurements if item["quality"]["accepted"]]
+    passed = [item["position"] for item in passing]
+    averaged = spatial_average(passing or measurements)
+    averaged["dropped_positions"] = [
+        item["position"] for item in measurements if item["position"] not in passed
+    ]
+    refusal = room_run_refusal(passed, run["positions"])
+    quality = averaged["quality"]
+    if refusal:
+        quality.update(accepted=False, verdict="fail")
+        quality["warnings"] = [refusal] + quality["warnings"]
+    elif averaged["dropped_positions"]:
+        quality["verdict"] = "warning"
+        quality["warnings"] = quality["warnings"] + [
+            "Left out measurement positions "
+            + ", ".join(map(str, averaged["dropped_positions"])) + "."
+        ]
+    sink, mic, channel = measurement_devices(
+        run["sink"], run["microphone"], run["channel"], run["mic_cal_file"],
+        ROOM_CORRECTION,
+    )
+    try:
+        return profile_from_measurement(
+            sink, mic, channel, run["voicing"], averaged,
+            run["loudness"], run["bass"], run["channel_trim"], ROOM_CORRECTION,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
@@ -2064,7 +2300,7 @@ def refine_from_check():
     return profile_from_measurement(
         profile["speaker"], mic, mic.get("channel", 0), profile.get("voicing", "neutral"),
         refined, profile.get("loudness", "protected"), profile.get("bass", "normal"),
-        profile.get("channel_trim", "off"),
+        profile.get("channel_trim", "off"), profile.get("mode", QUICK_CALIBRATION),
     )
 
 
@@ -2106,6 +2342,7 @@ def verify_calibration():
             # The level default belongs to the real speakers behind the filter.
             level_sink=profile["speaker"]["name"],
             sweeps=VERIFICATION_SWEEPS, recording=VERIFICATION_RECORDING,
+            mode=profile.get("mode", QUICK_CALIBRATION),
         )
     measurement["measured_through"] = {
         "sink": VIRTUAL_SINK, "corrected": True, "bass_enhancer_muted": bool(muted),
@@ -2394,9 +2631,26 @@ def main():
                            default="protected")
     calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")
     calibrate.add_argument("--channel-trim", choices=("off", "auto"), default="off")
+    calibrate.add_argument("--mode", choices=MODES, default=QUICK_CALIBRATION)
     calibrate.add_argument("--mic-cal-file")
     calibrate.add_argument("--install", action="store_true",
                            help="install and play the result when it passes")
+    room_start = sub.add_parser("room-start-json")
+    room_start.add_argument("--sink", required=True)
+    room_start.add_argument("--mic", required=True)
+    room_start.add_argument("--channel", default="0")
+    room_start.add_argument("--voicing", choices=("warm", "neutral"), default="neutral")
+    room_start.add_argument("--loudness", choices=("protected", "balanced", "matched"),
+                            default="protected")
+    room_start.add_argument("--bass", choices=("normal", "full"), default="normal")
+    room_start.add_argument("--channel-trim", choices=("off", "auto"), default="off")
+    room_start.add_argument("--mic-cal-file")
+    room_start.add_argument("--positions", type=int)
+    room_measure = sub.add_parser("room-measure-json")
+    room_measure.add_argument("--position", type=int, required=True)
+    room_fit = sub.add_parser("room-fit-json")
+    room_fit.add_argument("--install", action="store_true",
+                          help="install and play the result when it passes")
     reanalyze = sub.add_parser("reanalyze-saved-json")
     reanalyze.add_argument("--voicing", choices=("warm", "neutral"))
     reanalyze.add_argument("--loudness", choices=("protected", "balanced", "matched"))
@@ -2420,8 +2674,18 @@ def main():
     elif command == "calibrate-json":
         profile = calibrate_noninteractive(
             args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,
-            args.loudness, args.bass, args.channel_trim,
+            args.loudness, args.bass, args.channel_trim, args.mode,
         )
+        print(json.dumps(install_if_accepted(profile) if args.install else profile))
+    elif command == "room-start-json":
+        print(json.dumps(start_room_run(
+            args.sink, args.mic, args.channel, args.voicing, args.mic_cal_file,
+            args.loudness, args.bass, args.channel_trim, args.positions,
+        )))
+    elif command == "room-measure-json":
+        print(json.dumps(measure_room_position(args.position)))
+    elif command == "room-fit-json":
+        profile = fit_room_run()
         print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "reanalyze-saved-json":
         profile = reanalyze_saved_capture(

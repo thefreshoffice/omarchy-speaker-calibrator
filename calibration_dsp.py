@@ -242,6 +242,11 @@ def _drift_corrected_segment(
     return np.interp(positions, source, capture, left=0.0, right=0.0)
 
 
+# The analysis grid starts this far above the sweep, clear of its faded
+# opening: 80 Hz for the 70 Hz quick calibration sweep.
+ANALYSIS_START_ABOVE_SWEEP = 80.0 / 70.0
+
+
 def _log_grid(start_hz: float, end_hz: float, points_per_octave: int = 24) -> np.ndarray:
     count = int(math.floor(math.log2(end_hz / start_hz) * points_per_octave)) + 1
     return start_hz * 2.0 ** (np.arange(count, dtype=float) / points_per_octave)
@@ -434,6 +439,7 @@ def perceptual_smooth(
     *,
     peak_weighted: bool = True,
     width_scale: float = 1.0,
+    max_octaves: float | None = None,
 ) -> np.ndarray:
     """Smooth a magnitude response the way the ear resolves it.
 
@@ -444,11 +450,15 @@ def perceptual_smooth(
     loudspeaker literature asks for, since filling a cancellation with gain
     achieves nothing but a resonance is worth removing.  Pass
     ``peak_weighted=False`` for a curve that is a difference rather than a
-    response, where a plain mean is the honest one.
+    response, where a plain mean is the honest one.  ``max_octaves`` caps the
+    window, so a narrow room mode in the bass survives the smoothing.
     """
     frequencies = np.asarray(frequencies, dtype=float)
     curve = np.asarray(curve_db, dtype=float)
-    sigma = np.maximum(erb_octaves(frequencies) * float(width_scale), 1e-3)
+    sigma = erb_octaves(frequencies) * float(width_scale)
+    if max_octaves is not None:
+        sigma = np.minimum(sigma, max_octaves)
+    sigma = np.maximum(sigma, 1e-3)
     distance = np.log2(frequencies[np.newaxis, :] / frequencies[:, np.newaxis])
     weights = np.exp(-0.5 * (distance / sigma[:, np.newaxis]) ** 2)
     weights /= np.sum(weights, axis=1, keepdims=True)
@@ -720,11 +730,29 @@ def analyse_capture(
         capture, sweep, schedule, spec.rate, record_lead_seconds
     )
     drift_ppm = (clock_ratio - 1.0) * 1_000_000.0
+    # Playback and recording start at unknown offsets, so an arrival is only
+    # meaningful relative to the others in this capture: each sweep's start
+    # is measured against one line through all of them.  The line is fitted
+    # with a separate offset per speaker, or the alternating sweeps would tilt
+    # it and bias every arrival.
+    expected_starts = np.asarray([
+        record_lead_seconds * spec.rate + event["start_frame"] for event in schedule
+    ], dtype=float)
+    design = np.column_stack((
+        expected_starts,
+        np.ones(expected_starts.size),
+        [float(event["output_channel"]) for event in schedule],
+    ))
+    (timeline_slope, timeline_intercept, _), *_ = np.linalg.lstsq(
+        design, np.asarray(starts, dtype=float), rcond=None
+    )
     noise_frames = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
     noise = capture[:noise_frames]
     noise_level = rms(noise)
     noise_dbfs = dbfs(noise_level)
-    frequencies = _log_grid(max(80.0, spec.start_hz), min(16_000.0, spec.end_hz))
+    frequencies = _log_grid(
+        spec.start_hz * ANALYSIS_START_ABOVE_SWEEP, min(16_000.0, spec.end_hz)
+    )
     calibration_curve = _calibration_curve(calibration, frequencies)
     tail_frames = int(round(spec.response_tail * spec.rate))
     pre_frames = int(round(GATE_PRE_ARRIVAL_SECONDS * spec.rate))
@@ -740,7 +768,9 @@ def analyse_capture(
     noise_floor = noise_floor + calibration_curve
 
     per_channel: dict[int, list[dict]] = {0: [], 1: []}
-    for event, start, correlation in zip(schedule, starts, correlations):
+    for event, start, correlation, expected_start in zip(
+        schedule, starts, correlations, expected_starts
+    ):
         segment = _drift_corrected_segment(
             capture, start - pre_frames, segment_frames, clock_ratio
         )
@@ -766,6 +796,10 @@ def analyse_capture(
             "snr_db": curve - noise_floor,
             "impulse_peak": round(float(np.max(np.abs(impulse))), 7),
             "direct_sound_ms": round((peak_index - pre_frames) / spec.rate * 1000.0, 3),
+            "arrival_ms": round((
+                start - timeline_slope * expected_start - timeline_intercept
+                + peak_index - pre_frames
+            ) / spec.rate * 1000.0, 4),
         }
         per_channel[event["output_channel"]].append(item)
 
@@ -852,6 +886,9 @@ def analyse_capture(
             "response_db": np.round(aggregate, 3).tolist(),
             "uncertainty_db": np.round(uncertainty, 3).tolist(),
             "snr_db": np.round(snr, 3).tolist(),
+            "arrival_ms": round(float(np.median([
+                item["arrival_ms"] for item in accepted_items
+            ])), 4),
             "sweeps": public_sweeps,
         })
 
@@ -1191,6 +1228,105 @@ def combine_microphone_measurements(
         },
         "quality": quality,
     }
+
+
+SPATIAL_ALIGN_BAND_HZ = (250.0, 2000.0)
+
+
+def _power_average_db(curves: list[np.ndarray]) -> np.ndarray:
+    return 10.0 * np.log10(np.mean(10.0 ** (np.vstack(curves) / 10.0), axis=0))
+
+
+def spatial_average(measurements: list[dict]) -> dict:
+    """The power average of the measurement positions, seat first.
+
+    The level search picks a sweep level per position, so each position is
+    first shifted to the seat's midband level and only its shape is averaged.
+    A power average lets a null at one position count for little while a peak
+    still counts, which is what a correction should chase.  Each position's
+    repeat curves are kept, tagged with the position, so the fit can hold a
+    whole position out.
+    """
+    seat = measurements[0]
+    frequencies = np.asarray(seat["frequency_hz"], dtype=float)
+    for measurement in measurements[1:]:
+        if not np.allclose(frequencies, np.asarray(measurement["frequency_hz"], dtype=float)):
+            raise ValueError("Measurement positions use incompatible frequency grids.")
+    band = (
+        (frequencies >= SPATIAL_ALIGN_BAND_HZ[0]) & (frequencies <= SPATIAL_ALIGN_BAND_HZ[1])
+    )
+
+    def midband(measurement):
+        return float(np.median(np.asarray(measurement["level_dbfs"], dtype=float)[band]))
+
+    shifts = [midband(seat) - midband(measurement) for measurement in measurements]
+
+    def averaged(curves):
+        return np.round(_power_average_db([
+            np.asarray(curve, dtype=float) + shift for curve, shift in zip(curves, shifts)
+        ]), 3).tolist()
+
+    channels = []
+    for index, seat_channel in enumerate(seat["channels"]):
+        sources = [measurement["channels"][index] for measurement in measurements]
+        channels.append({
+            **seat_channel,
+            "response_db": averaged([source["response_db"] for source in sources]),
+            "uncertainty_db": np.round(np.median(np.vstack([
+                np.asarray(source.get("uncertainty_db", np.zeros(frequencies.size)), dtype=float)
+                for source in sources
+            ]), axis=0), 3).tolist(),
+        })
+    validation_curves = [
+        {
+            **curve,
+            "position": measurement.get("position", number),
+            "response_db": np.round(
+                np.asarray(curve["response_db"], dtype=float) + shift, 3
+            ).tolist(),
+        }
+        for number, (measurement, shift) in enumerate(zip(measurements, shifts), start=1)
+        for curve in measurement.get("validation_curves", [])
+    ]
+    qualities = [measurement["quality"] for measurement in measurements]
+    accepted = all(quality["accepted"] for quality in qualities)
+    warnings = list(dict.fromkeys(
+        warning for quality in qualities for warning in quality.get("warnings", [])
+    ))
+    quality = {
+        **seat["quality"],
+        "accepted": accepted,
+        "verdict": "fail" if not accepted else ("warning" if warnings else "pass"),
+        "warnings": warnings,
+        "guidance": list(dict.fromkeys(
+            advice for quality in qualities for advice in quality.get("guidance", [])
+        )),
+    }
+    result = {
+        **seat,
+        "level_dbfs": averaged([measurement["level_dbfs"] for measurement in measurements]),
+        "channels": channels,
+        "validation_curves": validation_curves,
+        "quality": quality,
+        "positions": [
+            measurement.get("position", number)
+            for number, measurement in enumerate(measurements, start=1)
+        ],
+        "position_shifts_db": [round(shift, 3) for shift in shifts],
+        # The seat alone sets arrival alignment, so its own channels are kept.
+        "seat": {
+            "position": seat.get("position", 1),
+            "frequency_hz": seat["frequency_hz"],
+            "channels": [
+                {key: channel[key] for key in
+                 ("output_channel", "response_db", "uncertainty_db", "arrival_ms")
+                 if key in channel}
+                for channel in seat["channels"]
+            ],
+        },
+    }
+    result.pop("position", None)
+    return result
 
 
 @dataclass(frozen=True)

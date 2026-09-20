@@ -32,6 +32,10 @@ Panel {
   // Selected device rows; -1 until the device list arrives.
   property int sinkIndex: -1
   property int micIndex: -1
+  // What the user picked, by name, so a refreshed list keeps the choice.
+  property string chosenSinkName: ""
+  property string chosenMicName: ""
+  property string _selectedMicName: ""
 
   function open() {
     root.controller.show()
@@ -79,16 +83,31 @@ Panel {
     var mic = service.microphones[root.micIndex]
     return mic ? mic.internal === true : true
   }
-  // Zero-knowledge default: the laptop's own speakers and microphones.
-  function selectInternalDevices() {
-    var sink = -1
-    for (var sinkIndex = 0; sinkIndex < service.sinks.length; sinkIndex++)
-      if (service.sinks[sinkIndex].internal === true) { sink = sinkIndex; break }
-    root.sinkIndex = sink >= 0 ? sink : (service.sinks.length > 0 ? 0 : -1)
-    var mic = -1
-    for (var micIndex = 0; micIndex < service.microphones.length; micIndex++)
-      if (service.microphones[micIndex].internal === true) { mic = micIndex; break }
-    root.micIndex = mic >= 0 ? mic : (service.microphones.length > 0 ? 0 : -1)
+  // The first of these names that is connected, else the built-in device.
+  function deviceIndex(list, names) {
+    for (var n = 0; n < names.length; n++) {
+      if (!names[n]) continue
+      for (var i = 0; i < list.length; i++)
+        if (list[i].name === names[n]) return i
+    }
+    for (i = 0; i < list.length; i++)
+      if (list[i].internal === true) return i
+    return list.length > 0 ? 0 : -1
+  }
+  // The user's pick first, then the devices the installed calibration was
+  // measured with, then the laptop's own speakers and microphones.
+  function selectDevices() {
+    var profile = service.status.profile || {}
+    root.sinkIndex = root.deviceIndex(service.sinks,
+      [root.chosenSinkName, (profile.speaker || {}).name])
+    root.micIndex = root.deviceIndex(service.microphones,
+      [root.chosenMicName, (profile.microphone || {}).name])
+    var mic = service.microphones[root.micIndex]
+    var name = mic ? mic.name : ""
+    if (name !== root._selectedMicName) {
+      root._selectedMicName = name
+      channelBox.currentIndex = 0
+    }
   }
 
   // ---- options -------------------------------------------------------------
@@ -96,9 +115,36 @@ Panel {
     return { voicing: root.voicingMode, bass: root.bassMode, loudness: root.loudnessMode,
              channelTrim: root.channelTrimMode, micCalibrationFile: micCalPath.text.trim() }
   }
+  // A room correction profile is refitted only from its whole run, which the
+  // helper refuses to do from the last capture.
   function hasMeasurement() {
     return service.proposal !== null && service.proposal !== undefined
       && service.proposal.measurement !== undefined
+      && service.proposal.mode !== "room-correction"
+  }
+  function selectedExternalDevices() {
+    var sink = service.sinks[root.sinkIndex]
+    var mic = service.microphones[root.micIndex]
+    return !!(sink && mic && sink.internal === false && mic.internal === false)
+  }
+  function roomCorrectionAvailable() { return root.selectedExternalDevices() }
+  function roomPrompt() {
+    var of = " (" + service.roomPosition + " of " + service.roomPositions() + ")"
+    if (service.roomPosition === 1)
+      return "Place the microphone at your seat" + of + ", where your head is when you "
+        + "listen. Keep the room quiet, then press Measure."
+    return "Move the microphone to the next measurement position" + of + ": a little "
+      + "away from the last one, still around where a listener's head would be. "
+      + "Press Measure when it is in place."
+  }
+  function roomFailureText() {
+    var quality = service.roomLastQuality || {}
+    var lines = ["Position " + service.roomPosition + " did not pass."]
+      .concat(quality.failures || [], quality.guidance || [])
+    if (service.roomPosition === 1)
+      lines.push("The seat position sets the timing between the speakers; "
+        + "if you skip it, the profile will not install.")
+    return lines.join("\n")
   }
   // A saved measurement is re-fitted and applied at once, so a toggle is heard
   // immediately.  Without one the options simply wait for the next calibration.
@@ -873,14 +919,15 @@ Panel {
         root.adoptOptions(service.status.profile)
         root._optionsAdopted = true
       }
+      if (root.chosenSinkName === "" || root.chosenMicName === "") root.selectDevices()
       eqCanvas.requestPaint()
       microphoneCanvas.requestPaint()
     }
     // New curves land in a canvas that is already showing, and a canvas in a
     // window that was closed and opened again comes back empty: paint on both.
     function onMicComparisonChanged() { microphoneCanvas.requestPaint() }
-    function onSinksChanged() { root.selectInternalDevices() }
-    function onMicrophonesChanged() { root.selectInternalDevices(); channelBox.currentIndex = 0 }
+    function onSinksChanged() { root.selectDevices() }
+    function onMicrophonesChanged() { root.selectDevices() }
     function onProposalChanged() { responseCanvas.requestPaint() }
   }
 
@@ -908,6 +955,14 @@ Panel {
         contentHeight: content.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        readonly property bool overflows: contentHeight > height + 1
+        // Always drawn when there is more than fits: a bar that appears only
+        // while scrolling hides that the device lists and room correction
+        // sit below the fold.
+        QQC.ScrollBar.vertical: QQC.ScrollBar {
+          id: scrollBar
+          policy: scroller.overflows ? QQC.ScrollBar.AlwaysOn : QQC.ScrollBar.AlwaysOff
+        }
 
         Column {
           id: content
@@ -916,6 +971,7 @@ Panel {
           // as an unfinished box on one side.
           x: Style.space(2)
           width: parent.width - Style.space(4)
+            - (scroller.overflows ? scrollBar.width + Style.space(4) : 0)
           spacing: Style.space(12)
 
           PanelHero {
@@ -1171,6 +1227,175 @@ Panel {
           Column {
             width: parent.width
             spacing: Style.space(6)
+            visible: root.roomCorrectionAvailable() || service.roomStage !== ""
+
+            PanelSeparator { foreground: root.foreground }
+            PanelSectionHeader { text: "ROOM CORRECTION"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: service.roomStage === ""
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: "For external speakers in a room: measures several positions around your "
+                  + "seat with the calibrated microphone and corrects what they share. About "
+                  + "30 seconds per position, and you move the microphone between them."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(10)
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: "MEASUREMENT POSITIONS"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+                QQC.SpinBox {
+                  id: roomPositionsBox
+                  from: 1
+                  to: 9
+                  value: 5
+                  editable: false
+                  enabled: !service.busy
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                visible: micCalPath.text.trim() === ""
+                width: parent.width
+                text: "No calibration file for this microphone, so the correction also evens "
+                  + "out the microphone's own sound. Usually still a clear improvement; if "
+                  + "you have the file, enter its path under Advanced, MIC CAL FILE."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Button {
+                width: parent.width
+                bordered: true
+                iconText: "󰊚"
+                text: "Start room correction"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy && root.roomCorrectionAvailable()
+                onClicked: {
+                  var sink = service.sinks[root.sinkIndex]
+                  var mic = service.microphones[root.micIndex]
+                  service.roomStart(sink.name, mic.name, root.selectedChannelValue(),
+                                    root.options(), roomPositionsBox.value)
+                }
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: service.roomStage === "place"
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: root.roomPrompt()
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+              Button {
+                width: parent.width
+                bordered: true
+                selected: true
+                iconText: service.busy && service.phase === "roommeasure" ? "󰑓" : "󰊚"
+                iconSpinning: service.busy && service.phase === "roommeasure"
+                text: service.busy && service.phase === "roommeasure" ? "Measuring… keep quiet"
+                  : "Measure position " + service.roomPosition + " of " + service.roomPositions()
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.roomMeasure()
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(6)
+              visible: service.roomStage === "failed"
+
+              Text {
+                textFormat: Text.PlainText
+                width: parent.width
+                text: root.roomFailureText()
+                color: bar ? bar.urgent : Color.urgent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Button {
+                width: parent.width
+                bordered: true
+                selected: true
+                iconText: "󰑓"
+                text: "Retake position " + service.roomPosition
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.roomMeasure()
+              }
+              Button {
+                width: parent.width
+                bordered: true
+                iconText: "󰒭"
+                text: "Skip position " + service.roomPosition
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                enabled: !service.busy
+                onClicked: service.roomNext()
+              }
+            }
+
+            Button {
+              width: parent.width
+              visible: service.roomStage === "fit" && !service.busy
+              bordered: true
+              selected: true
+              iconText: "󰄬"
+              text: "Fit and install"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: service.roomFit()
+            }
+
+            Button {
+              width: parent.width
+              visible: service.roomStage !== ""
+              bordered: true
+              iconText: "󰅖"
+              text: "Cancel room correction"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              enabled: !service.busy
+              onClicked: service.roomCancel()
+            }
+          }
+
+
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
 
             // Measuring needs numpy and scipy, which Omarchy does not ship.
             // Without them everything here works except the one thing the
@@ -1224,7 +1449,10 @@ Panel {
                 foreground: root.foreground
                 fontFamily: root.fontFamily
                 enabled: !service.busy
-                onClicked: root.sinkIndex = index
+                onClicked: {
+                  root.sinkIndex = index
+                  root.chosenSinkName = modelData.name
+                }
               }
             }
             Text {
@@ -1279,7 +1507,12 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   enabled: !service.busy
-                  onClicked: { root.micIndex = index; channelBox.currentIndex = 0 }
+                  onClicked: {
+                    root.micIndex = index
+                    root.chosenMicName = modelData.name
+                    root._selectedMicName = modelData.name
+                    channelBox.currentIndex = 0
+                  }
                 }
 
                 Text {
@@ -1991,6 +2224,39 @@ Panel {
               }
             }
           }
+        }
+      }
+
+      BorderSurface {
+        id: moreBelow
+        visible: scroller.overflows && !scroller.atYEnd
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: Style.space(6)
+        radius: Style.cornerRadius
+        implicitWidth: moreText.implicitWidth + Style.space(24)
+        implicitHeight: moreText.implicitHeight + Style.space(10)
+        color: Color.popups.background
+        borderSpec: Border.controlSpec(moreMouse.containsMouse ? "hover-cursor" : "normal",
+                                       root.foreground, Color.accent)
+
+        Text {
+          id: moreText
+          anchors.centerIn: parent
+          textFormat: Text.PlainText
+          text: "More below  󰁅"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+        MouseArea {
+          id: moreMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: Qt.PointingHandCursor
+          onClicked: scroller.contentY = Math.min(
+            scroller.contentHeight - scroller.height,
+            scroller.contentY + scroller.height * 0.8)
         }
       }
     }
