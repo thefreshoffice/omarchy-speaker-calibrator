@@ -243,13 +243,17 @@ VIRTUAL_SINK = "omarchy_speaker_tuning"
 # the switcher (which shows the description) never disagree.
 SINK_LABEL = "Calibrated Speakers"
 
+# module-rt asks RTKit directly, as the stock pipewire.conf does. Through the
+# portal, a portal started before RTKit reports its limits as zero: the realtime
+# budget is clamped to 0 µs, the data thread still becomes SCHED_RR, and the
+# kernel kills the filter-chain the moment audio flows (issue #25).
 HOST_TEXT = """context.properties = { log.level = 0 }
 context.spa-libs = {
   audio.convert.* = audioconvert/libspa-audioconvert
   support.* = support/libspa-support
 }
 context.modules = [
-  { name = libpipewire-module-rt args = { } flags = [ ifexists nofail ] }
+  { name = libpipewire-module-rt args = { rtportal.enabled = false } flags = [ ifexists nofail ] }
   { name = libpipewire-module-protocol-native }
   { name = libpipewire-module-client-node }
   { name = libpipewire-module-adapter }
