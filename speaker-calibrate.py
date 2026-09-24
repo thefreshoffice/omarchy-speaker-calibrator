@@ -260,7 +260,15 @@ context.modules = [
 ]
 """
 
-UNIT_TEXT = """[Unit]
+# The sandbox PipeWire's own pipewire.service runs under, so a filter-chain
+# host is held to exactly what the daemon it copies is.
+UNIT_SANDBOX = """LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service mincore"""
+
+UNIT_TEXT = f"""[Unit]
 Description=Omarchy speaker tuning filter-chain
 After=pipewire.service wireplumber.service
 Requires=pipewire.service
@@ -272,6 +280,9 @@ Type=simple
 ExecStart=/usr/bin/pipewire -c omarchy-speaker-tuning.conf
 Restart=on-failure
 RestartSec=2
+{UNIT_SANDBOX}
+# The data thread is made realtime through RTKit (see HOST_TEXT).
+RestrictRealtime=no
 
 [Install]
 WantedBy=graphical-session.target
@@ -306,20 +317,33 @@ def harmonic_bass_status():
             "package": None, "path": None, "missing_ports": []}
 
 
-LOUDNESS_UNIT_TEXT = """[Unit]
+LOUDNESS_UNIT_TEXT = f"""[Unit]
 Description=Omarchy speaker loudness compensation
 After=omarchy-speaker-tuning.service
 PartOf=omarchy-speaker-tuning.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -B -s {tracker}
+ExecStart=/usr/bin/python3 -B -I {{tracker}}
 Restart=on-failure
 RestartSec=2
+{UNIT_SANDBOX}
+# Only writes controls; nothing here needs to be realtime.
+RestrictRealtime=yes
 
 [Install]
 WantedBy=graphical-session.target
 """
+
+
+def unit_quoted(path):
+    """A path as one ExecStart argument, whatever the directory is called.
+
+    Unquoted, a space splits it in two, and systemd reads a percent sign as
+    the start of a specifier and a backslash as an escape.
+    """
+    text = str(path).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{text}"'
 
 
 def loudness_unit_path():
@@ -345,7 +369,7 @@ def ensure_loudness_unit():
     registration outlives any number of switches.
     """
     unit = loudness_unit_path()
-    wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
+    wanted = LOUDNESS_UNIT_TEXT.format(tracker=unit_quoted(loudness_tracker_path()))
     fresh = True
     try:
         fresh = read_text_bounded(unit) != wanted
