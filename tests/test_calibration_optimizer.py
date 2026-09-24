@@ -2250,6 +2250,19 @@ class VendorTrialTests(unittest.TestCase):
         self.assertIn("omarchy-speaker-trial.conf", speaker_calibrate.TRIAL_UNIT_TEXT)
         self.assertNotIn("omarchy-speaker-tuning.conf", speaker_calibrate.TRIAL_UNIT_TEXT)
 
+    def test_every_unit_runs_in_pipewires_own_sandbox(self):
+        loudness = speaker_calibrate.LOUDNESS_UNIT_TEXT.format(tracker='"/x.py"')
+        for text in (speaker_calibrate.UNIT_TEXT, speaker_calibrate.TRIAL_UNIT_TEXT, loudness):
+            service = text.split("[Service]")[1].split("[Install]")[0]
+            self.assertIn(speaker_calibrate.UNIT_SANDBOX, service)
+        # The filter-chain's data thread is made realtime through RTKit.
+        for text in (speaker_calibrate.UNIT_TEXT, speaker_calibrate.TRIAL_UNIT_TEXT):
+            self.assertIn("RestrictRealtime=no", text)
+        self.assertIn("RestrictRealtime=yes", loudness)
+
+    def test_the_tracker_path_is_one_argument_whatever_the_directory_is_called(self):
+        self.assertEqual(speaker_calibrate.unit_quoted('/a b/%h"x.py'), '"/a b/%%h\\"x.py"')
+
     def test_the_overlay_links_omarchy_and_holds_only_the_rendered_tuning(self):
         rendered = {"slug": "slimbook-executive", "tuning": 'description="x"\n', "chain": "context.modules = []\n"}
         overlay = speaker_calibrate.build_vendor_overlay(rendered)
