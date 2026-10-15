@@ -719,13 +719,21 @@ def analyse_capture(
     gate_cycles: float | None = DEFAULT_GATE_CYCLES,
 ) -> dict:
     """Analyze a mono capture of the generated stereo measurement program."""
+    # Some DMICs carry a DC offset far above the room noise, which then reads
+    # as background and swamps the sweep alignment.  Zero-phase, so arrival
+    # times are untouched; 10 Hz sits well below the 80 Hz analysis band.
+    # Peak and clipping stay on the raw capture, which is what actually clips.
+    filtered = signal.sosfiltfilt(
+        signal.butter(2, 10.0, "highpass", fs=spec.rate, output="sos"),
+        np.asarray(capture, dtype=np.float64),
+    )
     sweep = make_sweep(spec)
     starts, correlations, clock_ratio = locate_sweeps(
-        capture, sweep, schedule, spec.rate, record_lead_seconds
+        filtered, sweep, schedule, spec.rate, record_lead_seconds
     )
     drift_ppm = (clock_ratio - 1.0) * 1_000_000.0
     noise_frames = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
-    noise = capture[:noise_frames]
+    noise = filtered[:noise_frames]
     noise_level = rms(noise)
     noise_dbfs = dbfs(noise_level)
     frequencies = _log_grid(max(80.0, spec.start_hz), min(16_000.0, spec.end_hz))
@@ -737,7 +745,7 @@ def analyse_capture(
     # The noise floor is the room sound between sweeps, put through the same
     # deconvolution and gate as the sweeps and read at the same position.
     _, noise_floor, _ = regularized_response(
-        silence_buffer(capture, starts, spec, record_lead_seconds, segment_frames),
+        silence_buffer(filtered, starts, spec, record_lead_seconds, segment_frames),
         sweep, spec, frequencies,
         gate_cycles=gate_cycles, nominal_peak_index=pre_frames, locate_peak=False,
     )
@@ -746,9 +754,12 @@ def analyse_capture(
     per_channel: dict[int, list[dict]] = {0: [], 1: []}
     for event, start, correlation in zip(schedule, starts, correlations):
         segment = _drift_corrected_segment(
-            capture, start - pre_frames, segment_frames, clock_ratio
+            filtered, start - pre_frames, segment_frames, clock_ratio
         )
         sweep_part = segment[pre_frames:pre_frames + sweep.size]
+        raw_part = _drift_corrected_segment(
+            capture, start - pre_frames, segment_frames, clock_ratio
+        )[pre_frames:pre_frames + sweep.size]
         impulse, curve, peak_index = regularized_response(
             segment, sweep, spec, frequencies,
             gate_cycles=gate_cycles, nominal_peak_index=pre_frames,
@@ -760,8 +771,8 @@ def analyse_capture(
             "start_frame": start,
             "alignment_correlation": round(correlation, 5),
             "rms_dbfs": round(dbfs(segment_rms), 3),
-            "peak_dbfs": round(dbfs(float(np.max(np.abs(sweep_part)))), 3),
-            "clipped_samples": int(np.count_nonzero(np.abs(sweep_part) >= 0.999)),
+            "peak_dbfs": round(dbfs(float(np.max(np.abs(raw_part)))), 3),
+            "clipped_samples": int(np.count_nonzero(np.abs(raw_part) >= 0.999)),
             "broadband_prominence_db": round(dbfs(segment_rms) - noise_dbfs, 3),
             "harmonic_residual_db": round(
                 estimate_harmonic_residual_db(sweep_part, spec, noise_level), 3
@@ -1291,7 +1302,10 @@ def analyse_level_probe(
     if usable < 6 * block:
         raise ValueError("The level probe recording is too short to analyse.")
     blocks = values[:usable].reshape((usable // block, block, channels))
-    block_rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    # Some DMICs carry a DC offset well above the room noise; left in, it reads
+    # as background and hides the probe.  Median, so the start-up burst does not skew it.
+    centered = blocks - np.median(values[:usable], axis=0)
+    block_rms = np.sqrt(np.mean(centered * centered, axis=1))
     block_peak = np.max(np.abs(blocks), axis=1)
     count = blocks.shape[0]
     background_end = int(np.clip(round(background_seconds * rate / block), 1, count // 2))

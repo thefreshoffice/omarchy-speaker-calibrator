@@ -165,6 +165,23 @@ class CalibrationDspTests(unittest.TestCase):
         self.assertEqual(len(result["validation_curves"]), 6)
         self.assertLess(result["quality"]["metrics"]["worst_repeatability_db"], 0.5)
 
+    def test_microphone_dc_offset_is_not_background_and_does_not_spoil_alignment(self):
+        # Some digital microphones deliver a constant offset far above the room
+        # noise; at -9 dBFS it read as background and broke sweep alignment.
+        capture, schedule = self.synthetic_capture()
+        capture += 0.35
+        result = analyse_capture(
+            capture,
+            schedule,
+            self.spec,
+            record_lead_seconds=0.25,
+            internal_mic=True,
+        )
+        self.assertTrue(result["quality"]["accepted"], result["quality"])
+        self.assertLess(result["quality"]["metrics"]["background_dbfs"], -60.0)
+        self.assertGreater(result["quality"]["metrics"]["minimum_alignment_correlation"], 0.15)
+        self.assertEqual(result["quality"]["metrics"]["clipped_samples"], 0)
+
     def test_clock_drift_is_estimated_and_corrected(self):
         capture, schedule = self.synthetic_capture(drift_ratio=1.001)
         result = analyse_capture(
@@ -419,6 +436,14 @@ class LevelSearchTests(unittest.TestCase):
         probe = analyse_level_probe(capture, self.rate)
         self.assertLess(probe["background_rms_dbfs"], -50.0)
         self.assertAlmostEqual(probe["peak_dbfs"], 20 * np.log10(0.3), delta=0.2)
+
+    def test_probe_hears_a_quiet_tone_over_a_microphone_dc_offset(self):
+        # A -40 dBFS tone on a -9 dBFS offset: counted in the RMS, the offset
+        # made the probe look like no signal at all.
+        capture = self.probe_capture(0.01) + 0.35
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertGreater(probe["prominence_db"], 30.0)
+        self.assertLess(probe["background_rms_dbfs"], -60.0)
 
     def test_silence_has_no_prominence(self):
         probe = analyse_level_probe(self.probe_capture(0.0), self.rate)
