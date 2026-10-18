@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import copy
+import dataclasses
 import json
 import sys
 import tempfile
@@ -45,7 +46,7 @@ class CalibrationDspTests(unittest.TestCase):
         )
 
     def synthetic_capture(self, *, clip=False, drift_ratio=None, noise=2e-5,
-                          late_reflection=None):
+                          late_reflection=None, lead_seconds=0.25):
         program, schedule = build_measurement_signal(self.spec)
         mono = np.sum(program, axis=1)
         impulse = np.zeros(400)
@@ -55,7 +56,7 @@ class CalibrationDspTests(unittest.TestCase):
             delay_samples, amplitude = late_reflection
             impulse[32 + delay_samples] = amplitude
         response = signal.fftconvolve(mono, impulse)
-        lead = np.zeros(int(0.25 * self.spec.rate))
+        lead = np.zeros(int(lead_seconds * self.spec.rate))
         capture = np.concatenate((lead, response, np.zeros(self.spec.rate // 2)))
         if drift_ratio is not None:
             numerator = int(round(drift_ratio * 10_000))
@@ -136,6 +137,36 @@ class CalibrationDspTests(unittest.TestCase):
         # The test sweep stops at 3 kHz, so only the low and mid bands exist.
         self.assertIn("snr_low_db", noisy_result["quality"]["metrics"])
         self.assertNotIn("snr_high_db", noisy_result["quality"]["metrics"])
+
+    def test_capture_ignores_a_digital_microphone_startup_burst(self):
+        # The same burst the level probe skips, at the plugin's real 1 s lead
+        # and sweep spacing: full-scale garbage for 180 ms while the microphone
+        # node starts, long before the first sweep.  It must not read as a loud
+        # room, nor get into the noise floor the response is compared against;
+        # with this spacing that floor is read from 0.15 s on.
+        self.spec = dataclasses.replace(self.spec, pre_silence=0.5, block_gap=0.65)
+        clean, schedule = self.synthetic_capture(lead_seconds=1.0)
+        burst = clean.copy()
+        startup = int(0.18 * self.spec.rate)
+        burst[:startup] = np.random.default_rng(7).choice((-1.0, 1.0), startup)
+        clean_result = analyse_capture(
+            clean, schedule, self.spec, record_lead_seconds=1.0, internal_mic=True
+        )
+        burst_result = analyse_capture(
+            burst, schedule, self.spec, record_lead_seconds=1.0, internal_mic=True
+        )
+        clean_metrics = clean_result["quality"]["metrics"]
+        burst_metrics = burst_result["quality"]["metrics"]
+        self.assertLess(burst_metrics["background_dbfs"], -50.0)
+        self.assertAlmostEqual(
+            burst_metrics["background_dbfs"], clean_metrics["background_dbfs"], delta=1.0
+        )
+        self.assertAlmostEqual(burst_metrics["snr_mid_db"], clean_metrics["snr_mid_db"], delta=1.0)
+        self.assertFalse(
+            [w for w in burst_result["quality"]["warnings"] if "background level" in w],
+            burst_result["quality"]["warnings"],
+        )
+        self.assertTrue(burst_result["quality"]["accepted"], burst_result["quality"])
 
     def test_signal_alternates_left_and_right_three_times(self):
         program, schedule = build_measurement_signal(self.spec)

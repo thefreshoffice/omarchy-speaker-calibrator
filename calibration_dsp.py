@@ -257,6 +257,12 @@ GATE_PRE_ARRIVAL_SECONDS = 0.05
 # a few hundred hertz to drop wall and ceiling reflections and the distortion
 # products that a sine sweep folds into negative time.
 DEFAULT_GATE_CYCLES = 15.0
+# Some digital microphone drivers open their stream with a short burst: full
+# scale for the first 50 ms, settled after about 150 ms on a Ryzen HD Audio
+# array, a 30 ms pop at -12 dBFS on a sof-soundwire array.  Every recording
+# starts well before anything is played, so this much of its opening is left
+# out wherever the room is judged from it.
+STARTUP_SETTLE_SECONDS = 0.2
 
 
 def _band_limit_weights(bins: np.ndarray, spec: SweepSpec) -> np.ndarray:
@@ -377,19 +383,22 @@ def silence_buffer(
     spec: SweepSpec,
     record_lead_seconds: float,
     length: int,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> np.ndarray:
     """Recorded room sound from between the sweeps, tiled to ``length``.
 
     Running this through the same deconvolution and gate as a sweep measures
     the noise floor in exactly the units of the response, at every frequency,
     without any assumption about how the inverse filter spreads noise in time.
+    The piece before the first sweep starts after ``startup_settle_seconds``,
+    so a microphone's start-up burst does not pass for room sound.
     """
     rate = spec.rate
     margin = int(round(min(0.1, spec.block_gap / 4.0) * rate))
     tail = int(round(spec.response_tail * rate))
     pieces = []
     first_end = starts[0] - margin
-    first_start = max(0, first_end - int(round(
+    first_start = max(int(round(startup_settle_seconds * rate)), first_end - int(round(
         (0.75 * record_lead_seconds + spec.pre_silence) * rate
     )))
     if first_end > first_start:
@@ -717,15 +726,25 @@ def analyse_capture(
     internal_mic: bool,
     calibration: dict | None = None,
     gate_cycles: float | None = DEFAULT_GATE_CYCLES,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> dict:
-    """Analyze a mono capture of the generated stereo measurement program."""
+    """Analyze a mono capture of the generated stereo measurement program.
+
+    The recorder starts ``record_lead_seconds`` before playback, so the
+    opening of the capture is room sound and is reported as the background
+    level.  The first ``startup_settle_seconds`` of it are skipped, as in
+    ``analyse_level_probe``, because some microphones start with a burst that
+    would otherwise read as a loud room.  A short lead keeps at least half the
+    background window.
+    """
     sweep = make_sweep(spec)
     starts, correlations, clock_ratio = locate_sweeps(
         capture, sweep, schedule, spec.rate, record_lead_seconds
     )
     drift_ppm = (clock_ratio - 1.0) * 1_000_000.0
-    noise_frames = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
-    noise = capture[:noise_frames]
+    noise_end = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
+    settle_frames = min(int(round(startup_settle_seconds * spec.rate)), noise_end // 2)
+    noise = capture[settle_frames:noise_end]
     noise_level = rms(noise)
     noise_dbfs = dbfs(noise_level)
     frequencies = _log_grid(max(80.0, spec.start_hz), min(16_000.0, spec.end_hz))
@@ -737,7 +756,8 @@ def analyse_capture(
     # The noise floor is the room sound between sweeps, put through the same
     # deconvolution and gate as the sweeps and read at the same position.
     _, noise_floor, _ = regularized_response(
-        silence_buffer(capture, starts, spec, record_lead_seconds, segment_frames),
+        silence_buffer(capture, starts, spec, record_lead_seconds, segment_frames,
+                       startup_settle_seconds),
         sweep, spec, frequencies,
         gate_cycles=gate_cycles, nominal_peak_index=pre_frames, locate_peak=False,
     )
@@ -1258,7 +1278,7 @@ def analyse_level_probe(
     *,
     background_seconds: float = 0.3,
     block_seconds: float = 0.05,
-    startup_settle_seconds: float = 0.2,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> dict:
     """Summarize a short level-probe recording without relying on timing.
 
