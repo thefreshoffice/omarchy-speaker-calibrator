@@ -67,3 +67,9 @@ Messages about unknown Quickshell modules are noise; `Expected token` is not.
   strings.
 - Small pull requests. Three of five hundred lines are reviewed faster than
   one of fifteen hundred.
+
+For runtime binding regressions on an Omarchy development desktop, run
+`python scripts/smoke-qml.py`. It loads the real QML in a separate hidden
+Quickshell instance with disposable HOME/state and a stub calibration helper.
+It performs no measurements or audio changes. The Python suite tests the
+actual calibration backend separately.
