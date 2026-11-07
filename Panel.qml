@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 Panel {
@@ -17,7 +18,9 @@ Panel {
   readonly property var barIdentity: hostWidget || root
   readonly property string helperPath: decodeURIComponent(
     String(Qt.resolvedUrl("speaker-calibrate.py")).replace(/^file:\/\//, ""))
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
+  readonly property color accent: Commons.Color.accent
+  readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Util.alpha(foreground, 0.62)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -422,7 +425,7 @@ Panel {
       context.stroke()
     }
     trace(comparison.internal, root.dim, 1.5)
-    trace(comparison.external, bar && bar.accent ? bar.accent : Color.accent, 2)
+    trace(comparison.external, root.accent, 2)
   }
   // Switching the correction off also drops the level to the one the
   // correction plays at, so the two can be judged on tone alone.
@@ -705,12 +708,12 @@ Panel {
     readonly property bool _hot: actionMouse.containsMouse
     radius: Style.cornerRadius
     implicitHeight: Math.max(Style.space(44), actionContent.implicitHeight + Style.space(16))
-    color: Style.controlFill(false, _hot && enabled, root.foreground, Color.accent)
-    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal", root.foreground, Color.accent)
+    color: Style.controlFill(false, _hot && enabled, root.foreground, root.accent)
+    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal", root.foreground, root.accent)
     // Disabled rows dim, except during a quick switch: a quarter of a second
     // of dimming reads as a flicker, and the click is simply ignored then.
     opacity: enabled || (service.busy && !service.working) ? 1.0 : 0.55
-    Behavior on color { ColorAnimation { duration: 100 } }
+    Behavior on color { ColorAnimation { duration: Style.duration(100) } }
 
     Row {
       id: actionContent
@@ -957,12 +960,12 @@ Panel {
     // Input gain after the sections: trim in protected mode, make-up when louder.
     var net = Number(fit.net_input_gain_db !== undefined ? fit.net_input_gain_db : -(fit.headroom_db || 1))
     context.globalAlpha = 0.55
-    context.strokeStyle = Color.accent
+    context.strokeStyle = root.accent
     context.lineWidth = 1
     context.setLineDash([3, 3])
     context.beginPath(); context.moveTo(padLeft, yFor(net)); context.lineTo(width - padRight, yFor(net)); context.stroke()
     context.setLineDash([])
-    context.fillStyle = Color.accent
+    context.fillStyle = root.accent
     context.textAlign = "left"
     context.textBaseline = "bottom"
     context.globalAlpha = 0.8
@@ -1068,7 +1071,7 @@ Panel {
             visible: service.error !== ""
             width: parent.width
             text: service.error
-            color: bar ? bar.urgent : Color.urgent
+            color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             wrapMode: Text.WordWrap
@@ -1172,7 +1175,7 @@ Panel {
               && service.proposal.quality !== undefined && service.proposal.quality.accepted === false
             width: parent.width
             text: root.qualityIssuesText() + (root.qualityGuidanceText() !== "" ? "\n" + root.qualityGuidanceText() : "")
-            color: bar ? bar.urgent : Color.urgent
+            color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
@@ -1188,7 +1191,7 @@ Panel {
               : service.verificationSummary(service.status.verification)
             color: service.status.verification && !service.status.verification.stale
               && service.status.verification.verdict === "fail"
-              ? (bar ? bar.urgent : Color.urgent) : root.dim
+              ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
@@ -1418,7 +1421,7 @@ Panel {
             // A failure is said here as well as under the header: whoever
             // pressed the button above is looking at this line, and the header
             // is a screen further up.
-            color: service.error !== "" ? (bar ? bar.urgent : Color.urgent) : root.dim
+            color: service.error !== "" ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: service.error !== "" ? Style.font.body : Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -1952,7 +1955,7 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: "—  external mic"
-                  color: bar && bar.accent ? bar.accent : Color.accent
+                  color: root.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
@@ -2129,7 +2132,7 @@ Panel {
                 : "LAST MEASUREMENT  ·  NONE YET"
               foreground: service.proposal && service.proposal.quality
                 && !service.proposal.quality.accepted
-                ? (bar ? bar.urgent : Color.urgent) : root.foreground
+                ? root.urgent : root.foreground
               fontFamily: root.fontFamily
             }
 
@@ -2155,7 +2158,7 @@ Panel {
               visible: root.importedNote() !== ""
               width: parent.width
               text: root.importedNote()
-              color: root.importedMismatch() ? (bar ? bar.urgent : Color.urgent) : root.dim
+              color: root.importedMismatch() ? root.urgent : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
@@ -2173,7 +2176,7 @@ Panel {
                   text: "•  " + modelData
                   color: service.proposal && service.proposal.quality
                     && !service.proposal.quality.accepted
-                    ? (bar ? bar.urgent : Color.urgent) : root.dim
+                    ? root.urgent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   wrapMode: Text.WordWrap
@@ -2347,7 +2350,7 @@ Panel {
                   if (fit && fit.predicted_response_db) {
                     var predicted = fit.predicted_response_db
                     count = Math.min(frequencies.length, predicted.length)
-                    context.strokeStyle = Color.accent
+                    context.strokeStyle = root.accent
                     context.globalAlpha = 0.95
                     context.lineWidth = 2.0
                     context.setLineDash([7, 4])
@@ -2378,7 +2381,7 @@ Panel {
                   }
                   if (fit && fit.filters) {
                     context.setLineDash([])
-                    context.strokeStyle = Color.accent
+                    context.strokeStyle = root.accent
                     context.globalAlpha = 0.62
                     context.lineWidth = 1.5
                     for (var filterIndex = 0; filterIndex < fit.filters.length; filterIndex++) {
@@ -2452,7 +2455,7 @@ Panel {
                 text: "LAST CHECK  ·  " + String((service.status.verification || {}).verdict || "").toUpperCase()
                   + ((service.status.verification || {}).stale ? "  ·  STALE" : "")
                 foreground: (service.status.verification || {}).verdict === "fail"
-                  ? (bar ? bar.urgent : Color.urgent) : root.foreground
+                  ? root.urgent : root.foreground
                 fontFamily: root.fontFamily
               }
               Column {
@@ -2474,7 +2477,7 @@ Panel {
                     width: parent.width
                     text: "•  " + modelData
                     color: (service.status.verification || {}).verdict === "fail"
-                      ? (bar ? bar.urgent : Color.urgent) : root.dim
+                      ? root.urgent : root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     wrapMode: Text.WordWrap
