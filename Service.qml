@@ -233,14 +233,11 @@ Item {
     if (install) arguments.push("--install")
     start("measure", arguments)
   }
-  // Re-fit the last recorded sweeps with different options, without playing
-  // anything; with install=true the result is applied immediately.
-  function refit(options, install) {
-    var arguments = ["reanalyze-saved-json"].concat(optionArguments(options))
-    if (install) arguments.push("--install")
-    start("refit", arguments)
+  // Re-fit the last recorded sweeps with different options and play the
+  // result; what played before stays in the list.
+  function refit(options) {
+    start("refit", ["reanalyze-saved-json"].concat(optionArguments(options)).concat(["--install"]))
   }
-  function install() { start("install", ["install-proposal"]) }
   // The calibration list: a click plays one, live or without a break; the
   // pin keeps one past the last ten; delete drops one that is not playing.
   // The id is one the helper listed, and it checks it again.
@@ -475,15 +472,8 @@ Item {
             root.message = (root.phase === "refit" ? "Refit ready: " : "Measurement accepted: ")
               + root.optionsLabel(result) + " · " + count
               + (count === 1 ? " section" : " sections")
-              + " · nothing changes until you press Install"
           } else
             root.message = "The measurement was rejected — see the guidance below and try again"
-        } else if (root.phase === "install") {
-          var installed = JSON.parse(raw)
-          root.status = Object.assign({}, root.status, { enabled: true, profile: installed, bypass: false })
-          root.message = "Installed and playing: " + root.optionsLabel(installed)
-            + (installed.activation === "restart" ? " · tuning restarted" : " · switched live")
-          Qt.callLater(root.refreshStatus)
         } else if (root.phase === "relevel") {
           var levelled = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { profile: levelled.profile, bypass: false })

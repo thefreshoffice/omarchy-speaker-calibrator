@@ -177,6 +177,8 @@ LIBRARY_ID = re.compile(r"[0-9a-f]{12}")
 # from the registry come on top of these.
 LIBRARY_KEEP = 10
 LIBRARY_SOURCES = ("measured", "imported", "shared")
+# What a profile carries about its place in the list, never shared.
+LIBRARY_KEYS = ("library_id", "library_played_at")
 # Before the library there were two slots, the profile the last install
 # replaced and a decision held open after a measurement.  Read once, to fill
 # the library, and then removed.
@@ -4205,7 +4207,9 @@ def shared_payload():
     day = str(profile.get("created_at", ""))[:10] or dt.date.today().isoformat()
     name = f"{hardware['label']} · {kind} · {day}"
     shared = dict(profile)
-    for key in ("activation", "installed", "imported"):
+    # Where it sits in this machine's list is this machine's business: an id
+    # carried along would make the file pass for the entry it came from.
+    for key in ("activation", "installed", "imported") + LIBRARY_KEYS:
         shared.pop(key, None)
     mic = dict(shared.get("microphone") or {})
     # The correction file is a path on the exporting machine; only whether
@@ -4370,8 +4374,13 @@ def local_speaker():
     return {"name": sinks[0]["name"], "description": label(sinks[0])}
 
 
-def shared_summary(path, ours, sinks):
-    """One row for the panel: what the file is and whether it fits this machine."""
+def shared_summary(path, ours, sinks, known=None):
+    """One row for the panel: what the file is and whether it fits this machine.
+
+    ``known`` is what the list holds: its ids and its entries' filters.  A
+    file it already holds, because it was loaded or because it is an export
+    of one of its own entries, is marked so the panel can leave it out.
+    """
     try:
         raw = read_text_bounded(path, SHARE_LIMIT_BYTES, missing_ok=False)
         payload = valid_shared_payload(json.loads(raw or ""))
@@ -4391,7 +4400,37 @@ def shared_summary(path, ours, sinks):
         "created_at": short_label(profile.get("created_at"), 40),
         "microphone": MICROPHONE_KIND_LABELS[microphone_kind(profile)],
         "matches": {"machine": hardware_matches(theirs, ours), "speakers": theirs.get("speaker") in sinks},
+        "in_library": _known_to_library(payload, known),
     }
+
+
+def _library_fingerprint(profile):
+    return json.dumps((profile.get("fit") or {}).get("filters"), sort_keys=True, default=str)
+
+
+def _library_known():
+    """The ids in the list and the filters of its entries, for shared_summary."""
+    ids, filters = set(), set()
+    for entry in _read_index() or []:
+        ids.add(entry["id"])
+        try:
+            profile = load_profile(_entry_file(entry["id"]))
+        except (SystemExit, AttributeError):
+            profile = None
+        if profile is not None:
+            filters.add(_library_fingerprint(profile))
+    return ids, filters
+
+
+def _known_to_library(payload, known):
+    if not known:
+        return False
+    ids, filters = known
+    profile = payload.get("profile") or {}
+    # The id an import of this file gets: see profile_identity.
+    identity = profile_identity({"fit": profile.get("fit"),
+                                 "imported": {"exported_at": short_label(payload.get("exported_at"), 40)}})
+    return identity in ids or _library_fingerprint(profile) in filters
 
 
 def shared_profiles():
@@ -4410,9 +4449,12 @@ def shared_profiles():
     except OSError:
         return []
     candidates.sort(reverse=True)
+    if not candidates:
+        return []
     ours = hardware_id()
     sinks = {item.get("name") for item in physical_sinks()}
-    return [shared_summary(directory / name, ours, sinks) for _, name in candidates[:SHARE_LIST_LIMIT]]
+    known = _library_known()
+    return [shared_summary(directory / name, ours, sinks, known) for _, name in candidates[:SHARE_LIST_LIMIT]]
 
 
 def import_profile(name=None, path=None):
@@ -4457,6 +4499,8 @@ def adopt_shared_payload(payload, source_name, registry=None):
     here = {item.get("name"): item for item in physical_sinks()}
     matches = {"machine": hardware_matches(theirs, ours), "speakers": theirs.get("speaker") in here}
     profile = payload["profile"]
+    for key in LIBRARY_KEYS:
+        profile.pop(key, None)
     if matches["speakers"]:
         found = here[theirs["speaker"]]
         profile["speaker"] = {"name": checked_sink_name(found["name"]), "description": label(found)}
