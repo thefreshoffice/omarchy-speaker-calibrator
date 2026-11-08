@@ -36,6 +36,8 @@ Panel {
   property bool shareOpen: false
   property bool detailsOpen: false
   property bool setupOpen: false
+  // Which devices picked by hand are not connected, so a fallback stands in.
+  property var missingDevices: []
   // Which share row was pressed, so its confirmation shows under that one.
   property bool shareFromStep: false
   // A score in a word: 67 reads like a poor grade and is a good profile.  The
@@ -190,12 +192,18 @@ Panel {
     }
     var sink = deviceIndex(service.sinks, root.chosenSink)
     if (sink < 0) sink = deviceIndex(service.sinks, (profile.speaker || {}).name)
+    var sinkMissing = sink < 0 && root.chosenSink !== "" ? root.chosenSink : ""
     if (sink < 0) sink = firstInternal(service.sinks)
     root.sinkIndex = sink
     var mic = deviceIndex(service.microphones, root.chosenMic)
     if (mic < 0) mic = deviceIndex(service.microphones, (profile.microphone || {}).name)
+    var micMissing = mic < 0 && root.chosenMic !== "" ? root.chosenMic : ""
     if (mic < 0) mic = defaultInternal(service.microphones)
     if (mic < 0) mic = firstInternal(service.microphones)
+    // A device picked by hand that is not connected: the fallback stands in,
+    // and the line under Calibrate says so rather than measuring quietly
+    // with something else.
+    root.missingDevices = (sinkMissing ? ["speakers"] : []).concat(micMissing ? ["microphone"] : [])
     var before = root.micIndex >= 0 && service.microphones[root.micIndex]
       ? service.microphones[root.micIndex].name : ""
     var after = mic >= 0 ? service.microphones[mic].name : ""
@@ -222,13 +230,11 @@ Panel {
   // fraction of a second.  A different voicing or channel trim changes the fit
   // itself and goes through a refit; without any measurement the options
   // simply wait for the next calibration.
+  // The level switches: a gain and the bass shelf, applied live.  A voicing
+  // or channel balance waiting for its refit stays waiting; its own row
+  // fits it, so a level switch never starts a refit nobody pressed.
   function applyOptions() {
-    var profile = service.status.profile
-    if (profile && service.status.enabled
-        && (profile.voicing || "neutral") === root.voicingMode
-        && (profile.channel_trim || "off") === root.channelTrimMode)
-      service.relevel(root.options())
-    else if (root.hasMeasurement()) service.refit(root.options())
+    if (service.status.profile) service.relevel(root.options())
   }
   function adoptOptions(profile) {
     if (!profile) return
@@ -403,16 +409,24 @@ Panel {
     return (playing.voicing || "neutral") !== root.voicingMode
       || (playing.channel_trim || "off") !== root.channelTrimMode
   }
-  // What the next calibration measures with.  The pickers open by
-  // themselves while there is nothing chosen yet or a chosen device is gone.
+  // What the next calibration measures with.  The pickers open by themselves
+  // before a first calibration or with no device to choose from; a device
+  // picked by hand that is gone is named in the line under Calibrate.
   function setupForced() {
     return !service.status.profile || root.sinkIndex < 0 || root.micIndex < 0
   }
   function setupShown() { return root.setupOpen || root.setupForced() }
+  function missingText() {
+    return "The " + root.missingDevices.join(" and the ")
+      + (root.missingDevices.length > 1 ? " you picked are" : " you picked is")
+      + " not connected; until it is, the next calibration uses what is selected here."
+  }
   function setupLabel() {
     var sink = root.sinkIndex >= 0 ? service.sinks[root.sinkIndex] : null
     var mic = root.micIndex >= 0 ? service.microphones[root.micIndex] : null
     return (sink ? sink.description : "No speakers") + "  ·  " + (mic ? mic.description : "no microphone")
+      + (root.missingDevices.length > 0 ? "  ·  the " + root.missingDevices.join(" and ") + " you picked "
+         + (root.missingDevices.length > 1 ? "are" : "is") + " not connected" : "")
   }
   // Shared files in Downloads that the list does not hold yet.
   function downloadRows() {
@@ -1958,6 +1972,17 @@ Panel {
             visible: root.setupShown()
             width: parent.width
             spacing: Style.space(12)
+
+            Text {
+              textFormat: Text.PlainText
+              visible: root.missingDevices.length > 0
+              width: parent.width
+              text: root.missingText()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
 
             Column {
               width: parent.width

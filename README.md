@@ -110,7 +110,8 @@ output on its own.
 
 Under the list of calibrations sits **Calibrate again**, with one line naming
 the speakers and microphone it will use; **change** opens the pickers, and they
-open by themselves before the first calibration or when a device is gone.
+open by themselves before the first calibration. When a device you picked is
+not connected, that line says so and names what stands in.
 Below that, three closed folds hold the rest:
 
 - **Tune the fit**: voicing, the three loudness levels, channel balance,
