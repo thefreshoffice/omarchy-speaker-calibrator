@@ -493,10 +493,16 @@ class ShareTests(ClientTestCase):
         panel, service = (root / "Panel.qml").read_text(), (root / "Service.qml").read_text()
         self.assertNotIn("share-status-json", service)
         self.assertNotIn("shareStatusCheck", panel + service)
-        self.assertEqual(panel.count("service.share("), 1)                       # only the button's own click
-        button = panel.index('"Share with everyone"')
-        self.assertGreater(button, panel.index('label: "Save and share"'))       # in its fold, with the other ways out
-        self.assertLess(button, panel.index('label: "Measurement details"'))
+        # Only a press shares: the step row's and the fold's own clicks.
+        calls = [index for index in range(len(panel)) if panel.startswith("service.share(", index)]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            handler = panel[panel.rindex("onClicked: {", 0, call):call]
+            self.assertNotIn("function", handler)
+            self.assertGreater(handler.count("{"), handler.count("}"))          # still inside that click
+        fold = panel.index('label: "Save and share"')
+        self.assertGreater(panel.index('"Share with everyone"', fold), fold)    # in its fold, with the other ways out
+        self.assertLess(panel.index('"Share with everyone"', fold), panel.index('label: "Measurement details"'))
 
     def test_the_status_says_what_would_be_sent_without_sending_it(self):
         self.install()

@@ -380,15 +380,20 @@ sound worse than it started.
 - Existing tuning files are backed up before replacement, and failed or
   clipped measurements are saved for diagnosis but cannot be installed.
 
-## Calibrations shared for your machine
+## Ready-made for your machine
 
 A calibration belongs to one model's speakers, so one measured on the same
-model is worth having. When other people have shared one for your model, the
-panel lists them above the Calibrate button, best first, each with how it was
-measured and its score. One press loads one and plays it; what you had stays
-in the list above, one click away. Nothing about a shared profile can
-choose your speaker output or step outside the limits the optimizer works
-under.
+model is worth having, and on a machine somebody has already calibrated you
+need no measurement of your own. The panel's **Ready-made for this machine**
+group, above the Calibrate button, lists the calibrations others shared for
+your model in the [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles),
+best first, each with how it was measured and its score. Looking for them asks
+that public registry, so the panel asks first; after a no, one row still offers
+to look, and with nothing shared yet it says so.
+
+One press plays one; what you had stays in the list above, one click away.
+Nothing about a shared profile can choose your speaker output or step outside
+the limits the optimizer works under.
 
 The score runs from 0 to 100 and comes from the file: a calibrated measuring
 microphone counts for more than an external one, which counts for more than the
@@ -399,9 +404,11 @@ it works for adds a little. The
 [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles) has a
 page per machine with every profile's graph.
 
-To share yours, open **Save and share** and press **Share with everyone**.
-Checking the
-calibration first raises its score. A new upload for the same machine and kind
+After a calibration with an external microphone the panel puts **Check this
+calibration** right under the switches, until it has been checked: a check is
+worth up to 28 of the 100 points. Once it has passed, the same place offers
+**Share with everyone**, until it is shared. Both are also in their folds,
+under Tune the fit and Save and share. A new upload for the same machine and kind
 of microphone takes the place of your earlier one.
 
 ## Sharing a calibration

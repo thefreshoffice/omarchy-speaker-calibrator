@@ -104,7 +104,7 @@ Item {
   function simpleLabel(profile) {
     if (!profile) return ""
     var parts = []
-    parts.push(profile.bass === "full" ? "Loudness on" : "Loudness off")
+    parts.push(profile.bass === "full" ? "Fuller bass on" : "Fuller bass off")
     var loudness = profile.loudness || "protected"
     parts.push(loudness === "matched" ? "Louder on"
       : loudness === "balanced" ? "Louder halfway" : "Louder off")
@@ -460,6 +460,8 @@ Item {
               ? "Calibrated and playing: " + root.simpleLabel(result)
                 + (root.status.library && root.status.library.length > 0
                    ? " · the one before is in the list" : "")
+                + ((result.microphone || {}).internal === true ? ""
+                   : " · check it to prove it works")
               : root.phase === "refine"
                 ? "Improved from the check, round " + refinement.iterations
                   + " · biggest change " + Number(refinement.largest_step_db || 0).toFixed(1)
