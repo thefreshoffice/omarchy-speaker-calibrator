@@ -1735,12 +1735,19 @@ class SharedCalibrationTests(unittest.TestCase):
             mock.patch.object(speaker_calibrate, "pactl_json",
                               lambda kind: [{"name": "alsa_output.pci-test.analog-stereo", "description": "Built-in Audio"}]),
             mock.patch.object(speaker_calibrate, "plugin_version", lambda: "1.1.0"),
+            mock.patch.object(speaker_calibrate, "install_now", self.fake_install_now),
         ]
+        self.installed = []
         for patch in self.patches:
             patch.start()
         self.addCleanup(self.folder.cleanup)
         for patch in self.patches:
             self.addCleanup(patch.stop)
+
+    def fake_install_now(self, profile):
+        """What install_now hands back, without touching an audio system."""
+        self.installed.append(profile)
+        return {**profile, "activation": "live", "installed": True}
 
     def install_active(self, profile=None):
         (self.data / "active-profile.json").write_text(json.dumps(profile or self.profile()))
@@ -1771,7 +1778,9 @@ class SharedCalibrationTests(unittest.TestCase):
         self.assertEqual(listed[0]["matches"], {"machine": True, "speakers": True})
         result = speaker_calibrate.import_profile(name=exported["file"])
         self.assertIsNone(result["warning"])
-        proposal = json.loads((self.data / "proposed-profile.json").read_text())
+        self.assertFalse((self.data / "proposed-profile.json").exists())
+        proposal = self.installed[-1]
+        self.assertIs(result["profile"]["installed"], True)
         self.assertEqual(proposal["imported"]["file"], exported["file"])
         self.assertEqual(proposal["imported"]["matches"], {"machine": True, "speakers": True})
         self.assertEqual(proposal["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
@@ -1790,10 +1799,10 @@ class SharedCalibrationTests(unittest.TestCase):
             self.assertEqual(listed[0]["matches"], {"machine": False, "speakers": False})
             result = speaker_calibrate.import_profile(name=exported["file"])
         self.assertIn("made on SLIMBOOK Executive; this is Dell Inc. XPS 14", result["warning"])
-        self.assertEqual(result["proposal"]["speaker"]["name"], "alsa_output.pci-xps.analog-stereo")
-        self.assertFalse(result["proposal"]["imported"]["matches"]["machine"])
-        self.assertEqual(result["proposal"]["deep_bass"], "on")
-        self.assertEqual(result["proposal"]["loudness_compensation"], "on")
+        self.assertEqual(result["profile"]["speaker"]["name"], "alsa_output.pci-xps.analog-stereo")
+        self.assertFalse(result["profile"]["imported"]["matches"]["machine"])
+        self.assertEqual(result["profile"]["deep_bass"], "on")
+        self.assertEqual(result["profile"]["loudness_compensation"], "on")
 
     def test_hardware_matching_prefers_the_sku(self):
         matches = speaker_calibrate.hardware_matches
@@ -1844,8 +1853,8 @@ class SharedCalibrationTests(unittest.TestCase):
         self.write_shared("hostile.speaker-calibration.json", hostile)
         result = speaker_calibrate.import_profile(name="hostile.speaker-calibration.json")
         self.assertTrue(result["matches"]["speakers"])
-        self.assertEqual(result["proposal"]["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
-        self.assertNotIn("context.exec", (self.data / "proposed-profile.json").read_text())
+        self.assertEqual(result["profile"]["speaker"]["name"], "alsa_output.pci-test.analog-stereo")
+        self.assertNotIn("context.exec", json.dumps(self.installed[-1]))
 
     def test_no_writer_of_configuration_accepts_a_name_pipewire_would_not_give(self):
         fit = self.profile()["fit"]
@@ -1872,7 +1881,7 @@ class SharedCalibrationTests(unittest.TestCase):
         with mock.patch.object(speaker_calibrate, "pactl_json", lambda kind: sinks):
             result = speaker_calibrate.import_profile(name="asahi.speaker-calibration.json")
         self.assertFalse(result["matches"]["speakers"])
-        self.assertEqual(result["proposal"]["speaker"]["name"], "audio_effect.j413-convolver")
+        self.assertEqual(result["profile"]["speaker"]["name"], "audio_effect.j413-convolver")
 
     def test_the_date_is_a_date_or_the_file_is_refused(self):
         valid = speaker_calibrate.valid_shared_payload
@@ -2134,73 +2143,6 @@ class InstallDefaultsTests(unittest.TestCase):
         speaker_calibrate.install_now({**base, "loudness_compensation": "on"})
         speaker_calibrate.install_now({**base, "loudness_compensation": "off"})
         self.assertEqual(calls, ["start", "stop"])
-
-
-class PreviewDecisionTests(unittest.TestCase):
-    """A new calibration plays and waits; apply or keep the previous."""
-
-    def setUp(self):
-        self.folder = tempfile.TemporaryDirectory(); root = Path(self.folder.name)
-        self.data = root / "data"; self.data.mkdir(0o700)
-        self.paths = {name: self.data / f"{name}.json" for name in ("active-profile", "previous-profile", "held-profile", "held-previous", "compare-state")}
-        self.activated = []
-        def fake_install_now(profile):
-            # What the real one does to the files: the current moves to previous, the new becomes current.
-            current = speaker_calibrate.load_profile(speaker_calibrate.PROFILE)
-            if current is not None:
-                speaker_calibrate.write_atomic(speaker_calibrate.PREVIOUS_PROFILE, json.dumps(current))
-            speaker_calibrate.write_atomic(speaker_calibrate.PROFILE, json.dumps(profile))
-            self.activated.append(("install", profile["created_at"])); return dict(profile, installed=True)
-        patches = [
-            mock.patch.object(speaker_calibrate, "DATA", self.data),
-            mock.patch.object(speaker_calibrate, "PROFILE", self.paths["active-profile"]),
-            mock.patch.object(speaker_calibrate, "PREVIOUS_PROFILE", self.paths["previous-profile"]),
-            mock.patch.object(speaker_calibrate, "HELD_PROFILE", self.paths["held-profile"]),
-            mock.patch.object(speaker_calibrate, "HELD_PREVIOUS", self.paths["held-previous"]),
-            mock.patch.object(speaker_calibrate, "COMPARE_STATE", self.paths["compare-state"]),
-            mock.patch.object(speaker_calibrate, "install_now", fake_install_now),
-            mock.patch.object(speaker_calibrate, "reinstall_profile", lambda profile: self.activated.append(("reinstall", profile["created_at"])) or "live"),
-            mock.patch.object(speaker_calibrate, "compare_toggle", lambda: self.activated.append(("compare", None))),
-        ]
-        for patch in patches:
-            patch.start(); self.addCleanup(patch.stop)
-        self.addCleanup(self.folder.cleanup)
-
-    def profile(self, stamp):
-        return {"created_at": stamp, "fit": {"filters": []}, "speaker": {"name": "s"}, "quality": {"accepted": True}}
-
-    def test_the_first_calibration_installs_and_nothing_waits(self):
-        result = speaker_calibrate.preview_install(self.profile("first"))
-        self.assertNotIn("previewing", result)
-        self.assertFalse(speaker_calibrate.previewing())
-
-    def test_keeping_the_previous_puts_both_slots_back(self):
-        self.paths["active-profile"].write_text(json.dumps(self.profile("old"))); self.paths["previous-profile"].write_text(json.dumps(self.profile("older")))
-        result = speaker_calibrate.preview_install(self.profile("new"))
-        self.assertTrue(result["previewing"]); self.assertTrue(speaker_calibrate.previewing())
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PROFILE)["created_at"], "new")
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "old")
-        # A second measurement while waiting keeps the original held copies.
-        speaker_calibrate.preview_install(self.profile("newer"))
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.HELD_PROFILE)["created_at"], "old")
-        decided = speaker_calibrate.preview_discard()
-        self.assertEqual(decided["profile"]["created_at"], "old")
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PROFILE)["created_at"], "old")
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "older")
-        self.assertFalse(speaker_calibrate.previewing())
-        self.assertEqual(self.activated[-1], ("reinstall", "old"))
-
-    def test_applying_keeps_the_new_one_and_the_old_one_under_switch_profile(self):
-        self.paths["active-profile"].write_text(json.dumps(self.profile("old")))
-        speaker_calibrate.preview_install(self.profile("new"))
-        speaker_calibrate.write_compare_state({"active": "previous", "bypass": False})
-        decided = speaker_calibrate.preview_apply()
-        self.assertEqual(decided["profile"]["created_at"], "new")
-        self.assertEqual(speaker_calibrate.load_profile(speaker_calibrate.PREVIOUS_PROFILE)["created_at"], "old")
-        self.assertFalse(speaker_calibrate.previewing())
-        self.assertIn(("compare", None), self.activated)
-        with self.assertRaises(SystemExit):
-            speaker_calibrate.preview_apply()
 
 
 class VendorTrialTests(unittest.TestCase):
@@ -2610,7 +2552,7 @@ class UnitFileTests(unittest.TestCase):
         speaker_calibrate.UNIT.parent.mkdir(parents=True)
         speaker_calibrate.UNIT.write_text(speaker_calibrate.UNIT_TEXT)
         os.utime(speaker_calibrate.UNIT, (1_000_000, 1_000_000))
-        with mock.patch.object(speaker_calibrate, "keep_previous_profile"), \
+        with mock.patch.object(speaker_calibrate, "library_add"), \
              mock.patch.object(speaker_calibrate, "activate_profile", return_value="live"):
             method = speaker_calibrate.install_profile({"speaker": {"name": "alsa_output.x"}}, "graph")
         self.assertEqual(method, "live")

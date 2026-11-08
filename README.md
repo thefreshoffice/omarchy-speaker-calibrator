@@ -64,11 +64,25 @@ asahi-audio update replaces it.
    made with, whenever they are connected.
 3. **Be quiet for about thirty seconds.** You will hear six sweeps: three per
    speaker.
-4. **Listen, then decide.** If the measurement passes its quality checks it
-   plays right away, and when a calibration was already installed the panel
-   asks: apply the new one, or keep the previous? A switch lets you hear both
-   before you answer, level matched, and either answer takes effect at once.
-   The first calibration has nothing to compare against and simply installs.
+4. **Listen.** If the measurement passes its quality checks it plays right
+   away and goes to the top of the **Calibrations** list. The one you had
+   before is right under it: click it to hear it again, and click the new one
+   to come back.
+
+### Switching calibrations
+
+Every calibration that played is kept in the **Calibrations** list: the last
+ten of your own, every one you pin, and the ones shared for your model that
+you loaded. Click a row to play it. For the same speakers only the filter's
+settings change, so the sound switches without stopping. A calibration for
+other speakers, or the first switch after an update, restarts the tuning,
+which costs a tick of a few hundredths of a second; only what was playing
+through the calibration is put back on it afterwards. Nothing runs or uses
+memory for the calibrations that are not playing; they are small files on
+disk. The pin keeps one past the last
+ten, and the bin deletes one that is not playing. Deep bass and the loudness
+compensation are switches of this machine, so they stay as they are when you
+switch.
 
 ![The panel: four switches, the equalizer, and the calibrate button](screenshot.png)
 
@@ -342,8 +356,10 @@ sound worse than it started.
   than volume. It only ever turns the plain sound down, never up.
 - A measurement is always taken with the correction flattened, so the plugin
   can never fit a correction on top of itself.
-- The filter graph always has the same shape, so installing or comparing
-  profiles updates its controls rather than restarting the audio client.
+- The filter graph always has the same shape, so installing or switching
+  calibrations updates its controls rather than restarting the audio client.
+  When it does have to restart, only the streams that were on the
+  calibration are moved back to it.
 - Existing tuning files are backed up before replacement, and failed or
   clipped measurements are saved for diagnosis but cannot be installed.
 
@@ -352,8 +368,8 @@ sound worse than it started.
 A calibration belongs to one model's speakers, so one measured on the same
 model is worth having. When other people have shared one for your model, the
 panel lists them above the Calibrate button, best first, each with how it was
-measured and its score. One press loads one as a preview, level matched against
-what you had, and you keep it or go back. Nothing about a shared profile can
+measured and its score. One press loads one and plays it; what you had stays
+in the list above, one click away. Nothing about a shared profile can
 choose your speaker output or step outside the limits the optimizer works
 under.
 
@@ -386,11 +402,11 @@ What kind of microphone it was travels, and whether it had a correction file,
 never where that file lives.
 
 A shared file dropped into your Downloads folder appears in the same section.
-**Load** makes it the last measurement, ready to install, exactly like a fresh
-measurement: **Install last measurement** applies it, your own calibration is
-kept, and **Switch profile** brings it back. When the file was made on
-different hardware the panel says so before you install it, because speakers
-differ between models and a calibration for another laptop may sound wrong.
+**Load** plays it and adds it to your calibrations; your own stays in the
+list, one click away. Your last measurement is left alone, so a refit still
+works on your own recording. When the file was made on different hardware the
+panel says so, because speakers differ between models and a calibration for
+another laptop may sound wrong.
 When the exporting machine's speaker device does not exist here, the
 calibration is pointed at this machine's speakers instead.
 
