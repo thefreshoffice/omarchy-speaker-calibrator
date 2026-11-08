@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sandbox  # noqa: E402,F401  (keeps every test off this machine's calibrator)
 
 from calibration_optimizer import (  # noqa: E402
     BOOST_HEADROOM_BUDGET_DB,
@@ -1360,6 +1362,7 @@ class MicrophoneCandidateTests(unittest.TestCase):
             ["Digital Microphone"],
         )
 
+    @mock.patch.object(speaker_calibrate, "run", lambda args, **options: subprocess.CompletedProcess(args, 0, "", ""))
     def test_asahi_devices_default_to_protected_speakers_and_internal_array(self):
         devices = {
             "sinks": [
@@ -2224,6 +2227,7 @@ class VendorTrialTests(unittest.TestCase):
             patch.start(); self.addCleanup(patch.stop)
         self.addCleanup(self.folder.cleanup)
 
+    @mock.patch.object(speaker_calibrate, "pactl_json", lambda kind: [])
     def test_whose_graph_is_playing(self):
         fragment = self.data / "90-tuning.conf"
         self.assertEqual(speaker_calibrate.graph_kind(), "none")
