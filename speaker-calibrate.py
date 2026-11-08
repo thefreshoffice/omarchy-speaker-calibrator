@@ -4,6 +4,8 @@
 import argparse
 import contextlib
 import datetime as dt
+import fcntl
+import hashlib
 import json
 import math
 import os
@@ -166,11 +168,27 @@ FRAGMENT = CONFIG / "pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf"
 UNIT = CONFIG / "systemd/user/omarchy-speaker-tuning.service"
 PROFILE = DATA / "active-profile.json"
 PROPOSAL = DATA / "proposed-profile.json"
-# The profile that the last install replaced, kept so the two can be swapped
-# in and out for a listening comparison.  Graphs are regenerated from a
-# profile's filters whenever it is activated, so only the profile is kept.
+# Every calibration that has played, so that any of them is one click away.
+# PROFILE is always the one playing, and the live copy of its entry here.
+LIBRARY = DATA / "library"
+LIBRARY_INDEX = LIBRARY / "index.json"
+LIBRARY_ID = re.compile(r"[0-9a-f]{12}")
+# The calibrations of one's own kept by recency; pinned ones and ones loaded
+# from the registry come on top of these.
+LIBRARY_KEEP = 10
+LIBRARY_SOURCES = ("measured", "imported", "shared")
+# Before the library there were two slots, the profile the last install
+# replaced and a decision held open after a measurement.  Read once, to fill
+# the library, and then removed.
 PREVIOUS_PROFILE = DATA / "previous-profile.json"
+HELD_PROFILE = DATA / "held-profile.json"
+HELD_PREVIOUS = DATA / "held-previous.json"
+# Whether the calibration is switched off.  It used to say which of the two
+# slots played as well.
 COMPARE_STATE = DATA / "compare-state.json"
+# Held while anything changes what is stored or what plays.  The panel runs
+# one command at a time; a second bar or a terminal could run another.
+STATE_LOCK = DATA / "lock"
 # The verification plays through the corrected output, so its capture must
 # never land on the calibration capture: refitting an already-corrected
 # recording would correct the sound twice.
@@ -345,15 +363,7 @@ def ensure_loudness_unit():
     registration outlives any number of switches.
     """
     unit = loudness_unit_path()
-    wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
-    fresh = True
-    try:
-        fresh = read_text_bounded(unit) != wanted
-    except OSError:
-        pass
-    if fresh:
-        write_atomic(unit, wanted)
-        run(["systemctl", "--user", "daemon-reload"], check=False)
+    fresh = write_unit(unit, LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path()))
     enabled = run(
         ["systemctl", "--user", "is-enabled", LOUDNESS_SERVICE], check=False, capture=True
     ).stdout.strip()
@@ -1263,19 +1273,44 @@ def move_apps(target):
             run(["pactl", "move-sink-input", str(stream["index"]), target], check=False)
 
 
-def compare_state():
+def streams_on(sink):
+    """The application streams playing on this sink now, by index."""
+    index = next((item.get("index") for item in pactl_json("sinks") if item.get("name") == sink), None)
+    if index is None:
+        return []
+    return [stream["index"] for stream in pactl_json("sink-inputs")
+            if stream.get("sink") == index
+            and (stream.get("properties") or {}).get("application.name")
+            and stream["properties"]["application.name"] != "EasyEffects"]
+
+
+def sink_present(name):
+    return any(item.get("name") == name for item in pactl_json("sinks"))
+
+
+def wait_for_sink(name, attempts=30):
+    """True once a sink of this name exists, polling every quarter second."""
+    for _ in range(attempts):
+        if sink_present(name):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _stored_compare_state():
     try:
         state = json.loads(read_text_bounded(COMPARE_STATE) or '')
     except (OSError, ValueError):
         state = {}
-    if state.get("active") not in ("current", "previous"):
-        state["active"] = "current"
-    state["bypass"] = bool(state.get("bypass", False))
-    return state
+    return state if isinstance(state, dict) else {}
+
+
+def compare_state():
+    return {"bypass": bool(_stored_compare_state().get("bypass", False))}
 
 
 def write_compare_state(state):
-    write_atomic(COMPARE_STATE, json.dumps(state) + "\n")
+    write_atomic(COMPARE_STATE, json.dumps({"bypass": bool(state.get("bypass"))}) + "\n")
 
 
 def transparent_controls(level_match_db=0.0):
@@ -1303,6 +1338,11 @@ def profile_summary(path):
         profile = json.loads(read_text_bounded(path) or '')
     except (OSError, ValueError):
         return None
+    return profile_summary_of(profile) if isinstance(profile, dict) else None
+
+
+def profile_summary_of(profile):
+    """A short label for a profile."""
     fit = profile.get("fit") or {}
     created = str(profile.get("created_at", ""))[:16].replace("T", " ")
     # The microphone comes right after the date: with one profile per kind of
@@ -1321,15 +1361,6 @@ def profile_summary(path):
         "loudness": profile.get("loudness", "protected"),
         "plugin_version": profile.get("plugin_version"),
     }
-
-
-def keep_previous_profile():
-    """Set aside the profile being listened to, for comparison with the next one."""
-    if PROFILE.exists() and compare_state()["active"] == "current":
-        shutil.copy2(PROFILE, PREVIOUS_PROFILE)
-    # When the previous profile was playing, it stays "previous": that is the
-    # sound the new install will be compared against.
-    write_compare_state({"active": "current", "bypass": False})
 
 
 def service_active():
@@ -1434,10 +1465,16 @@ def activate_profile(profile):
         state["bypass"] = False
         write_compare_state(state)
     # The sound changes first.  The running graph never reads the file on
-    # disk, so nothing audible should wait for its fsyncs; and a live update
-    # touches no unit file, so systemd has nothing to reload (restart_tuning
-    # reloads before it restarts).
-    live = service_active() and apply_controls_live(controls)
+    # disk, so nothing audible should wait for its fsyncs.  A unit file that
+    # changed was already reloaded by write_unit, and restart_tuning reloads
+    # again before it restarts.
+    #
+    # The speaker is the one thing a control cannot change: it is the graph's
+    # target, read when the host starts.  The controls of a graph aimed at
+    # another speaker would all land, and the sound would stay where it was.
+    running = running_target()
+    same_speaker = running is None or running == checked_sink_name(profile["speaker"]["name"])
+    live = same_speaker and service_active() and apply_controls_live(controls)
     # The graph file is written only when it changed, so that a restart, now
     # or later, loads what is playing.
     try:
@@ -1450,6 +1487,18 @@ def activate_profile(profile):
         return "live"
     restart_tuning()
     return "restart"
+
+
+def running_target():
+    """The speaker the tuning graph on disk plays into, or None when unknown."""
+    try:
+        text = read_text_bounded(FRAGMENT, errors="ignore") or ""
+    except (OSError, UnsafeFile):
+        return None
+    if not text.startswith(CALIBRATOR_HEADER):
+        return None
+    match = re.search(r'^\s*target\.object = "([^"\\]+)"', text, re.MULTILINE)
+    return match.group(1) if match else None
 
 
 @contextlib.contextmanager
@@ -1533,10 +1582,8 @@ def correction_silenced():
 
 
 def playing_profile():
-    """The profile that should be audible now, per the compare state."""
-    state = compare_state()
-    target = PREVIOUS_PROFILE if state["active"] == "previous" else PROFILE
-    return load_profile(target) or load_profile(PROFILE)
+    """The profile that should be audible now."""
+    return load_profile(PROFILE)
 
 
 def bypass_level_match(profile):
@@ -1582,19 +1629,52 @@ def bypass_toggle():
     return payload
 
 
+def write_unit(path, text):
+    """Write a systemd unit only when it changed, and reload systemd when it did.
+
+    systemd marks a unit for a reload as soon as its file is newer than the
+    copy it read, even with the same bytes, and then warns on every command
+    for that service.  A unit that did change has to be read before the next
+    start, or the next restart runs the old one.  Returns whether it was
+    written.
+    """
+    try:
+        if read_text_bounded(path) == text:
+            return False
+    except OSError:
+        pass
+    write_atomic(path, text)
+    run(["systemctl", "--user", "daemon-reload"], check=False)
+    return True
+
+
 def restart_tuning():
+    """Start the tuning host, or restart it with the graph on disk.
+
+    Starting it is switching the calibration on, so everything playing moves
+    to it and it becomes the default output.  A restart only puts back what
+    played through it: while the host restarts its streams fall back to
+    another output for a moment, and a stream on headphones or HDMI was never
+    the calibration's to take.
+    """
+    running = calibration_sink_present()
+    streams = streams_on(VIRTUAL_SINK) if running else []
+    default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip() if running else ""
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", SERVICE])
     run(["systemctl", "--user", "restart", SERVICE])
-    for _ in range(30):
-        if any(item.get("name") == VIRTUAL_SINK for item in pactl_json("sinks")):
-            move_apps(VIRTUAL_SINK)
-            return
-        time.sleep(0.25)
-    raise SystemExit("The tuning sink did not appear; inspect the user service status.")
+    if not wait_for_sink(VIRTUAL_SINK, 30):
+        raise SystemExit("The tuning sink did not appear; inspect the user service status.")
+    if not running:
+        move_apps(VIRTUAL_SINK)
+        return
+    for index in streams:
+        run(["pactl", "move-sink-input", str(index), VIRTUAL_SINK], check=False)
+    if default == VIRTUAL_SINK:
+        run(["pactl", "set-default-sink", VIRTUAL_SINK], check=False)
 
 
-def install_profile(profile, graph):
+def install_profile(profile):
     if not LIMITER_PROBE.exists():
         raise SystemExit(
             f"The filter chain needs {LIMITER_PACKAGE}, which this machine does "
@@ -1602,13 +1682,17 @@ def install_profile(profile, graph):
             f"  omarchy pkg add {LIMITER_PACKAGE}"
         )
     secure_directory(DATA, repair_contents=True)
-    keep_previous_profile()
+    # Into the library first: what played until now is written back to its
+    # own entry, and this one is added as the one that plays.
+    library_add(profile)
+    write_compare_state({"bypass": False})
     for path in (HOST, FRAGMENT, UNIT):
         backup(path)
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
-    write_atomic(FRAGMENT, graph)
-    write_atomic(UNIT, UNIT_TEXT)
+    # Not the graph: activate_profile writes it, and has to read the one on
+    # disk first to know which speaker the running tuning plays into.
+    write_unit(UNIT, UNIT_TEXT)
     write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     return activate_profile(profile)
 
@@ -1623,32 +1707,370 @@ def load_profile(path):
     return profile
 
 
-def compare_payload():
-    state = compare_state()
+# How a switch landed, in the words the panel shows after it.
+SWITCH_WORDS = {"live": " · switched live"}
+
+
+def compare_payload(profile=None):
     return {
-        "available": load_profile(PREVIOUS_PROFILE) is not None
-        and load_profile(PROFILE) is not None,
-        "active": state["active"],
-        "bypass": state["bypass"],
-        "level_match_db": bypass_level_match(playing_profile()),
-        "current": profile_summary(PROFILE),
-        "previous": profile_summary(PREVIOUS_PROFILE),
+        "bypass": compare_state()["bypass"],
+        "level_match_db": bypass_level_match(profile if profile is not None else playing_profile()),
     }
 
 
-def compare_toggle():
-    """Play the other of the two most recent profiles, live when possible."""
-    state = compare_state()
-    state["active"] = "previous" if state["active"] == "current" else "current"
-    target = load_profile(PREVIOUS_PROFILE if state["active"] == "previous" else PROFILE)
-    if target is None:
-        raise SystemExit("No previous profile to compare with; install a second profile first.")
-    state["bypass"] = False
-    write_compare_state(state)
-    payload = compare_payload()
-    payload["method"] = activate_profile(target)
-    payload["bypass"] = False
-    return payload
+# ---- the calibration library ---------------------------------------------------
+# Every calibration that played is kept on disk, so any of them is one click
+# away: the last LIBRARY_KEEP of one's own, every pinned one, and every one
+# loaded from the registry.  Nothing runs for them and nothing is held in
+# memory.  PROFILE is the one that plays and the live copy of its entry: the
+# bass, loudness and deep-bass switches change PROFILE alone, and it is
+# written back into its entry before anything else plays.  The index holds
+# what the panel lists, so the status never reads the profiles themselves.
+
+def profile_identity(profile):
+    """The library id of a profile, fixed the first time it is added."""
+    known = profile.get("library_id")
+    if isinstance(known, str) and LIBRARY_ID.fullmatch(known):
+        return known
+    imported = profile.get("imported") or {}
+    if imported.get("registry"):
+        key = ["registry", imported["registry"]]
+    elif imported:
+        # A shared file carries the day it was measured and not the time, so
+        # two from the same day are told apart by their filters.
+        key = ["file", (profile.get("fit") or {}).get("filters"), imported.get("exported_at")]
+    else:
+        key = ["measured", profile.get("created_at"), (profile.get("speaker") or {}).get("name")]
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:12]
+
+
+def profile_source(profile):
+    imported = profile.get("imported") or {}
+    return "shared" if imported.get("registry") else ("imported" if imported else "measured")
+
+
+def _now():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def _entry_file(identifier):
+    if not isinstance(identifier, str) or not LIBRARY_ID.fullmatch(identifier):
+        raise SystemExit("That is not a calibration in the list.")
+    return LIBRARY / f"{identifier}.json"
+
+
+def _entry_summary(profile):
+    summary = profile_summary_of(profile)
+    imported = profile.get("imported") or {}
+    summary["name"] = short_label(imported.get("name"))
+    summary["speaker"] = short_label((profile.get("speaker") or {}).get("description")) \
+        or short_label((profile.get("speaker") or {}).get("name"))
+    return summary
+
+
+def _clean_entry(item):
+    """An index row as this program writes it, or None."""
+    if not isinstance(item, dict):
+        return None
+    identifier = item.get("id")
+    if not isinstance(identifier, str) or not LIBRARY_ID.fullmatch(identifier):
+        return None
+    registry = item.get("registry")
+    return {
+        "id": identifier,
+        "source": item.get("source") if item.get("source") in LIBRARY_SOURCES else "measured",
+        "registry": registry if isinstance(registry, str) and REGISTRY_ID.fullmatch(registry) else None,
+        "pinned": item.get("pinned") is True,
+        "added_at": short_label(item.get("added_at"), 40),
+        "played_at": short_label(item.get("played_at"), 40) or "",
+        "summary": item.get("summary") if isinstance(item.get("summary"), dict) else {},
+    }
+
+
+def _read_index():
+    try:
+        data = json.loads(read_text_bounded(LIBRARY_INDEX) or "null")
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        return None
+    entries, seen = [], set()
+    for item in data["entries"]:
+        entry = _clean_entry(item)
+        if entry and entry["id"] not in seen and _entry_file(entry["id"]).exists():
+            seen.add(entry["id"])
+            entries.append(entry)
+    return entries
+
+
+def _write_index(entries):
+    entries = sorted(entries, key=lambda entry: entry["played_at"], reverse=True)
+    secure_directory(LIBRARY)
+    write_atomic(LIBRARY_INDEX, json.dumps({"entries": entries}, indent=1) + "\n")
+    return entries
+
+
+def _entry_for(profile, *, played_at, pinned=False, added_at=None):
+    imported = profile.get("imported") or {}
+    return _clean_entry({
+        "id": profile_identity(profile), "source": profile_source(profile),
+        "registry": imported.get("registry"), "pinned": pinned,
+        "added_at": added_at or played_at, "played_at": played_at,
+        "summary": _entry_summary(profile),
+    })
+
+
+def _store_entry(profile):
+    identifier = profile_identity(profile)
+    profile["library_id"] = identifier
+    secure_directory(LIBRARY)
+    write_atomic(_entry_file(identifier), json.dumps(profile, indent=2) + "\n")
+    return identifier
+
+
+def _rebuild_index():
+    """An index from the entry files alone, when the index is gone or unreadable."""
+    entries = []
+    for file in sorted(LIBRARY.glob("*.json")):
+        if not LIBRARY_ID.fullmatch(file.stem):
+            continue
+        profile = load_profile(file)
+        if profile is None or profile.get("library_id") != file.stem:
+            continue
+        stamp = str(profile.get("library_played_at") or profile.get("created_at") or "")
+        entries.append(_entry_for(profile, played_at=stamp))
+    return _write_index(entries)
+
+
+def _migrate():
+    """Fill the library from the two slots and the held decision of before."""
+    raw = _stored_compare_state()
+    candidates = []
+    # What plays comes first: the previous slot, if that was what played.
+    if raw.get("active") == "previous" and load_profile(PREVIOUS_PROFILE) is not None:
+        playing = load_profile(PREVIOUS_PROFILE)
+    else:
+        playing = load_profile(PROFILE)
+    if playing is not None:
+        candidates.append(playing)
+    for path in (PROFILE, PREVIOUS_PROFILE, HELD_PROFILE, HELD_PREVIOUS):
+        profile = load_profile(path)
+        if profile is not None:
+            candidates.append(profile)
+    proposal = load_profile(PROPOSAL)
+    if proposal is not None and (proposal.get("quality") or {}).get("accepted"):
+        candidates.append(proposal)
+    entries, seen = [], set()
+    now = _now()
+    for index, profile in enumerate(candidates):
+        identifier = profile_identity(profile)
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        stamp = now if index == 0 and playing is not None else str(profile.get("created_at") or "")
+        profile["library_played_at"] = stamp
+        _store_entry(profile)
+        entries.append(_entry_for(profile, played_at=stamp))
+    entries = _write_index(entries)
+    if playing is not None:
+        # Already audible, so it is written down and not activated again.
+        write_atomic(PROFILE, json.dumps(playing, indent=2) + "\n")
+    write_compare_state({"bypass": raw.get("bypass", False)})
+    for path in (PREVIOUS_PROFILE, HELD_PROFILE, HELD_PREVIOUS):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return entries
+
+
+def library_entries():
+    """The list, filled from the old slots or rebuilt from its files when it has to be.
+
+    Filling and rebuilding write PROFILE and the index, so they take the state
+    lock even from a status read: an install running at that moment must not
+    have its new PROFILE overwritten by the old one.  When another change
+    holds the lock, a status gets no list this time, and the next one does.
+    """
+    entries = _read_index()
+    if entries is not None:
+        return entries
+    with state_lock():
+        # Another run may have filled it while this one waited for the lock.
+        entries = _read_index()
+        if entries is not None:
+            return entries
+        if LIBRARY.is_dir() and any(LIBRARY_ID.fullmatch(file.stem) for file in LIBRARY.glob("*.json")):
+            return _rebuild_index()
+        return _migrate()
+
+
+def _write_back(entries):
+    """Keep what the switches did to the playing profile in its own entry."""
+    current = load_profile(PROFILE)
+    if current is None:
+        return
+    identifier = current.get("library_id")
+    if isinstance(identifier, str) and any(entry["id"] == identifier for entry in entries):
+        _store_entry(current)
+        for entry in entries:
+            if entry["id"] == identifier:
+                entry["summary"] = _entry_summary(current)
+
+
+def _prune(entries, playing):
+    """Drop one's own calibrations beyond the LIBRARY_KEEP most recently played."""
+    kept, own = [], 0
+    for entry in sorted(entries, key=lambda item: item["played_at"], reverse=True):
+        if not entry["pinned"] and entry["source"] != "shared":
+            own += 1
+            if own > LIBRARY_KEEP and entry["id"] != playing:
+                try:
+                    _entry_file(entry["id"]).unlink()
+                except OSError:
+                    pass
+                continue
+        kept.append(entry)
+    return kept
+
+
+def library_add(profile):
+    """Add a profile as the one that plays now, keeping what played before."""
+    entries = library_entries()
+    _write_back(entries)
+    identifier = profile_identity(profile)
+    existing = next((entry for entry in entries if entry["id"] == identifier), None)
+    now = _now()
+    profile["library_played_at"] = now
+    _store_entry(profile)
+    entry = _entry_for(profile, played_at=now,
+                       pinned=bool(existing and existing["pinned"]),
+                       added_at=existing["added_at"] if existing else now)
+    entries = [entry] + [item for item in entries if item["id"] != identifier]
+    return _write_index(_prune(entries, identifier))
+
+
+def _library_entry(entries, identifier):
+    _entry_file(identifier)
+    entry = next((item for item in entries if item["id"] == identifier), None)
+    if entry is None:
+        raise SystemExit("That calibration is not in the list any more.")
+    return entry
+
+
+def library_play(identifier):
+    """Play a calibration from the list: live, or with a restart when the speaker or the graph changed."""
+    entries = library_entries()
+    entry = _library_entry(entries, identifier)
+    profile = load_profile(_entry_file(identifier))
+    if profile is None:
+        raise SystemExit("That calibration cannot be read; delete it from the list.")
+    if graph_kind() == "vendor-trial":
+        raise SystemExit("The exported tuning is playing through Omarchy's installer; "
+                         "go back to the calibration first.")
+    current = load_profile(PROFILE) or {}
+    if current.get("library_id") == identifier:
+        return {**status_payload(), "method": "live", "message": "That calibration is already playing."}
+    _write_back(entries)
+    # Deep bass and the loudness compensation are this machine's switches,
+    # not the calibration's: they stay as they are.
+    for key, default in (("deep_bass", DEEP_BASS_DEFAULT),
+                         ("loudness_compensation", LOUDNESS_COMPENSATION_DEFAULT)):
+        profile[key] = current.get(key, profile.get(key, default))
+    profile["library_id"] = identifier
+    # Written down first, as an install is: if the restart below fails, the
+    # graph on disk, PROFILE and the list still agree on what plays.
+    now = _now()
+    profile["library_played_at"] = now
+    write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
+    _store_entry(profile)
+    entry["played_at"] = now
+    entry["summary"] = _entry_summary(profile)
+    _write_index([entry] + [item for item in entries if item is not entry])
+    method = activate_profile(profile)
+    if profile.get("loudness_compensation") == "on":
+        start_loudness_tracker()
+    else:
+        stop_loudness_tracker()
+    if entry["source"] == "measured":
+        # The microphone comparison follows the calibration that plays.
+        try:
+            archive_measurement(profile)
+        except Exception:        # a chart is never a reason to fail a switch
+            pass
+    label = entry["summary"].get("name") or entry["summary"].get("label") or "the calibration"
+    return {**status_payload(), "method": method,
+            "message": f"Playing {label}" + SWITCH_WORDS.get(method, " · tuning restarted")}
+
+
+def library_pin(identifier, pinned):
+    entries = library_entries()
+    _library_entry(entries, identifier)["pinned"] = bool(pinned)
+    _write_index(entries)
+    return {**status_payload(), "message": "Pinned: kept until you unpin it" if pinned
+            else "Unpinned: kept while it is among the last ten played"}
+
+
+def library_delete(identifier):
+    entries = library_entries()
+    _library_entry(entries, identifier)
+    if (load_profile(PROFILE) or {}).get("library_id") == identifier:
+        raise SystemExit("That calibration is playing; play another one before deleting it.")
+    try:
+        _entry_file(identifier).unlink()
+    except OSError:
+        pass
+    _write_index([entry for entry in entries if entry["id"] != identifier])
+    return {**status_payload(), "message": "Deleted from the list"}
+
+
+def library_status(profile):
+    """The list as the panel draws it: short labels only, every string cleaned."""
+    try:
+        entries = library_entries()
+    except (OSError, SystemExit):
+        return []
+    playing = (profile or {}).get("library_id")
+    rows = []
+    for entry in entries:
+        summary = _entry_summary(profile) if entry["id"] == playing else entry["summary"]
+        rows.append({
+            "id": entry["id"], "source": entry["source"], "pinned": entry["pinned"],
+            "playing": entry["id"] == playing, "registry": entry["registry"],
+            "played_at": short_label(entry["played_at"], 40),
+            "created_at": short_label(summary.get("created_at"), 40),
+            "label": short_label(summary.get("label"), 200),
+            "name": short_label(summary.get("name")),
+            "speaker": short_label(summary.get("speaker")),
+            "microphone_kind": summary.get("microphone_kind") if summary.get("microphone_kind") in ("internal", "external") else None,
+        })
+    return rows
+
+
+_STATE_LOCK_HELD = False
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Hold the one lock that every change takes, or say that one is running."""
+    global _STATE_LOCK_HELD
+    if _STATE_LOCK_HELD:
+        yield
+        return
+    secure_directory(DATA)
+    descriptor = os.open(STATE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Another change to the calibration is running; try again when it has finished.")
+        _STATE_LOCK_HELD = True
+        try:
+            yield
+        finally:
+            _STATE_LOCK_HELD = False
+    finally:
+        os.close(descriptor)
 
 
 def analyze_recording(
@@ -2504,9 +2926,14 @@ def backfill_archive():
     more.  Only slots that are missing are written, so a real measurement is
     never replaced by an older profile.
     """
-    for path in (PROFILE, PREVIOUS_PROFILE):
+    paths = [PROFILE]
+    try:
+        paths += [_entry_file(entry["id"]) for entry in (_read_index() or []) if entry["source"] == "measured"]
+    except (OSError, SystemExit):
+        pass
+    for path in paths:
         profile = load_profile(path)
-        if not profile:
+        if not profile or profile.get("imported"):
             continue
         kind = microphone_kind(profile)
         if (MICROPHONE_ARCHIVE / f"{kind}.json").exists():
@@ -2827,15 +3254,7 @@ def install_proposal():
 def install_now(profile):
     if not profile.get("quality", {}).get("accepted") or not profile.get("fit"):
         raise SystemExit("This measurement failed its quality checks and cannot be installed.")
-    profile["activation"] = install_profile(
-        profile,
-        filter_config(
-            profile["speaker"]["name"], profile["fit"],
-            deep_bass=profile.get("deep_bass") == "on",
-            loudness_compensation=profile.get("loudness_compensation") == "on",
-            sink_volume_db=sink_volume_db(listening_sink(profile)),
-        ),
-    )
+    profile["activation"] = install_profile(profile)
     profile["installed"] = True
     # The tracker follows the profile that is now playing: started when it
     # asks for compensation, stopped when it does not.
@@ -2981,7 +3400,7 @@ def relevel(bass=None, loudness=None):
         "profile": profile, "proposal": proposal, "method": method,
         "bass": bass, "loudness": loudness,
         "message": f"{BASS_LABELS[bass]} · {LOUDNESS_LABELS[loudness]}"
-                   + (" · switched live" if method == "live" else " · tuning restarted"),
+                   + SWITCH_WORDS.get(method, " · tuning restarted"),
     }
 
 
@@ -3385,8 +3804,8 @@ def registry_cached():
     return found
 
 
-def registry_load(identifier, preview=False):
-    """Fetch one shared calibration for this machine's model and make it the last measurement."""
+def registry_load(identifier):
+    """Fetch one shared calibration for this machine's model and play it."""
     if not isinstance(identifier, str) or not REGISTRY_ID.fullmatch(identifier):
         raise SystemExit("That is not the name of a calibration in the registry.")
     if registry_state().get("lookup") != "allowed":
@@ -3402,15 +3821,7 @@ def registry_load(identifier, preview=False):
         raise SystemExit(f"That calibration cannot be loaded: {error}.")
     except (RecursionError, OverflowError, TypeError, AttributeError, KeyError):
         raise SystemExit("That calibration is not a shared calibration file.")
-    result = adopt_shared_payload(payload, f"{identifier}{SHARE_SUFFIX}", registry=identifier)
-    if preview:
-        result["proposal"] = preview_if_accepted(result["proposal"])
-        result["message"] = (f"Loaded {result['proposal']['imported']['name']} from the registry and playing it. "
-                             "Apply it, or keep what you had?" if result["proposal"].get("previewing")
-                             else f"Loaded {result['proposal']['imported']['name']} from the registry and installed it.")
-        if result.get("warning"):
-            result["message"] += " " + result["warning"]
-    return result
+    return adopt_shared_payload(payload, f"{identifier}{SHARE_SUFFIX}", registry=identifier)
 
 
 def public_profile():
@@ -3981,13 +4392,14 @@ def shared_profiles():
 
 
 def import_profile(name=None, path=None):
-    """Make a shared calibration the last measurement, ready to install.
+    """Play a shared calibration file and add it to the list.
 
-    It goes through the same door as a fresh measurement: it becomes the
-    proposal, and Install applies it while the previous profile is kept for
-    comparison.  When the hardware differs from this machine the result says
-    so, and when the exporting machine's speaker device does not exist here
-    the calibration is pointed at this machine's speakers instead.
+    What played before stays in the list, one click away.  The last
+    measurement is left alone: a refit works on this machine's own recording,
+    and has nothing to do with somebody else's calibration.  When the
+    hardware differs from this machine the result says so, and when the
+    exporting machine's speaker device does not exist here the calibration is
+    pointed at this machine's speakers instead.
     """
     if path:
         source = Path(path)
@@ -4011,7 +4423,7 @@ def import_profile(name=None, path=None):
 
 
 def adopt_shared_payload(payload, source_name, registry=None):
-    """Make a validated shared calibration the last measurement, pointed at this machine's speakers."""
+    """Play a validated shared calibration, pointed at this machine's speakers."""
     ours = hardware_id()
     theirs = payload.get("hardware") or {}
     # The speaker comes from this machine's own list, the one the panel
@@ -4036,15 +4448,17 @@ def adopt_shared_payload(payload, source_name, registry=None):
         "hardware": {key: short_label(theirs.get(key)) for key in DMI_FIELDS + ("label", "speaker_description")},
         "this_machine": ours["label"], "matches": matches,
     }
-    write_atomic(PROPOSAL, json.dumps(profile, indent=2) + "\n")
     warning = None if matches["machine"] else (
         f"It was made on {theirs.get('label') or 'another machine'}; this is {ours['label']}. "
         "Speakers differ between models, so it may sound wrong here."
     )
+    profile = install_now(profile)
+    method = profile.get("activation")
     return {
-        "proposal": profile, "matches": matches, "warning": warning,
-        "message": f"Loaded {profile['imported']['name'] or source_name}. Press Install last "
-                   "measurement to hear it; Switch profile brings your own back."
+        "profile": profile, "matches": matches, "warning": warning,
+        "message": f"Playing {profile['imported']['name'] or source_name}"
+                   + SWITCH_WORDS.get(method, " · tuning restarted")
+                   + ". What played before is one click away in the list."
                    + (f" {warning}" if warning else ""),
     }
 
@@ -4467,8 +4881,6 @@ TRIAL_UNIT = CONFIG / "systemd/user" / TRIAL_SERVICE
 TRIAL_UNIT_TEXT = (UNIT_TEXT
                    .replace("omarchy-speaker-tuning.conf", "omarchy-speaker-trial.conf")
                    .replace("Omarchy speaker tuning filter-chain", "Omarchy speaker calibrator: exported tuning on trial"))
-
-
 def trial_graph(chain, speaker):
     """The rendered chain as a second sink: its own names, the real target."""
     return (chain.replace("@SPEAKER_SINK@", checked_sink_name(speaker))
@@ -4583,18 +4995,12 @@ def omarchy_audio_tuning(action, overlay=None):
 
 def reinstall_profile(profile):
     """Put the plugin's own files back and play the profile: what install does,
-    without a new previous-profile slot, because nothing new was measured."""
-    graph = filter_config(
-        profile["speaker"]["name"], profile["fit"],
-        deep_bass=profile.get("deep_bass") == "on",
-        loudness_compensation=profile.get("loudness_compensation") == "on",
-        sink_volume_db=sink_volume_db(listening_sink(profile)),
-    )
+    without a new list entry, because nothing new was measured.  The graph is
+    written by activate_profile, which reads the running one's speaker first."""
     for path in (HOST, FRAGMENT, UNIT):
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
-    write_atomic(FRAGMENT, graph)
-    write_atomic(UNIT, UNIT_TEXT)
+    write_unit(UNIT, UNIT_TEXT)
     method = activate_profile(profile)
     if profile.get("loudness_compensation") == "on":
         start_loudness_tracker()
@@ -4710,91 +5116,6 @@ def vendor_restore():
             "message": "Back to the calibration" + (" (tuning restarted)." if method == "restart" else ".")}
 
 
-# ---- a new calibration waits for a decision ---------------------------------
-# A measurement used to replace the calibration the moment it passed.  Now,
-# when one already plays, the new one is installed for listening while the
-# old one is held aside, and the panel asks: apply it, or keep the previous?
-# Either answer is one live update.  The first calibration has nothing to
-# compare against and installs as before.
-HELD_PROFILE = DATA / "held-profile.json"
-HELD_PREVIOUS = DATA / "held-previous.json"
-
-
-def previewing():
-    return HELD_PROFILE.exists()
-
-
-def _forget_held():
-    for path in (HELD_PROFILE, HELD_PREVIOUS):
-        try:
-            path.unlink()
-        except OSError:
-            pass
-
-
-def preview_install(profile):
-    """Play a new calibration without letting go of the one before it."""
-    current = load_profile(PROFILE)
-    if current is None:
-        return install_now(profile)
-    if not previewing():
-        # A second measurement while one already waits keeps the original held
-        # copies: the decision stays between the newest and what played before.
-        write_atomic(HELD_PROFILE, json.dumps(current, indent=2) + "\n")
-        previous = load_profile(PREVIOUS_PROFILE)
-        if previous is not None:
-            write_atomic(HELD_PREVIOUS, json.dumps(previous, indent=2) + "\n")
-        else:
-            try:
-                HELD_PREVIOUS.unlink()
-            except OSError:
-                pass
-    result = install_now(profile)
-    result["previewing"] = True
-    return result
-
-
-def preview_if_accepted(profile):
-    if profile.get("quality", {}).get("accepted") and profile.get("fit"):
-        return preview_install(profile)
-    return profile
-
-
-def preview_apply():
-    """Keep the new calibration; the previous stays under Switch profile."""
-    if not previewing():
-        raise SystemExit("No new calibration is waiting for a decision.")
-    if compare_state()["active"] == "previous":
-        compare_toggle()
-    _forget_held()
-    return {"previewing": False, "profile": load_profile(PROFILE),
-            "message": "The new calibration is applied; the one before it stays available under Switch profile."}
-
-
-def preview_discard():
-    """Put the previous calibration back; the new one stays as the last measurement."""
-    held = load_profile(HELD_PROFILE)
-    if held is None:
-        raise SystemExit("No new calibration is waiting for a decision.")
-    held_previous = load_profile(HELD_PREVIOUS)
-    write_atomic(PROFILE, json.dumps(held, indent=2) + "\n")
-    if held_previous is not None:
-        write_atomic(PREVIOUS_PROFILE, json.dumps(held_previous, indent=2) + "\n")
-    else:
-        try:
-            PREVIOUS_PROFILE.unlink()
-        except OSError:
-            pass
-    write_compare_state({"active": "current", "bypass": False})
-    method = reinstall_profile(held)
-    # The archive follows the calibration that plays, not the last measured.
-    archive_measurement(held)
-    _forget_held()
-    return {"previewing": False, "profile": held, "method": method,
-            "message": "Kept the previous calibration. The new measurement stays as the last "
-                       "measurement; Install last measurement applies it later if you change your mind."}
-
-
 def cached_status():
     """The last status this plugin wrote, for drawing the panel immediately.
 
@@ -4832,11 +5153,17 @@ def status_registry():
 
 
 def status_payload():
+    try:
+        # The first status after an update fills the list from the old slots,
+        # which writes PROFILE again; read it after that.
+        library_entries()
+    except (OSError, SystemExit):
+        pass
     profile = load_profile(PROFILE)
     proposal = load_profile(PROPOSAL)
     active = run(["systemctl", "--user", "is-active", SERVICE], check=False, capture=True).stdout.strip()
     default = run(["pactl", "get-default-sink"], check=False, capture=True).stdout.strip()
-    compare = compare_payload()
+    compare = compare_payload(profile)
     payload = {"service": active or "inactive", "defaultSink": default or "unknown",
             # The fallback is a node name, which the device also chooses.
             "defaultSinkDescription": (short_label(sink_description(default))
@@ -4855,7 +5182,8 @@ def status_payload():
             "verification": load_verification(),
             "bassEnhancer": harmonic_bass_status(),
             "deepBass": (profile or {}).get("deep_bass", "off"),
-            "previewing": previewing(),
+            # Every calibration that can be played from the list, playing one marked.
+            "library": library_status(profile),
             "loudnessCompensation": (profile or {}).get("loudness_compensation", "off"),
             "loudnessTracker": "running" if loudness_running() else "stopped",
             "microphones": archived_microphones(),
@@ -4977,7 +5305,7 @@ def wizard():
           f"{fit_payload['weighted_rmse_after_db']:.2f} dB")
     print(f"  Background level: {metrics['background_dbfs']:.1f} dBFS")
     if input("Install and enable this profile? [Y/n]: ").strip().lower() not in ("n", "no"):
-        install_profile(profile, filter_config(sink["name"], fit_payload))
+        install_profile(profile)
         print("\nProfile installed. The calibrated sink is now the default output.")
     else:
         print("Profile was measured but not installed.")
@@ -4994,14 +5322,14 @@ def status():
               + (" (stale, the profile changed since)" if check.get("stale") else "")
               + f" · off plan by {check['model_error_db']['rms']:.1f} dB"
               + f" · target error {errors['before']:.1f} → {errors['measured']:.1f} dB")
-    compare = payload["compare"]
     if payload.get("bypass"):
         print("Calibration is switched off (bypassed); run 'bypass-toggle' to switch it on.")
-    if compare["available"]:
-        playing = compare[compare["active"]]
-        print(f"Playing: {compare['active']} profile"
-              + (f" ({playing['label']})" if playing else "")
-              + " · run 'compare-toggle' to hear the other one")
+    rows = payload.get("library") or []
+    if rows:
+        print("Calibrations (* plays; 'library-play-json --id <id>' plays another):")
+        for row in rows:
+            print(f"  {'*' if row['playing'] else ' '} {row['id']}  {row['name'] or row['label'] or 'calibration'}"
+                  + ("  · pinned" if row["pinned"] else ""))
     if profile:
         print(f"Speaker: {profile['speaker']['description']}\nMicrophone: {profile['microphone']['description']}")
         gains = profile.get("fit", {}).get("gains_db") if profile.get("fit") else None
@@ -5049,7 +5377,7 @@ def main():
     for name in ("wizard", "status", "status-json", "status-cache-json",
                  "microphone-comparison-json", "use-calibrated-output",
                  "devices-json", "install-proposal",
-                 "disable", "compare-toggle", "bypass-toggle"):
+                 "disable", "bypass-toggle"):
         sub.add_parser(name)
     for name in ("deep-bass-toggle",
                  "install-measurement-support", "loudness-toggle"):
@@ -5061,9 +5389,8 @@ def main():
                         help="when the registry cannot be reached, answer from the cache instead of failing")
     consent = sub.add_parser("registry-consent-json", help="allow or decline looking online for shared calibrations")
     consent.add_argument("--answer", choices=("allowed", "declined"), required=True)
-    load = sub.add_parser("registry-load-json", help="load one shared calibration as the last measurement")
+    load = sub.add_parser("registry-load-json", help="play one shared calibration and add it to the list")
     load.add_argument("--id", required=True)
-    load.add_argument("--preview", action="store_true")
     pressed = sub.add_parser("share-json", help="what the panel's Share button does")
     pressed.add_argument("--confirmed", action="store_true", help="what it sends has been shown and agreed to")
     sub.add_parser("share-status-json", help="what sharing the playing calibration would send, and how")
@@ -5075,8 +5402,13 @@ def main():
     remember.add_argument("--mic")
     remember.add_argument("--channel")
     sub.add_parser("export-json")
-    sub.add_parser("preview-apply-json")
-    sub.add_parser("preview-discard-json")
+    play = sub.add_parser("library-play-json", help="play a calibration from the list")
+    play.add_argument("--id", required=True)
+    pin = sub.add_parser("library-pin-json", help="keep a calibration in the list until it is unpinned")
+    pin.add_argument("--id", required=True)
+    pin.add_argument("--pinned", choices=("on", "off"), required=True)
+    forget = sub.add_parser("library-delete-json", help="delete a calibration from the list")
+    forget.add_argument("--id", required=True)
     vendor = sub.add_parser("vendor-tuning-json")
     vendor.add_argument("--reference", help="a track to run through the chain for the headroom and LRA figures")
     trial = sub.add_parser("vendor-try-json")
@@ -5111,8 +5443,6 @@ def main():
     calibrate.add_argument("--bass", choices=("normal", "full"), default="normal")
     calibrate.add_argument("--channel-trim", choices=("off", "auto"), default="off")
     calibrate.add_argument("--mic-cal-file")
-    calibrate.add_argument("--preview", action="store_true",
-                           help="play the result and wait for a decision when a calibration already exists")
     calibrate.add_argument("--install", action="store_true",
                            help="install and play the result when it passes")
     reanalyze = sub.add_parser("reanalyze-saved-json")
@@ -5125,6 +5455,22 @@ def main():
                            help="install and play the result when it passes")
     args = parser.parse_args()
     command = args.command or "wizard"
+    if command in READ_ONLY_COMMANDS:
+        dispatch(args, command)
+        return
+    with state_lock():
+        dispatch(args, command)
+
+
+# Commands that change nothing a second run could trip over, and so run
+# beside anything else.  Everything else takes the state lock.
+READ_ONLY_COMMANDS = frozenset((
+    "status", "status-json", "status-cache-json", "devices-json", "microphone-comparison-json",
+    "registry-lookup-json", "share-status-json", "remember-selection-json",
+))
+
+
+def dispatch(args, command):
     if command == "registry-lookup-json":
         try:
             print(json.dumps(registry_lookup(args.refresh)))
@@ -5138,7 +5484,7 @@ def main():
         write_registry_state(lookup=args.answer)
         print(json.dumps(registry_lookup(True) if args.answer == "allowed" else registry_cached()))
     elif command == "registry-load-json":
-        print(json.dumps(registry_load(args.id, args.preview)))
+        print(json.dumps(registry_load(args.id)))
     elif command == "share-json":
         print(json.dumps(share_press(args.confirmed)))
     elif command == "share-status-json":
@@ -5169,8 +5515,6 @@ def main():
         )
         if args.install:
             profile = install_if_accepted(profile)
-        elif args.preview:
-            profile = preview_if_accepted(profile)
         print(json.dumps(profile))
     elif command == "reanalyze-saved-json":
         profile = reanalyze_saved_capture(
@@ -5179,8 +5523,6 @@ def main():
         print(json.dumps(install_if_accepted(profile) if args.install else profile))
     elif command == "install-proposal":
         print(json.dumps(install_proposal()))
-    elif command == "compare-toggle":
-        print(json.dumps(compare_toggle()))
     elif command == "bypass-toggle":
         print(json.dumps(bypass_toggle()))
     elif command == "verify-json":
@@ -5198,10 +5540,12 @@ def main():
         print(json.dumps(vendor_restore()))
     elif command == "vendor-tuning-json":
         print(json.dumps(vendor_tuning(reference=args.reference)))
-    elif command == "preview-apply-json":
-        print(json.dumps(preview_apply()))
-    elif command == "preview-discard-json":
-        print(json.dumps(preview_discard()))
+    elif command == "library-play-json":
+        print(json.dumps(library_play(args.id)))
+    elif command == "library-pin-json":
+        print(json.dumps(library_pin(args.id, args.pinned == "on")))
+    elif command == "library-delete-json":
+        print(json.dumps(library_delete(args.id)))
     elif command == "export-json":
         print(json.dumps(export_profile()))
     elif command == "import-json":

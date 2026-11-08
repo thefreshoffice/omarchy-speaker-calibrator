@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sandbox  # noqa: E402,F401  (keeps every test off this machine's calibrator)
 sys.dont_write_bytecode = True
 
 import calibration_share as share  # noqa: E402

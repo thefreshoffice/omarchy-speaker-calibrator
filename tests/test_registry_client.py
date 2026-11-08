@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sandbox  # noqa: E402,F401  (keeps every test off this machine's calibrator)
 sys.dont_write_bytecode = True
 
 import calibration_share as share  # noqa: E402
@@ -54,8 +56,12 @@ class ClientTestCase(unittest.TestCase):
             patch = mock.patch.object(speaker_calibrate, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+        self.installed = []
+        def fake_install_now(profile):
+            self.installed.append(profile)
+            return {**profile, "activation": "live", "installed": True}
         for name, value in (("hardware_id", lambda: dict(OURS)), ("pactl_json", lambda kind: [SINK]),
-                            ("plugin_version", lambda: "1.2.0")):
+                            ("plugin_version", lambda: "1.2.0"), ("install_now", fake_install_now)):
             patch = mock.patch.object(speaker_calibrate, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -344,11 +350,13 @@ class LoadTests(ClientTestCase):
         with mock.patch.object(speaker_calibrate, "registry_fetch", return_value=json.dumps(public)) as fetched:
             result = speaker_calibrate.registry_load(GOOD_ID)
         fetched.assert_called_once_with(f"profiles/slimbook/executive-14-uc2/{GOOD_ID}.json")
-        proposal = result["proposal"]
+        proposal = result["profile"]
         self.assertEqual(proposal["speaker"]["name"], SINK["name"])              # this machine's, from its own list
         self.assertEqual(proposal["imported"]["registry"], GOOD_ID)
         self.assertTrue(result["matches"]["machine"])
-        self.assertTrue(speaker_calibrate.PROPOSAL.exists())
+        # Played and listed, and the last measurement left to this machine's own recording.
+        self.assertEqual([item["imported"]["registry"] for item in self.installed], [GOOD_ID])
+        self.assertFalse(speaker_calibrate.PROPOSAL.exists())
 
     def test_what_is_not_a_calibration_is_refused_whoever_served_it(self):
         self.allow()

@@ -13,6 +13,8 @@ from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sandbox  # noqa: E402,F401  (keeps every test off this machine's calibrator)
 
 from calibration_dsp import (  # noqa: E402
     LEVEL_SEARCH_ABORT_STATUSES,
