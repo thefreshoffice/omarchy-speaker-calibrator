@@ -737,21 +737,25 @@ def analyse_capture(
     would otherwise read as a loud room.  A short lead keeps at least half the
     background window.
     """
+    noise_end = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
+    settle_frames = min(int(round(startup_settle_seconds * spec.rate)), noise_end // 2)
     # Some DMICs carry a DC offset far above the room noise, which then reads
     # as background and swamps the sweep alignment.  Zero-phase, so arrival
     # times are untouched; 10 Hz sits well below the 80 Hz analysis band.
+    # The skipped start stays out of the filter: run both ways, it would
+    # spread a start-up burst into the room sound read after it.
     # Peak and clipping stay on the raw capture, which is what actually clips.
-    filtered = signal.sosfiltfilt(
+    capture = np.asarray(capture, dtype=np.float64)
+    filtered = np.zeros_like(capture)
+    filtered[settle_frames:] = signal.sosfiltfilt(
         signal.butter(2, 10.0, "highpass", fs=spec.rate, output="sos"),
-        np.asarray(capture, dtype=np.float64),
+        capture[settle_frames:],
     )
     sweep = make_sweep(spec)
     starts, correlations, clock_ratio = locate_sweeps(
         filtered, sweep, schedule, spec.rate, record_lead_seconds
     )
     drift_ppm = (clock_ratio - 1.0) * 1_000_000.0
-    noise_end = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
-    settle_frames = min(int(round(startup_settle_seconds * spec.rate)), noise_end // 2)
     noise = filtered[settle_frames:noise_end]
     noise_level = rms(noise)
     noise_dbfs = dbfs(noise_level)
