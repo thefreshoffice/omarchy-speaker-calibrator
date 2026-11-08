@@ -345,15 +345,7 @@ def ensure_loudness_unit():
     registration outlives any number of switches.
     """
     unit = loudness_unit_path()
-    wanted = LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path())
-    fresh = True
-    try:
-        fresh = read_text_bounded(unit) != wanted
-    except OSError:
-        pass
-    if fresh:
-        write_atomic(unit, wanted)
-        run(["systemctl", "--user", "daemon-reload"], check=False)
+    fresh = write_unit(unit, LOUDNESS_UNIT_TEXT.format(tracker=loudness_tracker_path()))
     enabled = run(
         ["systemctl", "--user", "is-enabled", LOUDNESS_SERVICE], check=False, capture=True
     ).stdout.strip()
@@ -1434,9 +1426,9 @@ def activate_profile(profile):
         state["bypass"] = False
         write_compare_state(state)
     # The sound changes first.  The running graph never reads the file on
-    # disk, so nothing audible should wait for its fsyncs; and a live update
-    # touches no unit file, so systemd has nothing to reload (restart_tuning
-    # reloads before it restarts).
+    # disk, so nothing audible should wait for its fsyncs.  A unit file that
+    # changed was already reloaded by write_unit, and restart_tuning reloads
+    # again before it restarts.
     live = service_active() and apply_controls_live(controls)
     # The graph file is written only when it changed, so that a restart, now
     # or later, loads what is playing.
@@ -1582,6 +1574,25 @@ def bypass_toggle():
     return payload
 
 
+def write_unit(path, text):
+    """Write a systemd unit only when it changed, and reload systemd when it did.
+
+    systemd marks a unit for a reload as soon as its file is newer than the
+    copy it read, even with the same bytes, and then warns on every command
+    for that service.  A unit that did change has to be read before the next
+    start, or the next restart runs the old one.  Returns whether it was
+    written.
+    """
+    try:
+        if read_text_bounded(path) == text:
+            return False
+    except OSError:
+        pass
+    write_atomic(path, text)
+    run(["systemctl", "--user", "daemon-reload"], check=False)
+    return True
+
+
 def restart_tuning():
     run(["systemctl", "--user", "daemon-reload"])
     run(["systemctl", "--user", "enable", "--now", SERVICE])
@@ -1608,7 +1619,7 @@ def install_profile(profile, graph):
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
     write_atomic(FRAGMENT, graph)
-    write_atomic(UNIT, UNIT_TEXT)
+    write_unit(UNIT, UNIT_TEXT)
     write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     return activate_profile(profile)
 
@@ -4594,7 +4605,7 @@ def reinstall_profile(profile):
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
     write_atomic(FRAGMENT, graph)
-    write_atomic(UNIT, UNIT_TEXT)
+    write_unit(UNIT, UNIT_TEXT)
     method = activate_profile(profile)
     if profile.get("loudness_compensation") == "on":
         start_loudness_tracker()

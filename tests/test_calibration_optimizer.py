@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 
+import os
 import stat
 import subprocess
 import sys
@@ -2552,6 +2553,65 @@ class DeviceSelectionTests(unittest.TestCase):
         self.assertIn("root.chosenMic = modelData.name", self.source)
         self.assertIn("root.chosenSink = modelData.name", self.source)
         self.assertIn("root.chosenChannel = currentIndex", self.source)
+
+
+class UnitFileTests(unittest.TestCase):
+    """A unit is written only when it changed, and systemd reads it when it did."""
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.base = Path(folder.name)
+        ran = mock.patch.object(speaker_calibrate, "run")
+        self.ran = ran.start()
+        self.addCleanup(ran.stop)
+
+    def reloads(self):
+        return [call for call in self.ran.call_args_list
+                if call.args[0] == ["systemctl", "--user", "daemon-reload"]]
+
+    def test_an_unchanged_unit_is_left_alone(self):
+        unit = self.base / "omarchy-speaker-tuning.service"
+        unit.write_text(speaker_calibrate.UNIT_TEXT)
+        os.utime(unit, (1_000_000, 1_000_000))
+        self.assertFalse(speaker_calibrate.write_unit(unit, speaker_calibrate.UNIT_TEXT))
+        self.assertEqual(unit.stat().st_mtime, 1_000_000)
+        self.assertEqual(self.reloads(), [])
+
+    def test_a_changed_or_missing_unit_is_written_and_reloaded(self):
+        unit = self.base / "omarchy-speaker-tuning.service"
+        for before in ("[Service]\nExecStart=/usr/bin/false\n", None):
+            if before is None:
+                unit.unlink()
+            else:
+                unit.write_text(before)
+            self.ran.reset_mock()
+            self.assertTrue(speaker_calibrate.write_unit(unit, speaker_calibrate.UNIT_TEXT))
+            self.assertEqual(unit.read_text(), speaker_calibrate.UNIT_TEXT)
+            self.assertEqual(len(self.reloads()), 1)
+
+    def test_a_live_install_does_not_leave_systemd_a_stale_unit(self):
+        # The calibration installed live never restarts the service, so a
+        # unit rewritten with the same bytes stayed marked for a reload.
+        names = ("DATA", "PROFILE", "HOST", "FRAGMENT", "UNIT", "LIMITER_PROBE")
+        saved = {name: getattr(speaker_calibrate, name) for name in names}
+        self.addCleanup(lambda: [setattr(speaker_calibrate, name, value) for name, value in saved.items()])
+        speaker_calibrate.DATA = self.base / "data"
+        speaker_calibrate.PROFILE = speaker_calibrate.DATA / "active-profile.json"
+        speaker_calibrate.HOST = self.base / "pipewire/omarchy-speaker-tuning.conf"
+        speaker_calibrate.FRAGMENT = self.base / "pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf"
+        speaker_calibrate.UNIT = self.base / "systemd/user/omarchy-speaker-tuning.service"
+        speaker_calibrate.LIMITER_PROBE = self.base / "limiter_stereo.ttl"
+        speaker_calibrate.LIMITER_PROBE.write_text("")
+        speaker_calibrate.UNIT.parent.mkdir(parents=True)
+        speaker_calibrate.UNIT.write_text(speaker_calibrate.UNIT_TEXT)
+        os.utime(speaker_calibrate.UNIT, (1_000_000, 1_000_000))
+        with mock.patch.object(speaker_calibrate, "keep_previous_profile"), \
+             mock.patch.object(speaker_calibrate, "activate_profile", return_value="live"):
+            method = speaker_calibrate.install_profile({"speaker": {"name": "alsa_output.x"}}, "graph")
+        self.assertEqual(method, "live")
+        self.assertEqual(speaker_calibrate.UNIT.stat().st_mtime, 1_000_000)
+        self.assertEqual(self.reloads(), [])
 
 
 if __name__ == "__main__":
