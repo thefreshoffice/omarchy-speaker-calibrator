@@ -531,6 +531,9 @@ Item {
           var check = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { verification: check })
           root.message = root.verificationSummary(check)
+          // A check changes what sharing would publish and how it scores;
+          // the next step and the share rows read that from the status.
+          Qt.callLater(root.refreshStatus)
         } else if (root.phase === "deepbass") {
           var bass = JSON.parse(raw)
           root.status = Object.assign({}, root.status, {

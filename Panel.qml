@@ -64,6 +64,28 @@ Panel {
     if (entry.playing === true) bits.unshift("Playing now")
     return bits.join("  ·  ")
   }
+  // The registry's calibrations for this model that are worth offering: not
+  // the ones already in the list, which play from there, and not one's own
+  // uploads, which are the calibration they were shared from.
+  function registryRows() {
+    if (service.registry.consent !== "allowed") return []
+    var own = Object.keys(service.registry.uploads || {})
+    return (service.registry.profiles || []).filter(function (entry) {
+      return root.libraryEntryFor(entry.id) === null && own.indexOf(entry.id) < 0
+    })
+  }
+  function registryEmptyText() {
+    var model = String((service.status.hardware || {}).label || "this model")
+    var profiles = service.registry.profiles || []
+    if (service.registry.unreachable) return "The registry could not be reached just now."
+    if (profiles.length === 0)
+      return "Nobody has shared a calibration for " + model + " yet. Calibrate, check it and share it, "
+        + "and you will be the first."
+    var own = Object.keys(service.registry.uploads || {})
+    if (profiles.every(function (entry) { return own.indexOf(entry.id) >= 0 }))
+      return "The only calibrations shared for " + model + " are your own."
+    return "Everything shared for " + model + " is already in your list above."
+  }
   // A registry row that is already in the list plays from the list.
   function libraryEntryFor(registryId) {
     var rows = service.status.library || []
@@ -109,6 +131,9 @@ Panel {
     service.refresh()
     // A question Share asked the last time the panel was open is not still being asked.
     if (service.shareStatus !== null && service.shareStatus.state === "confirm") service.shareStatus = null
+    // Nor does what it answered stay on the main view: from now on the
+    // shared page is reached from Save and share.
+    root.shareFromStep = false
   }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
@@ -1656,6 +1681,17 @@ Panel {
               font.pixelSize: Style.font.caption
               wrapMode: Text.WordWrap
             }
+            // The page the note speaks of, here rather than in a closed fold.
+            ActionRow {
+              readonly property string sharedUrl: String((service.registry || {}).shared_url || "")
+              visible: root.shareFromStep && sharedUrl !== ""
+              width: parent.width
+              icon: "󰖟"
+              label: "Shared with everyone  ·  open its page"
+              description: "Others with " + String((service.status.hardware || {}).label || "this machine")
+                + " find it in their panel"
+              onClicked: service.openRegistryPage(sharedUrl)
+            }
 
             Column {
               visible: service.status.profile !== null && service.status.profile !== undefined
@@ -1821,10 +1857,7 @@ Panel {
               }
             }
             Repeater {
-              // The ones already in the list are played from there, above.
-              model: service.registry.consent === "allowed"
-                ? (service.registry.profiles || []).filter(function (entry) { return root.libraryEntryFor(entry.id) === null })
-                : []
+              model: root.registryRows()
               ActionRow {
                 width: parent.width
                 icon: "󰓦"
@@ -1846,12 +1879,9 @@ Panel {
             }
             Text {
               textFormat: Text.PlainText
-              visible: service.registry.consent === "allowed" && (service.registry.profiles || []).length === 0
+              visible: service.registry.consent === "allowed" && root.registryRows().length === 0
               width: parent.width
-              text: (service.registry.unreachable ? "The registry could not be reached just now. "
-                     : "Nobody has shared a calibration for " + String((service.status.hardware || {}).label || "this model")
-                       + " yet. ")
-                + "Calibrate, check it and share it, and you will be the first."
+              text: root.registryEmptyText()
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
