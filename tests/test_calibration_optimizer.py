@@ -2130,7 +2130,7 @@ class InstallDefaultsTests(unittest.TestCase):
     def test_installing_starts_or_stops_the_tracker_to_match_the_profile(self):
         calls = []
         patches = [
-            mock.patch.object(speaker_calibrate, "install_profile", lambda profile, graph: "live"),
+            mock.patch.object(speaker_calibrate, "install_profile", lambda profile: "live"),
             mock.patch.object(speaker_calibrate, "filter_config", lambda *a, **k: "graph"),
             mock.patch.object(speaker_calibrate, "sink_volume_db", lambda sink: 0.0),
             mock.patch.object(speaker_calibrate, "listening_sink", lambda profile: "sink"),
@@ -2554,7 +2554,7 @@ class UnitFileTests(unittest.TestCase):
         os.utime(speaker_calibrate.UNIT, (1_000_000, 1_000_000))
         with mock.patch.object(speaker_calibrate, "library_add"), \
              mock.patch.object(speaker_calibrate, "activate_profile", return_value="live"):
-            method = speaker_calibrate.install_profile({"speaker": {"name": "alsa_output.x"}}, "graph")
+            method = speaker_calibrate.install_profile({"speaker": {"name": "alsa_output.x"}})
         self.assertEqual(method, "live")
         self.assertEqual(speaker_calibrate.UNIT.stat().st_mtime, 1_000_000)
         self.assertEqual(self.reloads(), [])

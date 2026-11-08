@@ -1674,7 +1674,7 @@ def restart_tuning():
         run(["pactl", "set-default-sink", VIRTUAL_SINK], check=False)
 
 
-def install_profile(profile, graph):
+def install_profile(profile):
     if not LIMITER_PROBE.exists():
         raise SystemExit(
             f"The filter chain needs {LIMITER_PACKAGE}, which this machine does "
@@ -1690,7 +1690,8 @@ def install_profile(profile, graph):
         backup(path)
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
-    write_atomic(FRAGMENT, graph)
+    # Not the graph: activate_profile writes it, and has to read the one on
+    # disk first to know which speaker the running tuning plays into.
     write_unit(UNIT, UNIT_TEXT)
     write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     return activate_profile(profile)
@@ -1866,8 +1867,9 @@ def _migrate():
         if identifier in seen:
             continue
         seen.add(identifier)
-        _store_entry(profile)
         stamp = now if index == 0 and playing is not None else str(profile.get("created_at") or "")
+        profile["library_played_at"] = stamp
+        _store_entry(profile)
         entries.append(_entry_for(profile, played_at=stamp))
     entries = _write_index(entries)
     if playing is not None:
@@ -1883,12 +1885,24 @@ def _migrate():
 
 
 def library_entries():
+    """The list, filled from the old slots or rebuilt from its files when it has to be.
+
+    Filling and rebuilding write PROFILE and the index, so they take the state
+    lock even from a status read: an install running at that moment must not
+    have its new PROFILE overwritten by the old one.  When another change
+    holds the lock, a status gets no list this time, and the next one does.
+    """
     entries = _read_index()
     if entries is not None:
         return entries
-    if LIBRARY.is_dir() and any(LIBRARY_ID.fullmatch(file.stem) for file in LIBRARY.glob("*.json")):
-        return _rebuild_index()
-    return _migrate()
+    with state_lock():
+        # Another run may have filled it while this one waited for the lock.
+        entries = _read_index()
+        if entries is not None:
+            return entries
+        if LIBRARY.is_dir() and any(LIBRARY_ID.fullmatch(file.stem) for file in LIBRARY.glob("*.json")):
+            return _rebuild_index()
+        return _migrate()
 
 
 def _write_back(entries):
@@ -1964,7 +1978,8 @@ def library_play(identifier):
                          ("loudness_compensation", LOUDNESS_COMPENSATION_DEFAULT)):
         profile[key] = current.get(key, profile.get(key, default))
     profile["library_id"] = identifier
-    method = activate_profile(profile)
+    # Written down first, as an install is: if the restart below fails, the
+    # graph on disk, PROFILE and the list still agree on what plays.
     now = _now()
     profile["library_played_at"] = now
     write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
@@ -1972,6 +1987,7 @@ def library_play(identifier):
     entry["played_at"] = now
     entry["summary"] = _entry_summary(profile)
     _write_index([entry] + [item for item in entries if item is not entry])
+    method = activate_profile(profile)
     if profile.get("loudness_compensation") == "on":
         start_loudness_tracker()
     else:
@@ -2031,9 +2047,16 @@ def library_status(profile):
     return rows
 
 
+_STATE_LOCK_HELD = False
+
+
 @contextlib.contextmanager
 def state_lock():
     """Hold the one lock that every change takes, or say that one is running."""
+    global _STATE_LOCK_HELD
+    if _STATE_LOCK_HELD:
+        yield
+        return
     secure_directory(DATA)
     descriptor = os.open(STATE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
@@ -2041,7 +2064,11 @@ def state_lock():
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("Another change to the calibration is running; try again when it has finished.")
-        yield
+        _STATE_LOCK_HELD = True
+        try:
+            yield
+        finally:
+            _STATE_LOCK_HELD = False
     finally:
         os.close(descriptor)
 
@@ -3227,15 +3254,7 @@ def install_proposal():
 def install_now(profile):
     if not profile.get("quality", {}).get("accepted") or not profile.get("fit"):
         raise SystemExit("This measurement failed its quality checks and cannot be installed.")
-    profile["activation"] = install_profile(
-        profile,
-        filter_config(
-            profile["speaker"]["name"], profile["fit"],
-            deep_bass=profile.get("deep_bass") == "on",
-            loudness_compensation=profile.get("loudness_compensation") == "on",
-            sink_volume_db=sink_volume_db(listening_sink(profile)),
-        ),
-    )
+    profile["activation"] = install_profile(profile)
     profile["installed"] = True
     # The tracker follows the profile that is now playing: started when it
     # asks for compensation, stopped when it does not.
@@ -4976,17 +4995,11 @@ def omarchy_audio_tuning(action, overlay=None):
 
 def reinstall_profile(profile):
     """Put the plugin's own files back and play the profile: what install does,
-    without a new previous-profile slot, because nothing new was measured."""
-    graph = filter_config(
-        profile["speaker"]["name"], profile["fit"],
-        deep_bass=profile.get("deep_bass") == "on",
-        loudness_compensation=profile.get("loudness_compensation") == "on",
-        sink_volume_db=sink_volume_db(listening_sink(profile)),
-    )
+    without a new list entry, because nothing new was measured.  The graph is
+    written by activate_profile, which reads the running one's speaker first."""
     for path in (HOST, FRAGMENT, UNIT):
         secure_directory(path.parent)
     write_atomic(HOST, HOST_TEXT)
-    write_atomic(FRAGMENT, graph)
     write_unit(UNIT, UNIT_TEXT)
     method = activate_profile(profile)
     if profile.get("loudness_compensation") == "on":
@@ -5292,7 +5305,7 @@ def wizard():
           f"{fit_payload['weighted_rmse_after_db']:.2f} dB")
     print(f"  Background level: {metrics['background_dbfs']:.1f} dBFS")
     if input("Install and enable this profile? [Y/n]: ").strip().lower() not in ("n", "no"):
-        install_profile(profile, filter_config(sink["name"], fit_payload))
+        install_profile(profile)
         print("\nProfile installed. The calibrated sink is now the default output.")
     else:
         print("Profile was measured but not installed.")
@@ -5315,7 +5328,7 @@ def status():
     if rows:
         print("Calibrations (* plays; 'library-play-json --id <id>' plays another):")
         for row in rows:
-            print(f"  {'*' if row['playing'] else ' '} {row['id']}  {row['name'] or row['label']}"
+            print(f"  {'*' if row['playing'] else ' '} {row['id']}  {row['name'] or row['label'] or 'calibration'}"
                   + ("  · pinned" if row["pinned"] else ""))
     if profile:
         print(f"Speaker: {profile['speaker']['description']}\nMicrophone: {profile['microphone']['description']}")

@@ -119,6 +119,19 @@ class AddingAndPlayingTests(LibraryTestCase):
         playing = helper.load_profile(helper.PROFILE)
         self.assertEqual((playing["deep_bass"], playing["loudness_compensation"]), ("on", "on"))
 
+    def test_a_switch_that_fails_still_leaves_the_list_and_profile_agreeing(self):
+        first = self.install(profile("2026-11-01T10:00:00+00:00"))
+        self.install(profile("2026-11-02T10:00:00+00:00"))
+        def sink_never_appears(item):
+            raise SystemExit("The tuning sink did not appear; inspect the user service status.")
+        self.patch("activate_profile", sink_never_appears)
+        with self.assertRaisesRegex(SystemExit, "did not appear"):
+            helper.library_play(first)
+        # activate_profile had already written the graph for this one, so it is what the next start plays.
+        self.assertEqual(helper.load_profile(helper.PROFILE)["library_id"], first)
+        self.assertEqual([row["id"] for row in self.rows() if row["playing"]], [first])
+        self.assertEqual(self.rows()[0]["id"], first)
+
     def test_playing_what_already_plays_changes_nothing(self):
         first = self.install(profile("2026-11-01T10:00:00+00:00"))
         result = helper.library_play(first)
@@ -187,10 +200,13 @@ class RefusalTests(LibraryTestCase):
         self.assertEqual({entry["id"] for entry in helper.library_entries()}, {first, second})
 
     def test_another_change_running_is_said_and_not_waited_for(self):
-        with helper.state_lock():
-            with self.assertRaisesRegex(SystemExit, "Another change"):
-                with helper.state_lock():
-                    pass
+        import fcntl
+        other = os.open(helper.STATE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, other)
+        fcntl.flock(other, fcntl.LOCK_EX)          # as another process holding it
+        with self.assertRaisesRegex(SystemExit, "Another change"):
+            with helper.state_lock():
+                pass
 
 
 class TextStatusTests(unittest.TestCase):
@@ -265,6 +281,29 @@ class MigrationTests(LibraryTestCase):
             payload = helper.status_payload()
         self.assertEqual([row["playing"] for row in payload["library"]], [True, False])
 
+    def test_the_list_is_not_filled_while_another_change_runs(self):
+        old = profile("2026-10-01T10:00:00+00:00")
+        helper.PROFILE.write_text(json.dumps(old))
+        helper.PREVIOUS_PROFILE.write_text(json.dumps(profile("2026-09-01T10:00:00+00:00", gain=-2.0)))
+        # Another process holds the lock: an install, say, half way through.
+        other = os.open(helper.STATE_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, other)
+        import fcntl
+        fcntl.flock(other, fcntl.LOCK_EX)
+        with self.assertRaisesRegex(SystemExit, "Another change"):
+            helper.library_entries()
+        self.assertEqual(self.rows(), [])                # a status simply gets no list this time
+        self.assertTrue(helper.PREVIOUS_PROFILE.exists())
+        self.assertFalse(helper.LIBRARY_INDEX.exists())
+        self.assertEqual(json.loads(helper.PROFILE.read_text()), old)
+        fcntl.flock(other, fcntl.LOCK_UN)
+        self.assertEqual(len(helper.library_entries()), 2)
+
+    def test_a_locked_command_fills_the_list_without_waiting_on_itself(self):
+        helper.PROFILE.write_text(json.dumps(profile("2026-10-01T10:00:00+00:00")))
+        with helper.state_lock():
+            self.assertEqual(len(helper.library_entries()), 1)
+
     def test_a_rejected_measurement_is_not_listed(self):
         helper.PROFILE.write_text(json.dumps(profile("2026-10-01T10:00:00+00:00")))
         rejected = profile("2026-11-01T10:00:00+00:00", quality={"accepted": False})
@@ -303,6 +342,20 @@ class SwitchTests(LibraryTestCase):
         # Every control would land, and the sound would stay on the old speaker.
         self.write_running_graph("alsa_output.usb-other.analog-stereo")
         self.assertEqual(helper.activate_profile(profile("2026-11-01T10:00:00+00:00")), "restart")
+        self.assertEqual(self.steps, ["restart"])
+        self.assertIn(f'target.object = "{SPEAKER}"', helper.FRAGMENT.read_text())
+
+    def test_an_install_for_another_speaker_restarts_too(self):
+        # A measurement, a shared file and a registry calibration all arrive
+        # through install_profile, which must not write the graph first.
+        self.write_running_graph("alsa_output.usb-other.analog-stereo")
+        probe = self.config / "limiter_stereo.ttl"
+        probe.write_text("")
+        self.patch("LIMITER_PROBE", probe)
+        self.patch("HOST", self.config / "pipewire/omarchy-speaker-tuning.conf")
+        self.patch("UNIT", self.config / "systemd/user/omarchy-speaker-tuning.service")
+        self.patch("run", lambda args, **options: subprocess.CompletedProcess(args, 0, "", ""))
+        self.assertEqual(helper.install_profile(profile("2026-11-01T10:00:00+00:00")), "restart")
         self.assertEqual(self.steps, ["restart"])
         self.assertIn(f'target.object = "{SPEAKER}"', helper.FRAGMENT.read_text())
 
