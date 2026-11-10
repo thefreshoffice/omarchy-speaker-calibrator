@@ -128,6 +128,11 @@ Panel {
     // Start at the top: reopening halfway down the page loses the reading of
     // the calibration the panel exists to give.
     scroller.contentY = 0
+    // The panel outlives its openings, so the folds are closed here.
+    root.tuneOpen = false
+    root.shareOpen = false
+    root.detailsOpen = false
+    root.setupOpen = false
     service.refresh()
     // A question Share asked the last time the panel was open is not still being asked.
     if (service.shareStatus !== null && service.shareStatus.state === "confirm") service.shareStatus = null
@@ -215,14 +220,16 @@ Panel {
       root.chosenMic = kept.mic
       root.chosenChannel = Math.max(0, Number(kept.channel) || 0)
     }
+    // A device picked by hand that is gone is missing even when the
+    // calibration's own device can stand in for it.
     var sink = deviceIndex(service.sinks, root.chosenSink)
+    var sinkMissing = sink < 0 && root.chosenSink !== ""
     if (sink < 0) sink = deviceIndex(service.sinks, (profile.speaker || {}).name)
-    var sinkMissing = sink < 0 && root.chosenSink !== "" ? root.chosenSink : ""
     if (sink < 0) sink = firstInternal(service.sinks)
     root.sinkIndex = sink
     var mic = deviceIndex(service.microphones, root.chosenMic)
+    var micMissing = mic < 0 && root.chosenMic !== ""
     if (mic < 0) mic = deviceIndex(service.microphones, (profile.microphone || {}).name)
-    var micMissing = mic < 0 && root.chosenMic !== "" ? root.chosenMic : ""
     if (mic < 0) mic = defaultInternal(service.microphones)
     if (mic < 0) mic = firstInternal(service.microphones)
     // A device picked by hand that is not connected: the fallback stands in,
@@ -250,11 +257,6 @@ Panel {
     return service.proposal !== null && service.proposal !== undefined
       && service.proposal.measurement !== undefined
   }
-  // The two switches move only the bass shelf and the make-up gain, which the
-  // fit already holds for every combination, so they are applied live, in a
-  // fraction of a second.  A different voicing or channel trim changes the fit
-  // itself and goes through a refit; without any measurement the options
-  // simply wait for the next calibration.
   // The level switches: a gain and the bass shelf, applied live.  A voicing
   // or channel balance waiting for its refit stays waiting; its own row
   // fits it, so a level switch never starts a refit nobody pressed.
@@ -450,8 +452,12 @@ Panel {
     var sink = root.sinkIndex >= 0 ? service.sinks[root.sinkIndex] : null
     var mic = root.micIndex >= 0 ? service.microphones[root.micIndex] : null
     return (sink ? sink.description : "No speakers") + "  ·  " + (mic ? mic.description : "no microphone")
-      + (root.missingDevices.length > 0 ? "  ·  the " + root.missingDevices.join(" and ") + " you picked "
-         + (root.missingDevices.length > 1 ? "are" : "is") + " not connected" : "")
+  }
+  // Under the summary line, on a line of its own that long device names cannot cut off.
+  function missingNote() {
+    return "The " + root.missingDevices.join(" and the ")
+      + (root.missingDevices.length > 1 ? " you picked are" : " you picked is")
+      + " not connected, so the next calibration uses what is named above."
   }
   // Shared files in Downloads that the list does not hold yet.
   function downloadRows() {
@@ -1924,8 +1930,7 @@ Panel {
           }
 
           // What the next calibration uses, in one line.  The pickers open on
-          // request, and by themselves while there is nothing to choose from yet
-          // or a chosen device is gone.
+          // request, and by themselves while there is nothing to choose from yet.
           RowLayout {
             visible: !root.setupForced()
             width: parent.width
@@ -1952,6 +1957,16 @@ Panel {
                 onClicked: root.setupOpen = !root.setupOpen
               }
             }
+          }
+          Text {
+            textFormat: Text.PlainText
+            visible: !root.setupForced() && !root.setupOpen && root.missingDevices.length > 0
+            width: parent.width
+            text: root.missingNote()
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           Column {

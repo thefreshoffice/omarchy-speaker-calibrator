@@ -3414,6 +3414,10 @@ def relevel(bass=None, loudness=None):
     apply_level_variant(profile, bass, loudness)
     # Heard first; written down after.
     method = activate_profile(profile)
+    # A restart can bring back a tuning that was switched off, which also
+    # unregistered the tracker; a live switch leaves the running one alone.
+    if method != "live" and profile.get("loudness_compensation") == "on":
+        start_loudness_tracker()
     write_atomic(PROFILE, json.dumps(profile, indent=2) + "\n")
     proposal = load_profile(PROPOSAL)
     if (proposal and not proposal.get("imported")
@@ -4404,8 +4408,14 @@ def shared_summary(path, ours, sinks, known=None):
     }
 
 
+# What makes two calibrations sound different apart from the level switches,
+# which are carried over from the playing one on import.
+LIBRARY_FINGERPRINT_FIELDS = ("filters", "highpass", "highpass_hz", "channel_trim")
+
+
 def _library_fingerprint(profile):
-    return json.dumps((profile.get("fit") or {}).get("filters"), sort_keys=True, default=str)
+    fit = profile.get("fit") or {}
+    return json.dumps({field: fit.get(field) for field in LIBRARY_FINGERPRINT_FIELDS}, sort_keys=True, default=str)
 
 
 def _library_known():

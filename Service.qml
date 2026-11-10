@@ -108,6 +108,7 @@ Item {
     var loudness = profile.loudness || "protected"
     parts.push(loudness === "matched" ? "Louder on"
       : loudness === "balanced" ? "Louder halfway" : "Louder off")
+    if (profile.loudness_compensation === "on") parts.push("Loudness on")
     if (profile.voicing === "warm") parts.push("warm voicing")
     return parts.join(" · ")
   }

@@ -111,8 +111,8 @@ output on its own.
 Under the list of calibrations sits **Calibrate again**, with one line naming
 the speakers and microphone it will use; **change** opens the pickers, and they
 open by themselves before the first calibration. When a device you picked is
-not connected, that line says so and names what stands in.
-Below that, three closed folds hold the rest:
+not connected, a note under that line says so; the line names what stands in.
+Below that, three folds hold the rest, closed each time the panel opens:
 
 - **Tune the fit**: voicing, the three loudness levels, channel balance,
   checking the calibration and improving from the check, and switching it off

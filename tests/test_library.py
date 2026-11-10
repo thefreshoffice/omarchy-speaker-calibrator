@@ -112,6 +112,19 @@ class AddingAndPlayingTests(LibraryTestCase):
         stored = json.loads((helper.LIBRARY / f"{first}.json").read_text())
         self.assertEqual(stored["bass"], "full")
 
+    def test_a_level_switch_that_restarts_the_tuning_brings_the_tracker_back(self):
+        # "Switch off completely" unregisters the tracker; a switch that starts
+        # the tuning again has to start it too, and a live one leaves it be.
+        self.install(profile("2026-11-01T10:00:00+00:00", loudness_compensation="on"))
+        started = []
+        self.patch("start_loudness_tracker", lambda: started.append(True))
+        self.patch("apply_level_variant", lambda item, bass, loudness: item.update(bass=bass, loudness=loudness))
+        for method, expected in (("live", []), ("restart", [True])):
+            started.clear()
+            self.patch("activate_profile", lambda item, method=method: method)
+            helper.relevel("full", "protected")
+            self.assertEqual(started, expected, method)
+
     def test_the_machine_s_switches_stay_as_they_are(self):
         first = self.install(profile("2026-11-01T10:00:00+00:00", deep_bass="off"))
         self.install(profile("2026-11-02T10:00:00+00:00", deep_bass="on", loudness_compensation="on"))
@@ -266,6 +279,18 @@ class SharedFileTests(LibraryTestCase):
         path.write_text(json.dumps(payload))
         (row,) = helper.shared_profiles()
         self.assertFalse(row["in_library"])
+
+    def test_the_same_filters_with_another_high_pass_or_balance_is_another_calibration(self):
+        self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        path, original = self.exported()
+        for field, value in (("highpass_hz", 140.0), ("channel_trim", {"left_db": -1.5, "right_db": 0.0})):
+            payload = json.loads(json.dumps(original))
+            payload["profile"]["fit"][field] = value
+            payload["exported_at"] = "2026-11-02T10:00:00+00:00"        # not this export, so only the sound decides
+            path.write_text(json.dumps(payload))
+            (row,) = helper.shared_profiles()
+            self.assertFalse(row["in_library"], field)
 
     def test_a_loaded_file_is_known_and_leaves_the_measured_one_alone(self):
         measured = self.install(profile("2026-11-01T10:00:00+00:00"))
