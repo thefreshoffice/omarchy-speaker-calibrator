@@ -27,8 +27,8 @@ own packages rather than the AUR. Nothing here needs a terminal.
 ### MacBook10,1 audio setup
 
 On the 12-inch MacBook (2017), the stock audio driver can list the speakers and
-microphone while routing them incorrectly. See the [tested internal-audio
-setup](docs/macbook10-internal-audio.md) before calibrating this model.
+microphone while routing them incorrectly. See the [audio diagnosis and tested
+configuration](docs/macbook10-internal-audio.md) before calibrating this model.
 
 ## Using it
 
