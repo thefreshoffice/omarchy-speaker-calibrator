@@ -257,6 +257,12 @@ GATE_PRE_ARRIVAL_SECONDS = 0.05
 # a few hundred hertz to drop wall and ceiling reflections and the distortion
 # products that a sine sweep folds into negative time.
 DEFAULT_GATE_CYCLES = 15.0
+# Some digital microphone drivers open their stream with a short burst: full
+# scale for the first 50 ms, settled after about 150 ms on a Ryzen HD Audio
+# array, a 30 ms pop at -12 dBFS on a sof-soundwire array.  Every recording
+# starts well before anything is played, so this much of its opening is left
+# out wherever the room is judged from it.
+STARTUP_SETTLE_SECONDS = 0.2
 
 
 def _band_limit_weights(bins: np.ndarray, spec: SweepSpec) -> np.ndarray:
@@ -377,19 +383,22 @@ def silence_buffer(
     spec: SweepSpec,
     record_lead_seconds: float,
     length: int,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> np.ndarray:
     """Recorded room sound from between the sweeps, tiled to ``length``.
 
     Running this through the same deconvolution and gate as a sweep measures
     the noise floor in exactly the units of the response, at every frequency,
     without any assumption about how the inverse filter spreads noise in time.
+    The piece before the first sweep starts after ``startup_settle_seconds``,
+    so a microphone's start-up burst does not pass for room sound.
     """
     rate = spec.rate
     margin = int(round(min(0.1, spec.block_gap / 4.0) * rate))
     tail = int(round(spec.response_tail * rate))
     pieces = []
     first_end = starts[0] - margin
-    first_start = max(0, first_end - int(round(
+    first_start = max(int(round(startup_settle_seconds * rate)), first_end - int(round(
         (0.75 * record_lead_seconds + spec.pre_silence) * rate
     )))
     if first_end > first_start:
@@ -621,12 +630,16 @@ def _quality_summary(
             "corrections shrink where the noise floor is close."
         )
         guidance.append("Reduce background noise or raise the level, then measure again.")
+    # Neither of these is a defect in the measurement, and each would hold
+    # for every measurement made this way, so a verdict that carried them
+    # could never say "pass" and would hide the warnings that do vary.
+    # They are advice, and go where advice goes.
     if internal_mic:
-        warnings.append(
-            "Built-in microphone mode is a relative estimate; chassis coupling and unknown mic response remain."
+        guidance.append(
+            "Built-in microphone mode is a relative estimate; chassis coupling and the unknown "
+            "microphone response remain. An external measuring microphone is more reliable."
         )
     elif calibration is None:
-        warnings.append("No microphone calibration file was supplied.")
         guidance.append("For final tuning, load the serial-number calibration file for this microphone.")
     if background_dbfs > -35.0:
         warnings.append(f"Recorded background level is high ({background_dbfs:.1f} dBFS).")
@@ -713,15 +726,37 @@ def analyse_capture(
     internal_mic: bool,
     calibration: dict | None = None,
     gate_cycles: float | None = DEFAULT_GATE_CYCLES,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> dict:
-    """Analyze a mono capture of the generated stereo measurement program."""
+    """Analyze a mono capture of the generated stereo measurement program.
+
+    The recorder starts ``record_lead_seconds`` before playback, so the
+    opening of the capture is room sound and is reported as the background
+    level.  The first ``startup_settle_seconds`` of it are skipped, as in
+    ``analyse_level_probe``, because some microphones start with a burst that
+    would otherwise read as a loud room.  A short lead keeps at least half the
+    background window.
+    """
+    noise_end = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
+    settle_frames = min(int(round(startup_settle_seconds * spec.rate)), noise_end // 2)
+    # Some DMICs carry a DC offset far above the room noise, which then reads
+    # as background and swamps the sweep alignment.  Zero-phase, so arrival
+    # times are untouched; 10 Hz sits well below the 80 Hz analysis band.
+    # The skipped start stays out of the filter: run both ways, it would
+    # spread a start-up burst into the room sound read after it.
+    # Peak and clipping stay on the raw capture, which is what actually clips.
+    capture = np.asarray(capture, dtype=np.float64)
+    filtered = np.zeros_like(capture)
+    filtered[settle_frames:] = signal.sosfiltfilt(
+        signal.butter(2, 10.0, "highpass", fs=spec.rate, output="sos"),
+        capture[settle_frames:],
+    )
     sweep = make_sweep(spec)
     starts, correlations, clock_ratio = locate_sweeps(
-        capture, sweep, schedule, spec.rate, record_lead_seconds
+        filtered, sweep, schedule, spec.rate, record_lead_seconds
     )
     drift_ppm = (clock_ratio - 1.0) * 1_000_000.0
-    noise_frames = max(1, int(max(0.15, record_lead_seconds * 0.7) * spec.rate))
-    noise = capture[:noise_frames]
+    noise = filtered[settle_frames:noise_end]
     noise_level = rms(noise)
     noise_dbfs = dbfs(noise_level)
     frequencies = _log_grid(max(80.0, spec.start_hz), min(16_000.0, spec.end_hz))
@@ -733,7 +768,8 @@ def analyse_capture(
     # The noise floor is the room sound between sweeps, put through the same
     # deconvolution and gate as the sweeps and read at the same position.
     _, noise_floor, _ = regularized_response(
-        silence_buffer(capture, starts, spec, record_lead_seconds, segment_frames),
+        silence_buffer(filtered, starts, spec, record_lead_seconds, segment_frames,
+                       startup_settle_seconds),
         sweep, spec, frequencies,
         gate_cycles=gate_cycles, nominal_peak_index=pre_frames, locate_peak=False,
     )
@@ -742,9 +778,12 @@ def analyse_capture(
     per_channel: dict[int, list[dict]] = {0: [], 1: []}
     for event, start, correlation in zip(schedule, starts, correlations):
         segment = _drift_corrected_segment(
-            capture, start - pre_frames, segment_frames, clock_ratio
+            filtered, start - pre_frames, segment_frames, clock_ratio
         )
         sweep_part = segment[pre_frames:pre_frames + sweep.size]
+        raw_part = _drift_corrected_segment(
+            capture, start - pre_frames, segment_frames, clock_ratio
+        )[pre_frames:pre_frames + sweep.size]
         impulse, curve, peak_index = regularized_response(
             segment, sweep, spec, frequencies,
             gate_cycles=gate_cycles, nominal_peak_index=pre_frames,
@@ -756,8 +795,8 @@ def analyse_capture(
             "start_frame": start,
             "alignment_correlation": round(correlation, 5),
             "rms_dbfs": round(dbfs(segment_rms), 3),
-            "peak_dbfs": round(dbfs(float(np.max(np.abs(sweep_part)))), 3),
-            "clipped_samples": int(np.count_nonzero(np.abs(sweep_part) >= 0.999)),
+            "peak_dbfs": round(dbfs(float(np.max(np.abs(raw_part)))), 3),
+            "clipped_samples": int(np.count_nonzero(np.abs(raw_part) >= 0.999)),
             "broadband_prominence_db": round(dbfs(segment_rms) - noise_dbfs, 3),
             "harmonic_residual_db": round(
                 estimate_harmonic_residual_db(sweep_part, spec, noise_level), 3
@@ -1226,6 +1265,26 @@ class LevelSearchPolicy:
     # less than half as much, something else sets the peak: automatic gain
     # control, an overloaded microphone, or other audio.
     level_follow_step_db: float = 3.0
+    # Dynamics processing in the path (a microphone's compression, automatic
+    # gain or noise gate, a speaker amplifier's protection) moves the recorded
+    # level by less, or more, than the played level.  A swept-sine measurement
+    # assumes it moves one-for-one: a compressor flattens exactly the peaks and
+    # dips being measured, so the correction comes out too weak.  Two clean
+    # probes this far apart give a slope worth judging.  A noisy room leaves
+    # little room between a probe that clips and one the room buries, so the
+    # step is small, and a verdict also needs the recorded change to miss the
+    # played one by more than the scatter between two probes (a few tenths of
+    # a decibel each).
+    linearity_step_db: float = 3.0
+    linearity_minimum_error_db: float = 1.5
+    linearity_probe_step_db: float = 8.0
+    linearity_minimum_prominence_db: float = 8.0
+    linearity_compressed_slope: float = 0.8
+    linearity_expanded_slope: float = 1.25
+
+
+# How many of a probe's loudest 50 ms blocks stand for its level.
+LOUD_BLOCKS = 4
 
 
 def analyse_level_probe(
@@ -1234,12 +1293,15 @@ def analyse_level_probe(
     *,
     background_seconds: float = 0.3,
     block_seconds: float = 0.05,
+    startup_settle_seconds: float = STARTUP_SETTLE_SECONDS,
 ) -> dict:
     """Summarize a short level-probe recording without relying on timing.
 
-    The recorder starts ``background_seconds`` or more before the probe plays,
-    so the opening of the recording is room sound alone and is reported as
-    background.  Everything after it is the probe region.  Noise and
+    The recorder starts ``background_seconds`` or more before the probe plays.
+    Some digital microphone drivers emit a short full-scale burst while their
+    node starts, so ``startup_settle_seconds`` is discarded before room sound
+    is judged.  The following background window is reported as background;
+    everything after it is the probe region.  Noise and
     prominence come from short RMS blocks, so a late recorder start or an
     early stop cannot masquerade as a quiet speaker.
 
@@ -1264,30 +1326,48 @@ def analyse_level_probe(
     if usable < 6 * block:
         raise ValueError("The level probe recording is too short to analyse.")
     blocks = values[:usable].reshape((usable // block, block, channels))
-    block_rms = np.sqrt(np.mean(blocks * blocks, axis=1))
+    # Some DMICs carry a DC offset well above the room noise; left in, it reads
+    # as background and hides the probe.  Median, so the start-up burst does not skew it.
+    centered = blocks - np.median(values[:usable], axis=0)
+    block_rms = np.sqrt(np.mean(centered * centered, axis=1))
     block_peak = np.max(np.abs(blocks), axis=1)
     count = blocks.shape[0]
-    background_blocks = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
-    background_rms = np.sqrt(np.mean(block_rms[:background_blocks] ** 2, axis=0))
-    background_peak = np.max(block_peak[:background_blocks], axis=0)
+    background_end = int(np.clip(round(background_seconds * rate / block), 1, count // 2))
+    settle_blocks = int(np.clip(round(startup_settle_seconds * rate / block),
+                                0, max(0, background_end - 1)))
+    background_rms = np.sqrt(np.mean(
+        block_rms[settle_blocks:background_end] ** 2, axis=0))
+    background_peak = np.max(block_peak[settle_blocks:background_end], axis=0)
 
-    region_rms = block_rms[background_blocks:]
-    region_peak = block_peak[background_blocks:]
-    noise = np.percentile(block_rms, 10, axis=0)
+    region_rms = block_rms[background_end:]
+    region_peak = block_peak[background_end:]
+    noise = np.percentile(block_rms[settle_blocks:], 10, axis=0)
     loud = np.percentile(region_rms, 95, axis=0)
     prominences = [dbfs(loud[index]) - dbfs(noise[index]) for index in range(channels)]
     best = int(np.argmax(prominences))
 
-    crest_db = 20.0 * np.log10(region_peak / np.maximum(region_rms, 1e-12))
-    tonal = (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
+    crest_db = 20.0 * np.log10(np.maximum(region_peak, 1e-12) / np.maximum(region_rms, 1e-12))
+    tonal = (region_peak > 0.0) & (crest_db <= 12.0) & (region_rms >= 2.0 * noise[np.newaxis, :])
     tonal_peak = float(np.max(region_peak[tonal])) if np.any(tonal) else 0.0
     transient_peak = float(np.max(region_peak[~tonal])) if np.any(~tonal) else 0.0
+    # The level of the probe itself, for comparing probes with each other: the
+    # loudest tonal blocks of the best channel, with the noise power taken out
+    # so that a quiet probe is not flattered by the room.  The same few blocks
+    # are the loudest at every level, which a recorder that starts a little
+    # early or late does not change.
+    tonal_power = np.sort(region_rms[tonal[:, best], best] ** 2)[::-1][:LOUD_BLOCKS]
+    if tonal_power.size >= LOUD_BLOCKS:
+        loud_power = float(np.mean(tonal_power)) - float(noise[best]) ** 2
+        loud_rms = float(np.sqrt(max(loud_power, 1e-24)))
+    else:
+        loud_rms = 0.0
     loudest_blocks = np.sort(np.max(region_peak, axis=1))[::-1]
     peak = float(loudest_blocks[1] if loudest_blocks.size >= 4 else loudest_blocks[0])
-    region = values[background_blocks * block:usable]
+    region = values[background_end * block:usable]
     return {
         "peak_dbfs": round(dbfs(peak), 3),
         "tonal_peak_dbfs": round(dbfs(tonal_peak), 3),
+        "loud_rms_dbfs": round(dbfs(loud_rms), 3),
         "noise_dbfs": round(dbfs(float(noise[best])), 3),
         "prominence_db": round(float(prominences[best]), 3),
         "clipped_samples": int(np.count_nonzero(np.abs(region) >= 0.999)),
@@ -1422,6 +1502,113 @@ def search_measurement_level(
     }
 
 
+def _linearity_candidates(attempts, policy: LevelSearchPolicy) -> list[dict]:
+    return [
+        item for item in attempts or []
+        if item.get("clipped_samples", 1) == 0
+        and float(item.get("prominence_db", 0.0)) >= policy.linearity_minimum_prominence_db
+        and float(item.get("loud_rms_dbfs", -200.0)) > -119.0
+    ]
+
+
+def level_linearity(attempts, policy: LevelSearchPolicy = LevelSearchPolicy()) -> dict | None:
+    """How the recorded level followed the played level between two probes.
+
+    Takes the loudest clean probe, because the long sweeps play at about that
+    level and a compressor works hardest there, and the clean probe furthest
+    below it.  Returns None when no two clean probes are far enough apart to
+    say anything.
+    """
+    clean = sorted(_linearity_candidates(attempts, policy), key=lambda item: item["level_dbfs"])
+    if len(clean) < 2:
+        return None
+    quiet, loud = clean[0], clean[-1]
+    level_change = float(loud["level_dbfs"]) - float(quiet["level_dbfs"])
+    if level_change < policy.linearity_step_db:
+        return None
+    recorded_change = float(loud["loud_rms_dbfs"]) - float(quiet["loud_rms_dbfs"])
+    slope = recorded_change / level_change
+    error = recorded_change - level_change
+    if slope < policy.linearity_compressed_slope and error <= -policy.linearity_minimum_error_db:
+        verdict = "compressed"
+    elif slope > policy.linearity_expanded_slope and error >= policy.linearity_minimum_error_db:
+        verdict = "expanded"
+    else:
+        verdict = "linear"
+    return {
+        "quiet_level_dbfs": round(float(quiet["level_dbfs"]), 2),
+        "loud_level_dbfs": round(float(loud["level_dbfs"]), 2),
+        "level_change_db": round(level_change, 2),
+        "recorded_change_db": round(recorded_change, 2),
+        "slope": round(slope, 3),
+        "verdict": verdict,
+    }
+
+
+def linearity_probe_level(
+    search: dict, policy: LevelSearchPolicy = LevelSearchPolicy()
+) -> float | None:
+    """The level of one more probe that would make the search's linearity known.
+
+    None when the search already has its answer or no clean probe to compare
+    with, or when the allowed levels leave no room below the loudest clean one.
+    Always quieter than something already played, never louder.
+    """
+    attempts = search.get("attempts") or []
+    if level_linearity(attempts, policy) is not None:
+        return None
+    clean = _linearity_candidates(attempts, policy)
+    if not clean:
+        return None
+    loudest = max(float(item["level_dbfs"]) for item in clean)
+    low = float((search.get("level_bounds_dbfs") or [loudest])[0])
+    level = max(low, loudest - policy.linearity_probe_step_db)
+    if loudest - level < policy.linearity_step_db:
+        return None
+    return round(level, 2)
+
+
+def linearity_advice(search: dict) -> tuple[list[str], list[str]]:
+    """Return (warnings, guidance) for dynamics processing found by the probes."""
+    linearity = search.get("linearity") or {}
+    verdict = linearity.get("verdict")
+    if verdict not in ("compressed", "expanded"):
+        return [], []
+    level = float(linearity.get("level_change_db", 0.0))
+    recorded = float(linearity.get("recorded_change_db", 0.0))
+    if verdict == "compressed":
+        warnings = [
+            f"The recorded level rose only {recorded:.1f} dB for a {level:.1f} dB louder probe, "
+            "so something in the path compresses the sound and the correction will come out "
+            "weaker than the speakers need."
+        ]
+    else:
+        warnings = [
+            f"The recorded level rose {recorded:.1f} dB for a {level:.1f} dB louder probe, "
+            "so something in the path gates or expands the sound and the measured response "
+            "is exaggerated."
+        ]
+    switches = [
+        item for item in search.get("microphone_processing") or []
+        if isinstance(item, dict) and item.get("on") is True
+    ]
+    if switches:
+        names = ", ".join(f"'{item.get('name')}'" for item in switches)
+        first = switches[0]
+        guidance = [
+            f"These processing switches are on for this microphone: {names}. Turn them off, "
+            f"for example with: amixer -c {first.get('card')} cset name='{first.get('name')}' off, "
+            "then measure again."
+        ]
+    else:
+        guidance = [
+            "Turn off microphone processing such as automatic gain, dynamic range compression "
+            "or noise suppression, or lower the speaker volume if its amplifier is limiting, "
+            "then measure again."
+        ]
+    return warnings, guidance
+
+
 # A search that ends in one of these states cannot produce a usable
 # measurement at any level, so the caller should stop and show the advice.
 LEVEL_SEARCH_ABORT_STATUSES = ("no-signal", "background-too-loud", "level-independent")
@@ -1444,6 +1631,13 @@ def level_after_clipping(
 
 
 def level_search_advice(search: dict) -> tuple[list[str], list[str]]:
+    """Return (warnings, guidance) for a level search: its status and its linearity."""
+    warnings, guidance = _level_status_advice(search)
+    more_warnings, more_guidance = linearity_advice(search)
+    return list(warnings) + more_warnings, list(guidance) + more_guidance
+
+
+def _level_status_advice(search: dict) -> tuple[list[str], list[str]]:
     """Return (warnings, guidance) for a level search that could not settle."""
     status = search.get("status", "")
     level = float(search.get("selected_level_dbfs", 0.0))

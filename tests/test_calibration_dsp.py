@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import copy
+import dataclasses
 import json
 import sys
 import tempfile
@@ -12,6 +13,8 @@ from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sandbox  # noqa: E402,F401  (keeps every test off this machine's calibrator)
 
 from calibration_dsp import (  # noqa: E402
     LEVEL_SEARCH_ABORT_STATUSES,
@@ -45,7 +48,7 @@ class CalibrationDspTests(unittest.TestCase):
         )
 
     def synthetic_capture(self, *, clip=False, drift_ratio=None, noise=2e-5,
-                          late_reflection=None):
+                          late_reflection=None, lead_seconds=0.25):
         program, schedule = build_measurement_signal(self.spec)
         mono = np.sum(program, axis=1)
         impulse = np.zeros(400)
@@ -55,7 +58,7 @@ class CalibrationDspTests(unittest.TestCase):
             delay_samples, amplitude = late_reflection
             impulse[32 + delay_samples] = amplitude
         response = signal.fftconvolve(mono, impulse)
-        lead = np.zeros(int(0.25 * self.spec.rate))
+        lead = np.zeros(int(lead_seconds * self.spec.rate))
         capture = np.concatenate((lead, response, np.zeros(self.spec.rate // 2)))
         if drift_ratio is not None:
             numerator = int(round(drift_ratio * 10_000))
@@ -137,6 +140,36 @@ class CalibrationDspTests(unittest.TestCase):
         self.assertIn("snr_low_db", noisy_result["quality"]["metrics"])
         self.assertNotIn("snr_high_db", noisy_result["quality"]["metrics"])
 
+    def test_capture_ignores_a_digital_microphone_startup_burst(self):
+        # The same burst the level probe skips, at the plugin's real 1 s lead
+        # and sweep spacing: full-scale garbage for 180 ms while the microphone
+        # node starts, long before the first sweep.  It must not read as a loud
+        # room, nor get into the noise floor the response is compared against;
+        # with this spacing that floor is read from 0.15 s on.
+        self.spec = dataclasses.replace(self.spec, pre_silence=0.5, block_gap=0.65)
+        clean, schedule = self.synthetic_capture(lead_seconds=1.0)
+        burst = clean.copy()
+        startup = int(0.18 * self.spec.rate)
+        burst[:startup] = np.random.default_rng(7).choice((-1.0, 1.0), startup)
+        clean_result = analyse_capture(
+            clean, schedule, self.spec, record_lead_seconds=1.0, internal_mic=True
+        )
+        burst_result = analyse_capture(
+            burst, schedule, self.spec, record_lead_seconds=1.0, internal_mic=True
+        )
+        clean_metrics = clean_result["quality"]["metrics"]
+        burst_metrics = burst_result["quality"]["metrics"]
+        self.assertLess(burst_metrics["background_dbfs"], -50.0)
+        self.assertAlmostEqual(
+            burst_metrics["background_dbfs"], clean_metrics["background_dbfs"], delta=1.0
+        )
+        self.assertAlmostEqual(burst_metrics["snr_mid_db"], clean_metrics["snr_mid_db"], delta=1.0)
+        self.assertFalse(
+            [w for w in burst_result["quality"]["warnings"] if "background level" in w],
+            burst_result["quality"]["warnings"],
+        )
+        self.assertTrue(burst_result["quality"]["accepted"], burst_result["quality"])
+
     def test_signal_alternates_left_and_right_three_times(self):
         program, schedule = build_measurement_signal(self.spec)
         self.assertEqual(len(schedule), 6)
@@ -164,6 +197,23 @@ class CalibrationDspTests(unittest.TestCase):
         self.assertEqual(len(result["channels"][0]["sweeps"]), 3)
         self.assertEqual(len(result["validation_curves"]), 6)
         self.assertLess(result["quality"]["metrics"]["worst_repeatability_db"], 0.5)
+
+    def test_microphone_dc_offset_is_not_background_and_does_not_spoil_alignment(self):
+        # Some digital microphones deliver a constant offset far above the room
+        # noise; at -9 dBFS it read as background and broke sweep alignment.
+        capture, schedule = self.synthetic_capture()
+        capture += 0.35
+        result = analyse_capture(
+            capture,
+            schedule,
+            self.spec,
+            record_lead_seconds=0.25,
+            internal_mic=True,
+        )
+        self.assertTrue(result["quality"]["accepted"], result["quality"])
+        self.assertLess(result["quality"]["metrics"]["background_dbfs"], -60.0)
+        self.assertGreater(result["quality"]["metrics"]["minimum_alignment_correlation"], 0.15)
+        self.assertEqual(result["quality"]["metrics"]["clipped_samples"], 0)
 
     def test_clock_drift_is_estimated_and_corrected(self):
         capture, schedule = self.synthetic_capture(drift_ratio=1.001)
@@ -410,9 +460,34 @@ class LevelSearchTests(unittest.TestCase):
         probe = analyse_level_probe(self.probe_capture(0.3, background=0.05), self.rate)
         self.assertAlmostEqual(probe["background_rms_dbfs"], -26.0, delta=1.0)
 
+    def test_probe_ignores_a_digital_microphone_startup_burst(self):
+        capture = self.probe_capture(0.3, background=0.001)
+        # Some digital microphone nodes emit invalid full-scale samples while
+        # they start.  They settle before the deliberately long probe lead.
+        startup = int(0.15 * self.rate)
+        capture[:startup, 0] = np.tile((-1.0, 1.0), startup // 2)
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertLess(probe["background_rms_dbfs"], -50.0)
+        self.assertAlmostEqual(probe["peak_dbfs"], 20 * np.log10(0.3), delta=0.2)
+
+    def test_probe_hears_a_quiet_tone_over_a_microphone_dc_offset(self):
+        # A -40 dBFS tone on a -9 dBFS offset: counted in the RMS, the offset
+        # made the probe look like no signal at all.
+        capture = self.probe_capture(0.01) + 0.35
+        probe = analyse_level_probe(capture, self.rate)
+        self.assertGreater(probe["prominence_db"], 30.0)
+        self.assertLess(probe["background_rms_dbfs"], -60.0)
+
     def test_silence_has_no_prominence(self):
         probe = analyse_level_probe(self.probe_capture(0.0), self.rate)
         self.assertLess(probe["prominence_db"], 3.0)
+
+    def test_digital_silence_is_reported_without_numeric_warnings(self):
+        with np.errstate(divide="raise", invalid="raise"):
+            probe = analyse_level_probe(np.zeros((self.rate, 3)), self.rate)
+        self.assertEqual(probe["prominence_db"], 0.0)
+        self.assertEqual(probe["clipped_samples"], 0)
+        self.assertEqual(probe["tonal_blocks"], 0)
 
     def test_plan_raises_a_quiet_probe_proportionally(self):
         probe = {"peak_dbfs": -32.0, "noise_dbfs": -80.0, "prominence_db": 40.0, "clipped_samples": 0}
