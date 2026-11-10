@@ -39,7 +39,7 @@ Item {
   // { microphone, description, channel }.  Gone as soon as something else runs.
   property var offer: null
   // Calibrations other people shared for this machine's model, as the last
-  // lookup found them: { consent, profiles, checked_at, uploads }.  Looking
+  // lookup found them: { consent, profiles, checked_at, uploads, uploads_listed }.  Looking
   // needs a yes given once; until then nothing is asked of anyone.
   property var registry: ({ consent: null, profiles: [] })
   // What the last press on Share answered: { state: "confirm" | "uploaded" | "browser", ... }.

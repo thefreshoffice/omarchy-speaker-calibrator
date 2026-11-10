@@ -64,12 +64,18 @@ Panel {
     if (entry.playing === true) bits.unshift("Playing now")
     return bits.join("  ·  ")
   }
+  // One's own uploads whose calibration is still in the list.  Once the list
+  // has let that calibration go, the registry's copy is the way back to it.
+  function ownListed() {
+    var listed = service.registry.uploads_listed
+    return Array.isArray(listed) ? listed : Object.keys(service.registry.uploads || {})
+  }
   // The registry's calibrations for this model that are worth offering: not
   // the ones already in the list, which play from there, and not one's own
-  // uploads, which are the calibration they were shared from.
+  // uploads while the calibration they were shared from is listed.
   function registryRows() {
     if (service.registry.consent !== "allowed") return []
-    var own = Object.keys(service.registry.uploads || {})
+    var own = root.ownListed()
     return (service.registry.profiles || []).filter(function (entry) {
       return root.libraryEntryFor(entry.id) === null && own.indexOf(entry.id) < 0
     })
@@ -81,7 +87,7 @@ Panel {
     if (profiles.length === 0)
       return "Nobody has shared a calibration for " + model + " yet. Calibrate, check it and share it, "
         + "and you will be the first."
-    var own = Object.keys(service.registry.uploads || {})
+    var own = root.ownListed()
     if (profiles.every(function (entry) { return own.indexOf(entry.id) >= 0 }))
       return "The only calibrations shared for " + model + " are your own."
     return "Everything shared for " + model + " is already in your list above."

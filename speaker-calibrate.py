@@ -3665,7 +3665,28 @@ def registry_state():
         if isinstance(identifier, str) and REGISTRY_ID.fullmatch(identifier) and isinstance(url, str) \
                 and ISSUE_URL.fullmatch(url):
             kept["uploads"][identifier] = url
+    # Which calibration in the list each upload was shared from, so the panel
+    # can offer the registry's copy back once that calibration is gone.
+    sources = state.get("upload_sources") if isinstance(state.get("upload_sources"), dict) else {}
+    kept["upload_sources"] = {identifier: source for identifier, source in sources.items()
+                              if identifier in kept["uploads"] and isinstance(source, str)
+                              and LIBRARY_ID.fullmatch(source)}
     return kept
+
+
+def uploads_listed(state):
+    """One's own uploads whose calibration is still in the list.
+
+    An upload recorded before its source was kept counts as listed, which is
+    how every upload was treated before.
+    """
+    try:
+        listed = {entry["id"] for entry in library_entries()}
+    except (OSError, SystemExit):
+        return list(state.get("uploads", {}))
+    sources = state.get("upload_sources", {})
+    return [identifier for identifier in state.get("uploads", {})
+            if identifier not in sources or sources[identifier] in listed]
 
 
 def write_registry_state(**changes):
@@ -3813,14 +3834,15 @@ def registry_lookup(refresh=False):
         write_atomic(REGISTRY_CACHE, json.dumps(cached) + "\n")
     return {"consent": "allowed", "model": model, "label": ours["label"],
             "profiles": valid_index_rows(cached.get("document"), ours),
-            "checked_at": cached.get("checked_at"), "uploads": state.get("uploads", {})}
+            "checked_at": cached.get("checked_at"), "uploads": state.get("uploads", {}),
+            "uploads_listed": uploads_listed(state)}
 
 
 def registry_cached():
     """What the last lookup found, without asking anyone: for the status the panel polls."""
     state = registry_state()
     found = {"consent": state.get("lookup"), "profiles": [], "share_explained": state.get("share_explained"),
-             "uploads": state.get("uploads", {})}
+             "uploads": state.get("uploads", {}), "uploads_listed": uploads_listed(state)}
     if state.get("lookup") != "allowed":
         return found
     try:
@@ -4049,7 +4071,11 @@ def share_upload():
                          + (short_label(without_credentials(stderr[-600:])[-300:], 300) or "no reason given"))
     uploads = dict(list(state.get("uploads", {}).items())[-19:])
     uploads[identifier] = found.group(0)
-    write_registry_state(uploads=uploads, share_explained=True)
+    sources = {key: value for key, value in state.get("upload_sources", {}).items() if key in uploads}
+    source = (load_profile(PROFILE) or {}).get("library_id")
+    if isinstance(source, str) and LIBRARY_ID.fullmatch(source):
+        sources[identifier] = source
+    write_registry_state(uploads=uploads, upload_sources=sources, share_explained=True)
     return {"url": found.group(0), "id": identifier,
             "message": "Shared. It is checked and published within a minute or two; the link shows how it went."}
 

@@ -109,7 +109,8 @@ class ConsentTests(ClientTestCase):
         speaker_calibrate.REGISTRY_STATE.chmod(0o600)
         self.assertEqual(speaker_calibrate.registry_state(), {
             "lookup": None, "share_explained": False,
-            "uploads": {"2026-09-20-builtin-aaaaaaaaaa": f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12"}})
+            "uploads": {"2026-09-20-builtin-aaaaaaaaaa": f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12"},
+            "upload_sources": {}})
 
 
 class IndexTests(ClientTestCase):
@@ -416,6 +417,26 @@ class ShareTests(ClientTestCase):
         self.assertEqual(result["url"], f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12")
         self.assertEqual(again["url"], result["url"])
         self.assertEqual(speaker_calibrate.registry_state()["uploads"], {result["id"]: result["url"]})
+
+    def test_an_upload_is_offered_back_once_its_calibration_has_left_the_list(self):
+        profile = shared()["profile"]
+        profile["created_at"] = "2026-09-20T11:27:27.253765+00:00"
+        speaker_calibrate.library_add(profile)
+        speaker_calibrate.PROFILE.write_text(json.dumps(profile))
+        speaker_calibrate.PROFILE.chmod(0o600)
+        created = (0, f"https://github.com/{share.REGISTRY_REPOSITORY}/issues/12\n", "")
+        with mock.patch.object(speaker_calibrate, "gh_signed_in", return_value=True), \
+             mock.patch.object(speaker_calibrate, "run_bounded", return_value=created):
+            result = speaker_calibrate.share_upload()
+        state = speaker_calibrate.registry_state()
+        self.assertEqual(state["upload_sources"], {result["id"]: profile["library_id"]})
+        self.assertEqual(speaker_calibrate.uploads_listed(state), [result["id"]])     # still listed: not offered
+        self.assertEqual(speaker_calibrate.registry_cached()["uploads_listed"], [result["id"]])
+        speaker_calibrate._write_index([])                                          # the list let it go
+        self.assertEqual(speaker_calibrate.uploads_listed(state), [])               # so the registry's copy is offered
+        # An upload recorded before its source was kept stays hidden, as every upload was before.
+        speaker_calibrate.write_registry_state(upload_sources={})
+        self.assertEqual(speaker_calibrate.uploads_listed(speaker_calibrate.registry_state()), [result["id"]])
 
     def test_an_answer_that_is_not_the_registry_s_issue_is_not_recorded(self):
         self.install()

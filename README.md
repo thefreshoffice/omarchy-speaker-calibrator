@@ -390,7 +390,9 @@ group, above the Calibrate button, lists the calibrations others shared for
 your model in the [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles),
 best first, each with how it was measured and its score. Looking for them asks
 that public registry, so the panel asks first; after a no, one row still offers
-to look, and with nothing shared yet it says so.
+to look, and with nothing shared yet it says so. What you shared yourself is
+left out while the calibration it came from is still in your list; once the list
+has let that one go, the registry's copy is offered back.
 
 One press plays one; what you had stays in the list above, one click away.
 Nothing about a shared profile can choose your speaker output or step outside
@@ -549,7 +551,7 @@ created outside it and stay behind:
 | `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Switch off completely removes it |
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
-| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared) and `registry-cache.json` (the last list for your model) |
+| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared and which calibration each came from) and `registry-cache.json` (the last list for your model) |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-processing-restore.json` | exists only during a measurement: which microphone switches to put back |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-volume-restore.json` | exists only during a measurement that lowered the microphone's input level: what to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |
