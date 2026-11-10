@@ -104,10 +104,11 @@ Item {
   function simpleLabel(profile) {
     if (!profile) return ""
     var parts = []
-    parts.push(profile.bass === "full" ? "Loudness on" : "Loudness off")
+    parts.push(profile.bass === "full" ? "Fuller bass on" : "Fuller bass off")
     var loudness = profile.loudness || "protected"
     parts.push(loudness === "matched" ? "Louder on"
       : loudness === "balanced" ? "Louder halfway" : "Louder off")
+    if (profile.loudness_compensation === "on") parts.push("Loudness on")
     if (profile.voicing === "warm") parts.push("warm voicing")
     return parts.join(" · ")
   }
