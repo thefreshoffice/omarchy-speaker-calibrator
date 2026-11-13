@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "thefreshoffice.speaker-calibrator",
   "name": "Speaker Calibrator",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "Michael de By",
   "license": "MIT",
   "description": "Measure with one or many microphones and generate adaptive, repeat-validated, protected parametric speaker tuning.",
@@ -10,7 +10,7 @@
   "entryPoints": {"barWidget": "BarWidget.qml"},
   "barWidget": {
     "displayName": "Speaker Calibrator",
-    "description": "Calibrate the speakers in one step, with Loudness and Make-it-louder toggles; advanced details on request.",
+    "description": "Calibrate the speakers in one step, switch between your calibrations with a click, and play ones shared for your laptop model.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
