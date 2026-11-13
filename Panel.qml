@@ -1420,6 +1420,45 @@ Panel {
         clip: true
         boundsBehavior: Flickable.StopAtBounds
 
+        // Scrolling, by hand.  Flickable's own wheel scrolling turns every
+        // event into a short, slowing flick, which crawls through a page this
+        // long.  A mouse wheel moves a fixed stretch per notch.  A touchpad
+        // moves as far as the fingers go, undoing the 0.4 scroll factor
+        // Omarchy gives touchpads in Hyprland, and glides on when they lift,
+        // which Qt on Wayland leaves to the application.
+        WheelHandler {
+          id: wheel
+          readonly property real touchpadGain: 2.5
+          property var recent: []
+          target: null
+          acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+          onWheel: function (event) {
+            var now = Date.now()
+            var touchpad = event.pixelDelta.y !== 0
+            var ended = event.phase === Qt.ScrollEnd
+              || (event.pixelDelta.y === 0 && event.angleDelta.y === 0)
+            if (ended) {
+              // How fast the fingers moved over their last tenth of a second.
+              var moved = 0
+              for (var i = 0; i < wheel.recent.length; i++)
+                if (now - wheel.recent[i].at <= 100) moved += wheel.recent[i].by
+              wheel.recent = []
+              if (Math.abs(moved) > 2) scroller.flick(0, moved * 10)
+              event.accepted = true
+              return
+            }
+            scroller.cancelFlick()
+            var delta = touchpad ? event.pixelDelta.y * wheel.touchpadGain
+              : event.angleDelta.y / 120 * Style.space(120)
+            if (touchpad)
+              wheel.recent = wheel.recent.filter(function (step) { return now - step.at <= 100 })
+                .concat([{ at: now, by: delta }])
+            var bottom = Math.max(0, scroller.contentHeight - scroller.height)
+            scroller.contentY = Math.max(0, Math.min(bottom, scroller.contentY - delta))
+            event.accepted = true
+          }
+        }
+
         Column {
           id: content
           // Held a hair inside the scrolling viewport.  A row whose border
