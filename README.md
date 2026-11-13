@@ -98,18 +98,31 @@ asks for the same treatment of this sink). Selecting the raw device plays
 around the calibration, and so does an application that switches the default
 output on its own.
 
-### The four switches
+### The five switches
 
 | Switch | What it does |
 | --- | --- |
-| **Loudness** | Fuller sound with more bass, like the loudness button on a stereo. |
-| **Make it louder** | Gives back the volume the correction takes away. The limiter works harder at full volume. |
-| **Deep bass** | Suggests low notes the speakers cannot physically play, using their harmonics. |
 | **Calibration** | Switch it off to hear the plain speakers, level-matched so only the tone changes. |
+| **Fuller bass** | Lifts the bass by 3 dB at every volume. |
+| **Deep bass** | Suggests low notes the speakers cannot physically play, using their harmonics. |
+| **Loudness** | Follows the volume: the quieter you play, the more bass comes back, the way hearing needs it. |
+| **Make it louder** | Gives back the volume the correction takes away. The limiter works harder at full volume. |
 
-Everything else lives under **Advanced**: voicing, the three loudness levels,
-channel balance, loudness compensation, the measurement details, and a
-comparison of what each microphone measured.
+Under the list of calibrations sits **Calibrate again**, with one line naming
+the speakers and microphone it will use; **change** opens the pickers, and they
+open by themselves before the first calibration. When a device you picked is
+not connected, a note under that line says so; the line names what stands in.
+Below that, three folds hold the rest, closed each time the panel opens:
+
+- **Tune the fit**: voicing, the three loudness levels, channel balance,
+  checking the calibration and improving from the check, and switching it off
+  completely.
+- **Save and share**: sharing with everyone, saving a file for someone with the
+  same machine, saving an Omarchy tuning, and whether to look online for
+  calibrations others shared.
+- **Measurement details**: the last measurement, its graph, the fitted sections,
+  a comparison of what each microphone measured, the last check, and how it all
+  works.
 
 ## Deep bass, built in
 
@@ -197,16 +210,21 @@ otherwise read as error.
 the same gates. It is level-neutral, so iterating never drifts the overall
 loudness.
 
-## Advanced
+## Tune the fit
 
 **Flat or Warm.** Flat is balanced with more clarity. Warm is softer and less
 sharp for long listening. Both are voicings of the same measurement.
 
-**Loudness: Protected, Balanced, Matched.** How much of the loudness the cuts
+**Louder: Clean, Balanced, Loud.** How much of the loudness the cuts
 removed is added back as input gain: none, half, or all of it up to 6 dB.
-Matched is the loudest and makes the limiter work hardest.
+Loud is the loudest and makes the limiter work hardest. **Make it louder** on
+the main view switches between Clean and Loud; the level applies at once.
 
-**Bass: Normal or Full.** Full adds a +3 dB low shelf placed clear of the
+Voicing and channel balance change the fit itself, so after changing either a
+**Refit with these settings** row appears: it fits your last measurement again
+and plays the result, and what played before stays in the list.
+
+**Fuller bass**, on the main view, adds a +3 dB low shelf placed clear of the
 high-pass corner, paid for by input trim like any boost.
 
 **Channel balance** trims a broadband level difference between the two
@@ -217,13 +235,13 @@ only by turning the louder side down. A built-in array sits closer to one
 speaker than the other, so what it measures is where it is rather than what
 reaches you.
 
-**Loudness compensation** follows the volume and puts back what hearing drops
+**Loudness**, on the main view, follows the volume and puts back what hearing drops
 as the level falls, using the ISO 226:2023 equal-loudness curves. Full volume
 is the reference: it does nothing there and more the further down you play.
 The loudness stays the same either way; only the tone moves. It is the one
 part of this that needs something running in the background, because only the
-output device knows the listening level. It is on by default for a new calibration; the switch under
-Advanced turns it off, and the setting is kept across refits.
+output device knows the listening level. It is on by default for a new calibration; its switch turns it off, and the
+setting is kept across refits.
 
 ### Which microphones can measure
 
@@ -302,7 +320,7 @@ back afterwards.
 
 ### Comparing the two microphones
 
-Advanced keeps the last measurement from each kind of microphone and draws
+Measurement details keeps the last measurement from each kind of microphone and draws
 them on one set of axes, levelled on the 250 Hz to 1 kHz band so you see the
 difference in shape rather than in sensitivity, with the difference read out
 by band underneath.
@@ -382,15 +400,15 @@ it works for adds a little. The
 [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles) has a
 page per machine with every profile's graph.
 
-To share yours, press **Share this calibration with everyone**, just above the
-Advanced switch. Checking the
+To share yours, open **Save and share** and press **Share with everyone**.
+Checking the
 calibration first raises its score. A new upload for the same machine and kind
 of microphone takes the place of your earlier one.
 
 ## Sharing a calibration
 
 A calibration is specific to one model's speakers, so it can be handed to
-someone with the same machine. Under Advanced, **Export this calibration**
+someone with the same machine. Under Save and share, **Save a file to Downloads**
 writes the calibration that is playing to your Downloads folder as one file,
 named after the machine, the microphone and the date, for example
 `slimbook-executive-external-mic-2026-09-16.speaker-calibration.json`. The
@@ -401,8 +419,9 @@ microphone device name, since a USB device's name carries its serial number.
 What kind of microphone it was travels, and whether it had a correction file,
 never where that file lives.
 
-A shared file dropped into your Downloads folder appears in the same section.
-**Load** plays it and adds it to your calibrations; your own stays in the
+A shared file dropped into your Downloads folder appears in the list of
+calibrations as **From Downloads**, until it has been loaded or when it is your
+own export of a calibration already in the list. A click plays it and adds it to your calibrations; your own stays in the
 list, one click away. Your last measurement is left alone, so a refit still
 works on your own recording. When the file was made on different hardware the
 panel says so, because speakers differ between models and a calibration for
@@ -410,7 +429,7 @@ another laptop may sound wrong.
 When the exporting machine's speaker device does not exist here, the
 calibration is pointed at this machine's speakers instead.
 
-**Export as an Omarchy tuning** renders the same calibration in the layout
+**Save as an Omarchy tuning** renders the same calibration in the layout
 Omarchy ships its own laptop tunings in, `tuning.conf` and `filter-chain.conf`
 under `default/audio/tunings/<vendor>-<model>/`, into your Downloads folder.
 The chain holds only what Omarchy ships: the high-pass, the fitted sections,
@@ -466,9 +485,9 @@ and neither happens by itself:
   `raw.githubusercontent.com`, about once a day, and a profile's own file when
   you load it. The request carries no cookie, no credential and no identifier;
   GitHub sees your address and which model's list was asked for, as any web
-  server would. After a no, or **Stop looking online**, nothing is requested.
-- **Sharing your calibration.** Only when you press **Share this calibration
-  with everyone**, which the first time shows what it sends: the filters, the
+  server would. After a no, or with **Look online for shared calibrations** switched off, nothing is requested.
+- **Sharing your calibration.** Only when you press **Share with
+  everyone**, which the first time shows what it sends: the filters, the
   measured and corrected curves, how the measurement went, your machine's model
   as its firmware names it (vendor, product, SKU, board), and the name PipeWire
   gives the laptop's own speakers, which is their place on the board (for
@@ -504,7 +523,7 @@ uploaded.
 omarchy plugin remove thefreshoffice.speaker-calibrator
 ```
 
-Press **Disable** in the panel first. That restores the default output, stops
+Press **Switch off completely** in the panel first, under Tune the fit. That restores the default output, stops
 the services, ends an exported tuning that is on trial and removes its files,
 and takes the filter out of the audio path. If the plugin is
 removed while a calibration is still active, the PipeWire filter keeps running
@@ -520,7 +539,7 @@ created outside it and stay behind:
 | `~/.config/systemd/user/omarchy-speaker-loudness.service` | follows the volume for loudness compensation |
 | `~/.config/pipewire/omarchy-speaker-tuning.conf` | the filter sink |
 | `~/.config/pipewire/omarchy-speaker-tuning.conf.d/90-tuning.conf` | the measured filters |
-| `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Disable removes it |
+| `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Switch off completely removes it |
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
 | `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared) and `registry-cache.json` (the last list for your model) |

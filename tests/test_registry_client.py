@@ -494,9 +494,9 @@ class ShareTests(ClientTestCase):
         self.assertNotIn("share-status-json", service)
         self.assertNotIn("shareStatusCheck", panel + service)
         self.assertEqual(panel.count("service.share("), 1)                       # only the button's own click
-        button = panel.index("Share this calibration with everyone")
-        self.assertLess(button, panel.index('label: "Advanced"'))                # in the main panel, above the switch
-        self.assertGreater(button, panel.index('"Calibrate again"'))
+        button = panel.index('"Share with everyone"')
+        self.assertGreater(button, panel.index('label: "Save and share"'))       # in its fold, with the other ways out
+        self.assertLess(button, panel.index('label: "Measurement details"'))
 
     def test_the_status_says_what_would_be_sent_without_sending_it(self):
         self.install()

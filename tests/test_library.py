@@ -112,6 +112,19 @@ class AddingAndPlayingTests(LibraryTestCase):
         stored = json.loads((helper.LIBRARY / f"{first}.json").read_text())
         self.assertEqual(stored["bass"], "full")
 
+    def test_a_level_switch_that_restarts_the_tuning_brings_the_tracker_back(self):
+        # "Switch off completely" unregisters the tracker; a switch that starts
+        # the tuning again has to start it too, and a live one leaves it be.
+        self.install(profile("2026-11-01T10:00:00+00:00", loudness_compensation="on"))
+        started = []
+        self.patch("start_loudness_tracker", lambda: started.append(True))
+        self.patch("apply_level_variant", lambda item, bass, loudness: item.update(bass=bass, loudness=loudness))
+        for method, expected in (("live", []), ("restart", [True])):
+            started.clear()
+            self.patch("activate_profile", lambda item, method=method: method)
+            helper.relevel("full", "protected")
+            self.assertEqual(started, expected, method)
+
     def test_the_machine_s_switches_stay_as_they_are(self):
         first = self.install(profile("2026-11-01T10:00:00+00:00", deep_bass="off"))
         self.install(profile("2026-11-02T10:00:00+00:00", deep_bass="on", loudness_compensation="on"))
@@ -221,6 +234,94 @@ class TextStatusTests(unittest.TestCase):
         text = printed.getvalue()
         self.assertIn("* 0123456789ab  2026-11-08 08:03 · internal mic", text)
         self.assertIn("  ba9876543210  Shared one  · pinned", text)
+
+
+class SharedFileTests(LibraryTestCase):
+    """Files in Downloads: what goes out, what comes in, and which the list already holds."""
+
+    OURS = {"sys_vendor": "SLIMBOOK", "product_name": "Executive", "product_version": "",
+            "product_sku": "EXE14", "board_name": "EXE14", "label": "SLIMBOOK Executive"}
+
+    def setUp(self):
+        super().setUp()
+        self.downloads = self.data.parent / "Downloads"
+        self.downloads.mkdir()
+        self.patch("share_directory", lambda: self.downloads)
+        self.patch("hardware_id", lambda: dict(self.OURS))
+        self.patch("physical_sinks", lambda: [{"name": SPEAKER, "description": "Built-in Audio"}])
+        self.patch("plugin_version", lambda: "1.2.0")
+        self.patch("install_now", lambda item: {**item, "library_id": self.install(item), "activation": "live"})
+
+    def exported(self):
+        """The one file an export left in Downloads, as JSON."""
+        (path,) = self.downloads.glob("*" + helper.SHARE_SUFFIX)
+        return path, json.loads(path.read_text())
+
+    def test_an_export_carries_no_place_in_the_list(self):
+        self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        _, payload = self.exported()
+        for key in helper.LIBRARY_KEYS:
+            self.assertNotIn(key, payload["profile"])
+
+    def test_your_own_export_is_known_to_the_list(self):
+        self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        (row,) = helper.shared_profiles()
+        self.assertTrue(row["valid"])
+        self.assertTrue(row["in_library"])
+
+    def test_somebody_else_s_file_is_not(self):
+        self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        path, payload = self.exported()
+        payload["profile"]["fit"]["filters"][0]["gain_db"] = -2.0   # measured on another machine
+        path.write_text(json.dumps(payload))
+        (row,) = helper.shared_profiles()
+        self.assertFalse(row["in_library"])
+
+    def test_the_same_filters_with_another_high_pass_or_balance_is_another_calibration(self):
+        self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        path, original = self.exported()
+        for field, value in (("highpass_hz", 140.0), ("channel_trim", {"left_db": -1.5, "right_db": 0.0})):
+            payload = json.loads(json.dumps(original))
+            payload["profile"]["fit"][field] = value
+            payload["exported_at"] = "2026-11-02T10:00:00+00:00"        # not this export, so only the sound decides
+            path.write_text(json.dumps(payload))
+            (row,) = helper.shared_profiles()
+            self.assertFalse(row["in_library"], field)
+
+    def test_a_loaded_file_is_known_and_leaves_the_measured_one_alone(self):
+        measured = self.install(profile("2026-11-01T10:00:00+00:00"))
+        before = (helper.LIBRARY / f"{measured}.json").read_text()
+        helper.export_profile()
+        path, _ = self.exported()
+        helper.import_profile(path.name)
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["source"] for row in rows], ["imported", "measured"])
+        self.assertEqual((helper.LIBRARY / f"{measured}.json").read_text(), before)
+        (row,) = helper.shared_profiles()
+        self.assertTrue(row["in_library"])
+
+    def test_an_id_carried_in_an_older_file_is_not_trusted(self):
+        measured = self.install(profile("2026-11-01T10:00:00+00:00"))
+        helper.export_profile()
+        path, payload = self.exported()
+        payload["profile"]["library_id"] = measured                 # exported before this was fixed
+        payload["profile"]["library_played_at"] = "2026-11-01T10:00:00+00:00"
+        path.write_text(json.dumps(payload))
+        helper.import_profile(path.name)
+        ids = [row["id"] for row in self.rows()]
+        self.assertEqual(len(ids), 2)
+        self.assertIn(measured, ids)
+        self.assertEqual(json.loads((helper.LIBRARY / f"{measured}.json").read_text())["created_at"],
+                         "2026-11-01T10:00:00+00:00")
+
+    def test_downloads_without_shared_files_reads_nothing_from_the_list(self):
+        self.patch("_library_known", lambda: self.fail("the list was read for an empty Downloads"))
+        self.assertEqual(helper.shared_profiles(), [])
 
 
 class IdentityTests(LibraryTestCase):
