@@ -38,6 +38,8 @@ Panel {
   property bool setupOpen: false
   // Which devices picked by hand are not connected, so a fallback stands in.
   property var missingDevices: []
+  // Which share row was pressed, so its confirmation shows under that one.
+  property bool shareFromStep: false
   // A score in a word: 67 reads like a poor grade and is a good profile.  The
   // same floors as the helper's score_band.
   function scoreBand(score) {
@@ -61,6 +63,34 @@ Panel {
     if (entry.pinned === true) bits.push("pinned")
     if (entry.playing === true) bits.unshift("Playing now")
     return bits.join("  ·  ")
+  }
+  // One's own uploads whose calibration is still in the list.  Once the list
+  // has let that calibration go, the registry's copy is the way back to it.
+  function ownListed() {
+    var listed = service.registry.uploads_listed
+    return Array.isArray(listed) ? listed : Object.keys(service.registry.uploads || {})
+  }
+  // The registry's calibrations for this model that are worth offering: not
+  // the ones already in the list, which play from there, and not one's own
+  // uploads while the calibration they were shared from is listed.
+  function registryRows() {
+    if (service.registry.consent !== "allowed") return []
+    var own = root.ownListed()
+    return (service.registry.profiles || []).filter(function (entry) {
+      return root.libraryEntryFor(entry.id) === null && own.indexOf(entry.id) < 0
+    })
+  }
+  function registryEmptyText() {
+    var model = String((service.status.hardware || {}).label || "this model")
+    var profiles = service.registry.profiles || []
+    if (service.registry.unreachable) return "The registry could not be reached just now."
+    if (profiles.length === 0)
+      return "Nobody has shared a calibration for " + model + " yet. Calibrate, check it and share it, "
+        + "and you will be the first."
+    var own = root.ownListed()
+    if (profiles.every(function (entry) { return own.indexOf(entry.id) >= 0 }))
+      return "The only calibrations shared for " + model + " are your own."
+    return "Everything shared for " + model + " is already in your list above."
   }
   // A registry row that is already in the list plays from the list.
   function libraryEntryFor(registryId) {
@@ -112,6 +142,9 @@ Panel {
     service.refresh()
     // A question Share asked the last time the panel was open is not still being asked.
     if (service.shareStatus !== null && service.shareStatus.state === "confirm") service.shareStatus = null
+    // Nor does what it answered stay on the main view: from now on the
+    // shared page is reached from Save and share.
+    root.shareFromStep = false
   }
   function close() { root.controller.hide() }
   function toggle() { root.opened ? close() : open() }
@@ -370,6 +403,37 @@ Panel {
       : root.loudnessMode === "balanced"
         ? "Half of the loudness the correction takes away comes back."
         : "Cleanest, a little quieter than without the calibration."
+  }
+  // What to do next with the calibration that plays, at most one thing: prove
+  // a calibration made with an external microphone, then share a proven one.
+  function nextStep() {
+    var playing = service.status.profile
+    if (!playing || playing.imported || !service.status.enabled || service.status.bypass) return ""
+    var check = service.status.verification
+    var current = !!(check && check.stale === false)
+    if (current && check.verdict === "fail") return ""          // Improve from the check is the way on
+    if (!(current && (check.verdict === "pass" || check.verdict === "warning")))
+      return playing.microphone && playing.microphone.internal !== true ? "check" : ""
+    return String((service.registry || {}).shared_url || "") === "" ? "share" : ""
+  }
+  function shareConfirmText() {
+    return "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
+      + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
+      + "It does not contain your user name, any path, any device name or serial, or any recording. "
+      + (service.shareStatus !== null && service.shareStatus.one_press === true
+         ? "Press again to upload it."
+         : "The GitHub tool is not signed in here, so pressing again copies the profile and opens a "
+           + "form in your browser to paste it into.")
+  }
+  function shareStepDescription() {
+    var registry = service.registry || ({})
+    var check = service.status.verification || ({})
+    var model = String((service.status.hardware || {}).label || "this machine")
+    return (check.verdict === "warning" ? "It passed its check with a warning" : "It passed its check")
+      + (registry.share_score !== null && registry.share_score !== undefined
+         ? " and rates " + root.scoreBand(registry.share_score) + ", " + Number(registry.share_score) + " of 100" : "")
+      + ": everyone with " + model + " can then play it from their panel"
+      + (registry.share_replaces === true ? "  ·  replaces your earlier upload" : "")
   }
   // A refit is due when the fit's own options differ from what plays.
   function refitPending() {
@@ -919,12 +983,17 @@ Panel {
     property string icon: ""
     property string label: ""
     property string description: ""
+    // The one thing worth doing next, drawn the way a selected button is.
+    property bool highlighted: false
     signal clicked()
     readonly property bool _hot: actionMouse.containsMouse
+    readonly property color _labelColor: highlighted ? Style.selectedStateColor(root.foreground, root.accent) : root.foreground
     radius: Style.cornerRadius
     implicitHeight: Math.max(Style.space(44), actionContent.implicitHeight + Style.space(16))
-    color: Style.controlFill(false, _hot && enabled, root.foreground, root.accent)
-    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : "normal", root.foreground, root.accent)
+    color: highlighted && !(_hot && enabled) ? Style.selectedFillFor(root.foreground, root.accent)
+      : Style.controlFill(false, _hot && enabled, root.foreground, root.accent)
+    borderSpec: Border.controlSpec(_hot && enabled ? "hover-cursor" : highlighted ? "selected" : "normal",
+                                   root.foreground, root.accent)
     // Disabled rows dim, except during a quick switch: a quarter of a second
     // of dimming reads as a flicker, and the click is simply ignored then.
     opacity: enabled || (service.busy && !service.working) ? 1.0 : 0.55
@@ -942,7 +1011,7 @@ Panel {
       Text {
         textFormat: Text.PlainText
         text: actionRow.icon
-        color: root.foreground
+        color: actionRow._labelColor
         font.family: root.fontFamily
         font.pixelSize: Style.font.title
         width: Style.space(22)
@@ -956,7 +1025,7 @@ Panel {
         Text {
           textFormat: Text.PlainText
           text: actionRow.label
-          color: root.foreground
+          color: actionRow._labelColor
           font.family: root.fontFamily
           font.pixelSize: Style.font.subtitle
           font.bold: true
@@ -1569,6 +1638,73 @@ Panel {
               }
             }
 
+            // The next step, in plain sight: a check is what proves a
+            // calibration, and a proven one is worth most to everyone else
+            // with this machine.  Both stay in their folds as well.
+            ActionRow {
+              visible: root.nextStep() === "check"
+              highlighted: true
+              width: parent.width
+              icon: "󰄾"
+              label: service.busy && service.phase === "verify" ? "Checking…" : "Check this calibration"
+              description: root.calibrationMicrophoneConnected()
+                ? "30 seconds with the same microphone: it proves the calibration works, and adds up "
+                  + "to 28 points to its score when you share it"
+                : root.checkDescription()
+              enabled: !service.busy && root.calibrationMicrophoneConnected()
+              onClicked: service.verify()
+            }
+            ActionRow {
+              id: shareStep
+              readonly property bool asking: service.shareStatus !== null && service.shareStatus.state === "confirm"
+              visible: root.nextStep() === "share"
+              highlighted: true
+              width: parent.width
+              icon: "󰖟"
+              label: service.busy && service.phase === "share" ? "Sharing…"
+                : asking && root.shareFromStep
+                  ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
+                  : "Share with everyone"
+              description: root.shareStepDescription()
+              enabled: !service.busy
+              onClicked: {
+                var confirmed = asking && root.shareFromStep
+                root.shareFromStep = true
+                service.share(confirmed)
+              }
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: root.shareFromStep && shareStep.visible && shareStep.asking
+              width: parent.width
+              text: root.shareConfirmText()
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: root.shareFromStep && service.shareNote !== ""
+              width: parent.width
+              text: service.shareNote
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            // The page the note speaks of, here rather than in a closed fold.
+            ActionRow {
+              readonly property string sharedUrl: String((service.registry || {}).shared_url || "")
+              visible: root.shareFromStep && sharedUrl !== ""
+              width: parent.width
+              icon: "󰖟"
+              label: "Shared with everyone  ·  open its page"
+              description: "Others with " + String((service.status.hardware || {}).label || "this machine")
+                + " find it in their panel"
+              onClicked: service.openRegistryPage(sharedUrl)
+            }
+
             Column {
               visible: service.status.profile !== null && service.status.profile !== undefined
                 && service.status.profile.fit !== null && service.status.profile.fit !== undefined
@@ -1615,8 +1751,7 @@ Panel {
             readonly property int shown: expanded ? rows.length : Math.min(rows.length, 5)
             width: parent.width
             spacing: Style.space(6)
-            visible: rows.length > 0 || root.downloadRows().length > 0 || service.registry.consent === null
-              || (service.registry.consent === "allowed" && (service.registry.profiles || []).length > 0)
+            visible: rows.length > 0 || root.downloadRows().length > 0
 
             PanelSectionHeader {
               visible: libraryColumn.rows.length > 0 || root.downloadRows().length > 0
@@ -1678,15 +1813,24 @@ Panel {
               }
             }
 
-            // Calibrations other people shared for this model.  Asked about once;
-            // after a yes the list is simply there, and after a no nothing is.
+            PanelSeparator { foreground: root.foreground }
+          }
+
+          // Calibrations other people made and shared for this model, from the
+          // registry.  Always here, so a machine that is known never needs a
+          // measurement of its own.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+
             PanelSectionHeader {
-              visible: service.registry.consent === null
-                || (service.registry.consent === "allowed" && (service.registry.profiles || []).length > 0)
-              text: "SHARED FOR THIS MACHINE"
+              text: "READY-MADE FOR THIS MACHINE"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
+            // Calibrations other people shared for this model.  Asked about once;
+            // after a yes the list is simply there, and after a no one row
+            // still offers to look.
             Text {
               textFormat: Text.PlainText
               visible: service.registry.consent === null
@@ -1725,10 +1869,7 @@ Panel {
               }
             }
             Repeater {
-              // The ones already in the list are played from there, above.
-              model: service.registry.consent === "allowed"
-                ? (service.registry.profiles || []).filter(function (entry) { return root.libraryEntryFor(entry.id) === null })
-                : []
+              model: root.registryRows()
               ActionRow {
                 width: parent.width
                 icon: "󰓦"
@@ -1737,6 +1878,26 @@ Panel {
                 enabled: !service.busy
                 onClicked: service.registryLoad(modelData.id)
               }
+            }
+            ActionRow {
+              visible: service.registry.consent === "declined"
+              width: parent.width
+              icon: "󰖟"
+              label: "Look online for calibrations others shared"
+              description: "For " + String((service.status.hardware || {}).label || "this model")
+                + ": asks a public registry on GitHub, then about once a day"
+              enabled: !service.busy
+              onClicked: service.registryAnswer("allowed")
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: service.registry.consent === "allowed" && root.registryRows().length === 0
+              width: parent.width
+              text: root.registryEmptyText()
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
             PanelSeparator { foreground: root.foreground }
           }
@@ -2212,7 +2373,8 @@ Panel {
                 readonly property bool asking: service.shareStatus !== null && service.shareStatus.state === "confirm"
                 label: service.busy && service.phase === "share" ? "Sharing…"
                   : sharedUrl !== "" ? "Shared with everyone  ·  open its page"
-                  : asking ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
+                  : asking && !root.shareFromStep
+                    ? (service.shareStatus.one_press === true ? "Yes, share it" : "Yes, copy it and open the form")
                   : "Share with everyone"
                 readonly property var reg: service.registry || ({})
                 description: sharedUrl !== ""
@@ -2224,21 +2386,17 @@ Panel {
                     + (reg.share_replaces === true ? "  ·  replaces your earlier upload" : "")
                 enabled: !service.busy
                 onClicked: {
-                  if (sharedUrl !== "") service.openRegistryPage(sharedUrl)
-                  else service.share(asking)
+                  if (sharedUrl !== "") { service.openRegistryPage(sharedUrl); return }
+                  var confirmed = asking && !root.shareFromStep
+                  root.shareFromStep = false
+                  service.share(confirmed)
                 }
               }
               Text {
                 textFormat: Text.PlainText
-                visible: service.shareStatus !== null && service.shareStatus.state === "confirm"
+                visible: !root.shareFromStep && service.shareStatus !== null && service.shareStatus.state === "confirm"
                 width: parent.width
-                text: "Sharing publishes, under your GitHub account and free for anyone to use: the filters, the "
-                  + "measured curves, how the measurement went, and this machine's model as its firmware names it. "
-                  + "It does not contain your user name, any path, any device name or serial, or any recording. "
-                  + (service.shareStatus !== null && service.shareStatus.one_press === true
-                     ? "Press again to upload it."
-                     : "The GitHub tool is not signed in here, so pressing again copies the profile and opens a "
-                       + "form in your browser to paste it into.")
+                text: root.shareConfirmText()
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -2246,7 +2404,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                visible: service.shareNote !== ""
+                visible: !root.shareFromStep && service.shareNote !== ""
                 width: parent.width
                 text: service.shareNote
                 color: root.foreground

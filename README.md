@@ -381,15 +381,22 @@ sound worse than it started.
 - Existing tuning files are backed up before replacement, and failed or
   clipped measurements are saved for diagnosis but cannot be installed.
 
-## Calibrations shared for your machine
+## Ready-made for your machine
 
 A calibration belongs to one model's speakers, so one measured on the same
-model is worth having. When other people have shared one for your model, the
-panel lists them above the Calibrate button, best first, each with how it was
-measured and its score. One press loads one and plays it; what you had stays
-in the list above, one click away. Nothing about a shared profile can
-choose your speaker output or step outside the limits the optimizer works
-under.
+model is worth having, and on a machine somebody has already calibrated you
+need no measurement of your own. The panel's **Ready-made for this machine**
+group, above the Calibrate button, lists the calibrations others shared for
+your model in the [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles),
+best first, each with how it was measured and its score. Looking for them asks
+that public registry, so the panel asks first; after a no, one row still offers
+to look, and with nothing shared yet it says so. What you shared yourself is
+left out while the calibration it came from is still in your list; once the list
+has let that one go, the registry's copy is offered back.
+
+One press plays one; what you had stays in the list above, one click away.
+Nothing about a shared profile can choose your speaker output or step outside
+the limits the optimizer works under.
 
 The score runs from 0 to 100 and comes from the file: a calibrated measuring
 microphone counts for more than an external one, which counts for more than the
@@ -400,9 +407,11 @@ it works for adds a little. The
 [registry](https://github.com/thefreshoffice/omarchy-speaker-profiles) has a
 page per machine with every profile's graph.
 
-To share yours, open **Save and share** and press **Share with everyone**.
-Checking the
-calibration first raises its score. A new upload for the same machine and kind
+After a calibration with an external microphone the panel puts **Check this
+calibration** right under the switches, until it has been checked: a check is
+worth up to 28 of the 100 points. Once it has passed, the same place offers
+**Share with everyone**, until it is shared. Both are also in their folds,
+under Tune the fit and Save and share. A new upload for the same machine and kind
 of microphone takes the place of your earlier one.
 
 ## Sharing a calibration
@@ -542,7 +551,7 @@ created outside it and stay behind:
 | `~/.config/systemd/user/omarchy-speaker-trial.service` | only while an exported tuning is on trial; Switch off completely removes it |
 | `~/.config/pipewire/omarchy-speaker-trial.conf` | the trial's sink, same lifetime |
 | `~/.config/pipewire/omarchy-speaker-trial.conf.d/90-trial.conf` | the trial's filters, same lifetime |
-| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared) and `registry-cache.json` (the last list for your model) |
+| `~/.local/share/omarchy-speaker-calibrator/` | profiles, checks, and the recorded sweeps; also `registry.json` (your answer about looking online, links to what you shared and which calibration each came from) and `registry-cache.json` (the last list for your model) |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-processing-restore.json` | exists only during a measurement: which microphone switches to put back |
 | `~/.local/share/omarchy-speaker-calibrator/microphone-volume-restore.json` | exists only during a measurement that lowered the microphone's input level: what to put back |
 | `~/Downloads/*.speaker-calibration.json` | calibrations you exported, or that someone gave you |

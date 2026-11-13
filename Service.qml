@@ -39,7 +39,7 @@ Item {
   // { microphone, description, channel }.  Gone as soon as something else runs.
   property var offer: null
   // Calibrations other people shared for this machine's model, as the last
-  // lookup found them: { consent, profiles, checked_at, uploads }.  Looking
+  // lookup found them: { consent, profiles, checked_at, uploads, uploads_listed }.  Looking
   // needs a yes given once; until then nothing is asked of anyone.
   property var registry: ({ consent: null, profiles: [] })
   // What the last press on Share answered: { state: "confirm" | "uploaded" | "browser", ... }.
@@ -461,6 +461,8 @@ Item {
               ? "Calibrated and playing: " + root.simpleLabel(result)
                 + (root.status.library && root.status.library.length > 0
                    ? " · the one before is in the list" : "")
+                + ((result.microphone || {}).internal === true ? ""
+                   : " · check it to prove it works")
               : root.phase === "refine"
                 ? "Improved from the check, round " + refinement.iterations
                   + " · biggest change " + Number(refinement.largest_step_db || 0).toFixed(1)
@@ -530,6 +532,9 @@ Item {
           var check = JSON.parse(raw)
           root.status = Object.assign({}, root.status, { verification: check })
           root.message = root.verificationSummary(check)
+          // A check changes what sharing would publish and how it scores;
+          // the next step and the share rows read that from the status.
+          Qt.callLater(root.refreshStatus)
         } else if (root.phase === "deepbass") {
           var bass = JSON.parse(raw)
           root.status = Object.assign({}, root.status, {
