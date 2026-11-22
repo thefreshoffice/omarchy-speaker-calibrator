@@ -11,6 +11,7 @@ import math
 import os
 import re
 import secrets
+import select as select_module
 import shlex
 import shutil
 import signal
@@ -1444,6 +1445,77 @@ def write_controls(node_id, controls):
         ["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {payload} ] }}"],
         check=False, capture=True,
     ).returncode == 0
+
+
+class ControlSession:
+    """One ``pw-cli`` kept open, so a ramp costs one process, not one per step.
+
+    ``write_controls`` forks a process and connects a client for every write,
+    and that costs more than the write itself: about twenty milliseconds here.
+    A ramp meant to step every ``RAMP_INTERVAL_SECONDS`` was really stepping at
+    that plus a spawn, and one key press opened and closed a client per step.
+    This streams the steps into one client and waits for each answer, so they
+    stay spaced instead of queueing up and landing together.
+    """
+
+    QUIET_SECONDS = 0.005
+
+    def __init__(self, argv=None):
+        self.argv = list(argv or ["pw-cli"])
+        self.process = None
+
+    def _answer(self, quiet=QUIET_SECONDS):
+        """What pw-cli says back, read until it goes quiet."""
+        said = b""
+        while select_module.select([self.process.stdout], [], [], quiet)[0]:
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            said += chunk
+        return said.decode(errors="replace")
+
+    def _start(self):
+        self.close()
+        try:
+            self.process = subprocess.Popen(
+                self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, bufsize=0)
+        except OSError:
+            return False
+        # The greeting and the prompt arrive before the remote is connected,
+        # and a command sent with them is refused as an unknown global.
+        # Reading until it goes quiet is what connected looks like.
+        self._answer(quiet=0.05)
+        return True
+
+    def write(self, node_id, controls):
+        """Stream one write; False when pw-cli refused it."""
+        if self.process is None or self.process.poll() is not None:
+            if not self._start():
+                return False
+        payload = " ".join(
+            f'"{name}" {float(value):.6f}' for name, value in controls.items())
+        try:
+            self.process.stdin.write(
+                f"set-param {node_id} Props {{ params = [ {payload} ] }}\n".encode())
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self.close()
+            return False
+        # A refusal on the answer stands in for the exit code write_controls
+        # reads; the two start-up complaints that are not refusals say so.
+        return not any(
+            line.startswith("Error:") and "unsupported type" not in line
+            for line in self._answer().splitlines())
+
+    def close(self):
+        process, self.process = self.process, None
+        if process is None:
+            return
+        with contextlib.suppress(OSError):
+            process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=2)
 
 
 def apply_controls_live(controls):

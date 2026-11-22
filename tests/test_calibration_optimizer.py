@@ -2413,6 +2413,76 @@ class TrackerRampTests(unittest.TestCase):
         self.assertEqual(followed, [True])
 
 
+class FakeSession:
+    """A control session that records writes and can be told to refuse one."""
+
+    opened = 0
+
+    def __init__(self):
+        FakeSession.opened += 1
+        self.writes = []
+        self.closed = False
+        self.refuse_at = None
+
+    def write(self, node, controls):
+        if self.refuse_at is not None and len(self.writes) >= self.refuse_at:
+            return False
+        self.writes.append(dict(controls))
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+class SessionHelper(FakeTrackerHelper):
+    """The helper as this version ships it: it can open a session."""
+
+    ControlSession = FakeSession
+
+    def write_controls(self, node, controls):
+        raise AssertionError("a ramp should not fork a process per step")
+
+
+class TrackerSessionTests(unittest.TestCase):
+    """A ramp goes through one session instead of a process per write."""
+
+    def setUp(self):
+        self.module = load_tracker()
+        FakeSession.opened = 0
+        self.tracker = self.module.Tracker(SessionHelper())
+        self.tracker.node = 7
+        self.tracker.input_gain = 1.0
+        self.tracker.applied_db = -8.0
+
+    def ramp(self, target):
+        with mock.patch.object(self.module.time, "sleep"):
+            return self.tracker.apply(target)
+
+    def test_a_ramp_is_written_through_one_session(self):
+        self.assertTrue(self.ramp(-6.5))
+        expected = speaker_calibrate.loudness_ramp(
+            speaker_calibrate.loudness_controls(-8.0, True, 1.0),
+            speaker_calibrate.loudness_controls(-6.5, True, 1.0))
+        self.assertGreater(len(expected), 1)
+        self.assertEqual(FakeSession.opened, 1)
+        self.assertEqual(self.tracker.session.writes, expected)
+        self.assertEqual(self.tracker.applied_db, -6.5)
+
+    def test_a_second_level_reuses_the_open_session(self):
+        self.ramp(-6.5)
+        self.tracker.applied_db = -6.5
+        self.assertTrue(self.ramp(-5.0))
+        self.assertEqual(FakeSession.opened, 1)
+
+    def test_a_refused_step_drops_the_session_and_reports_failure(self):
+        self.tracker.session = FakeSession()
+        self.tracker.session.refuse_at = 1
+        self.assertFalse(self.ramp(-6.5))
+        self.assertIsNone(self.tracker.session)
+        self.assertIsNone(self.tracker.node)
+        # The level was not taken, so the next move is applied from scratch.
+        self.assertEqual(self.tracker.applied_db, -8.0)
+
 
 class MicrophoneArchiveIdentityTests(unittest.TestCase):
     """One record is kept per kind; the panel must know which device made it."""

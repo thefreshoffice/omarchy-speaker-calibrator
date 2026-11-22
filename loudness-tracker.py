@@ -70,6 +70,7 @@ class Tracker:
         self.input_gain = 1.0
         self.sink = None
         self.running = True
+        self.session = None
 
     def stop(self, *_):
         self.running = False
@@ -85,6 +86,23 @@ class Tracker:
                 return None
             self.node = node
         return self.node
+
+    def write(self, node, controls):
+        """One control write; a ramp keeps one pw-cli open across its steps.
+
+        Without a helper that can hold a session (an older one, or the tests)
+        every write stands alone as before.
+        """
+        session_class = getattr(self.helper, "ControlSession", None)
+        if session_class is None:
+            return self.helper.write_controls(node, controls)
+        if self.session is None:
+            self.session = session_class()
+        if self.session.write(node, controls):
+            return True
+        self.session.close()
+        self.session = None
+        return False
 
     def apply(self, volume_db, enabled=True):
         """Push one volume to the compensator; True when it was accepted.
@@ -110,7 +128,7 @@ class Tracker:
         for index, controls in enumerate(writes):
             if index:
                 time.sleep(RAMP_INTERVAL_SECONDS)
-            if not self.helper.write_controls(node, controls):
+            if not self.write(node, controls):
                 self.node = None
                 return False
         self.applied_db = volume_db if enabled else None
@@ -218,6 +236,8 @@ def main():
         # profile has been read.
         if tracker.applied_db is not None:
             tracker.apply(0.0, enabled=False)
+        if tracker.session is not None:
+            tracker.session.close()
 
 
 if __name__ == "__main__":
